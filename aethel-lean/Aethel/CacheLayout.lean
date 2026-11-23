@@ -1,0 +1,334 @@
+import Aethel.ScalarLayout
+import Aethel.LayoutAlgebra
+import Aethel.Representation
+import Aethel.AutomaticLayout
+
+namespace Aethel.CacheLayout
+
+open Aethel
+
+/-- Hardware cache-line and SIMD lane descriptor. Default matches x86-64 L1 (64 bytes). -/
+structure CacheSpec where
+  lineSize : Nat := 64
+  simdLaneCount : Nat := 8
+  linePos : 0 < lineSize := by decide
+  linePow2 : lineSize.isPowerOfTwo := by decide
+
+def withinCacheLine (lineSize offset width : Nat) : Prop :=
+  0 < width → offset / lineSize = (offset + width - 1) / lineSize
+
+private theorem mod_add_width_lt_line {lineSize offset width : Nat}
+    (hW : 0 < width) (hL : 0 < lineSize) (_hLe : width ≤ lineSize)
+    (hDvd : width ∣ lineSize) (hAlign : offset % width = 0) :
+    offset % lineSize + width ≤ lineSize := by
+  obtain ⟨k, hk⟩ := hDvd
+  have hkPos : 0 < k := by
+    rcases Nat.eq_zero_or_pos k with rfl | hkPos
+    · simp at hk; omega
+    · exact hkPos
+  have hModZero : (offset % lineSize) % width = 0 := by
+    rw [Nat.mod_mod_of_dvd offset ⟨k, hk⟩]
+    exact hAlign
+  obtain ⟨m, hm⟩ := Nat.dvd_of_mod_eq_zero hModZero
+  have hmLt : m < k := by
+    have hRemLt := Nat.mod_lt offset hL
+    rw [hm, hk] at hRemLt
+    exact (Nat.mul_lt_mul_left hW).mp hRemLt
+  have hSucc : m + 1 ≤ k := hmLt
+  calc
+    offset % lineSize + width = width * m + width := by rw [hm]
+    _ = width * (m + 1) := by rw [Nat.mul_succ]
+    _ ≤ width * k := Nat.mul_le_mul_left width hSucc
+    _ = lineSize := hk.symm
+
+theorem aligned_within_cacheLine {lineSize offset width : Nat}
+    (hW : 0 < width) (hL : 0 < lineSize) (hLe : width ≤ lineSize)
+    (hDvd : width ∣ lineSize) (hAlign : offset % width = 0) :
+    withinCacheLine lineSize offset width := by
+  intro _
+  have hFits : offset % lineSize + (width - 1) < lineSize := by
+    have hBound := mod_add_width_lt_line hW hL hLe hDvd hAlign
+    omega
+  have hDecomp : offset + width - 1 = (offset / lineSize) * lineSize + (offset % lineSize + (width - 1)) := by
+    have hDivMod := Nat.div_add_mod offset lineSize
+    rw [Nat.mul_comm lineSize (offset / lineSize)] at hDivMod
+    omega
+  rw [hDecomp, Nat.mul_comm (offset / lineSize) lineSize, Nat.mul_add_div hL,
+    Nat.div_eq_of_lt hFits, Nat.add_zero]
+
+/-- Tiled Array-of-Structures-of-Arrays (AoSoA) slot addressing: groups
+`tileWidth` elements per field contiguously before advancing to the next field,
+aligning SIMD vector loads cleanly to L1 cache lines. -/
+def aosoaSlot (tileWidth fieldCount element field : Nat) : Nat :=
+  (element / tileWidth) * (fieldCount * tileWidth) + field * tileWidth + (element % tileWidth)
+
+def encodeAoSoA (table : ScalarTable) (tileWidth fieldCount : Nat) : SlotStore :=
+  fun address =>
+    let tileSize := fieldCount * tileWidth
+    let tile := address / tileSize
+    let rem := address % tileSize
+    let field := rem / tileWidth
+    let lane := rem % tileWidth
+    table (tile * tileWidth + lane) field
+
+private theorem inner_offset_lt {tileWidth fieldCount field lane : Nat}
+    (hf : field < fieldCount) (hl : lane < tileWidth) :
+    field * tileWidth + lane < fieldCount * tileWidth := by
+  have hSucc : field + 1 ≤ fieldCount := hf
+  calc
+    field * tileWidth + lane < field * tileWidth + tileWidth := by omega
+    _ = (field + 1) * tileWidth := by rw [Nat.succ_mul]
+    _ ≤ fieldCount * tileWidth := Nat.mul_le_mul_right tileWidth hSucc
+
+theorem aosoa_read (table : ScalarTable) (tileWidth fieldCount element field : Nat)
+    (hw : 0 < tileWidth) (hf : field < fieldCount) :
+    encodeAoSoA table tileWidth fieldCount (aosoaSlot tileWidth fieldCount element field) =
+      table element field := by
+  have hTilePos : 0 < fieldCount * tileWidth := Nat.mul_pos (Nat.zero_lt_of_lt hf) hw
+  have hLaneLt : element % tileWidth < tileWidth := Nat.mod_lt element hw
+  have hRemLt : field * tileWidth + element % tileWidth < fieldCount * tileWidth :=
+    inner_offset_lt hf hLaneLt
+  have hAssoc : aosoaSlot tileWidth fieldCount element field =
+      (fieldCount * tileWidth) * (element / tileWidth) + (field * tileWidth + element % tileWidth) := by
+    simp only [aosoaSlot, Nat.mul_comm (element / tileWidth), Nat.add_assoc]
+  have hDiv : aosoaSlot tileWidth fieldCount element field / (fieldCount * tileWidth) =
+      element / tileWidth := by
+    rw [hAssoc, Nat.mul_add_div hTilePos, Nat.div_eq_of_lt hRemLt, Nat.add_zero]
+  have hMod : aosoaSlot tileWidth fieldCount element field % (fieldCount * tileWidth) =
+      field * tileWidth + element % tileWidth := by
+    rw [hAssoc, Nat.mul_add_mod, Nat.mod_eq_of_lt hRemLt]
+  have hField : (field * tileWidth + element % tileWidth) / tileWidth = field := by
+    rw [Nat.mul_comm field tileWidth, Nat.mul_add_div hw, Nat.div_eq_of_lt hLaneLt, Nat.add_zero]
+  have hLane : (field * tileWidth + element % tileWidth) % tileWidth = element % tileWidth := by
+    rw [Nat.mul_comm field tileWidth, Nat.mul_add_mod, Nat.mod_eq_of_lt hLaneLt]
+  have hElem : (element / tileWidth) * tileWidth + element % tileWidth = element := by
+    rw [Nat.mul_comm]
+    exact Nat.div_add_mod element tileWidth
+  simp only [encodeAoSoA, hDiv, hMod, hField, hLane, hElem]
+
+theorem three_way_read_agreement (table : ScalarTable)
+    (length tileWidth fieldCount element field : Nat)
+    (hi : element < length) (hw : 0 < tileWidth) (hf : field < fieldCount) :
+    encodeAoS table fieldCount (aosSlot fieldCount element field) = table element field ∧
+    encodeSoA table length (soaSlot length element field) = table element field ∧
+    encodeAoSoA table tileWidth fieldCount (aosoaSlot tileWidth fieldCount element field) =
+      table element field :=
+  ⟨aos_read table fieldCount element field hf,
+   soa_read table length element field hi,
+   aosoa_read table tileWidth fieldCount element field hw hf⟩
+
+theorem aosoaSlot_eq_iff (tileWidth fieldCount i j f g : Nat)
+    (hw : 0 < tileWidth) (hf : f < fieldCount) (hg : g < fieldCount) :
+    aosoaSlot tileWidth fieldCount i f = aosoaSlot tileWidth fieldCount j g ↔ i = j ∧ f = g := by
+  constructor
+  · intro h
+    have hRow := congrArg (encodeAoSoA (fun row _ => row) tileWidth fieldCount) h
+    have hCol := congrArg (encodeAoSoA (fun _ col => col) tileWidth fieldCount) h
+    simp only [aosoa_read _ _ _ _ _ hw hf, aosoa_read _ _ _ _ _ hw hg] at hRow hCol
+    exact ⟨hRow, hCol⟩
+  · rintro ⟨rfl, rfl⟩
+    rfl
+
+theorem aosoa_write_observation (table : ScalarTable) (tileWidth fieldCount i j f g value : Nat)
+    (hw : 0 < tileWidth) (hf : f < fieldCount) (hg : g < fieldCount) :
+    writeSlot (encodeAoSoA table tileWidth fieldCount) (aosoaSlot tileWidth fieldCount i f) value
+      (aosoaSlot tileWidth fieldCount j g) = writeTable table i f value j g := by
+  simp [writeSlot, writeTable, aosoaSlot_eq_iff _ _ _ _ _ _ hw hg hf, aosoa_read _ _ _ _ _ hw hg]
+
+def ScalarRepAoSoA (table : ScalarTable) (store : SlotStore)
+    (length tileWidth fieldCount : Nat) : Prop :=
+  ∀ i, i < length → ∀ f, f < fieldCount →
+    store (aosoaSlot tileWidth fieldCount i f) = table i f
+
+theorem scalarRepAoSoA_init (table : ScalarTable) (length tileWidth fieldCount : Nat)
+    (hw : 0 < tileWidth) :
+    ScalarRepAoSoA table (encodeAoSoA table tileWidth fieldCount) length tileWidth fieldCount :=
+  fun _ _ _ hf => aosoa_read table tileWidth fieldCount _ _ hw hf
+
+theorem scalarRepAoSoA_write {table : ScalarTable} {store : SlotStore}
+    {length tileWidth fieldCount : Nat}
+    (hrep : ScalarRepAoSoA table store length tileWidth fieldCount)
+    (i f value : Nat) (_hi : i < length) (hw : 0 < tileWidth) (hf : f < fieldCount) :
+    ScalarRepAoSoA (writeTable table i f value)
+      (writeSlot store (aosoaSlot tileWidth fieldCount i f) value) length tileWidth fieldCount := by
+  intro j hj g hg
+  simp [writeSlot, writeTable, aosoaSlot_eq_iff _ _ _ _ _ _ hw hg hf, hrep j hj g hg]
+
+theorem three_way_write_refinement {table : ScalarTable} {aos soa aosoa : SlotStore}
+    {length tileWidth fieldCount : Nat}
+    (ha : ScalarRepAoS table aos length fieldCount)
+    (hs : ScalarRepSoA table soa length fieldCount)
+    (ht : ScalarRepAoSoA table aosoa length tileWidth fieldCount)
+    (i f value : Nat) (hi : i < length) (hw : 0 < tileWidth) (hf : f < fieldCount) :
+    ScalarRepAoS (writeTable table i f value)
+      (writeSlot aos (aosSlot fieldCount i f) value) length fieldCount ∧
+    ScalarRepSoA (writeTable table i f value)
+      (writeSlot soa (soaSlot length i f) value) length fieldCount ∧
+    ScalarRepAoSoA (writeTable table i f value)
+      (writeSlot aosoa (aosoaSlot tileWidth fieldCount i f) value) length tileWidth fieldCount :=
+  ⟨scalarRepAoS_write ha i f value hi hf,
+   scalarRepSoA_write hs i f value hi hf,
+   scalarRepAoSoA_write ht i f value hi hw hf⟩
+
+theorem aosoa_tile_contiguous (tileWidth fieldCount element field : Nat)
+    (hw : 0 < tileWidth) (hSameTile : element % tileWidth + 1 < tileWidth) :
+    aosoaSlot tileWidth fieldCount (element + 1) field =
+      aosoaSlot tileWidth fieldCount element field + 1 := by
+  have hDecomp : element + 1 = tileWidth * (element / tileWidth) + (element % tileWidth + 1) := by
+    have := Nat.div_add_mod element tileWidth
+    omega
+  have hDiv : (element + 1) / tileWidth = element / tileWidth := by
+    rw [hDecomp, Nat.mul_add_div hw, Nat.div_eq_of_lt hSameTile, Nat.add_zero]
+  have hMod : (element + 1) % tileWidth = element % tileWidth + 1 := by
+    rw [hDecomp, Nat.mul_add_mod, Nat.mod_eq_of_lt hSameTile]
+  simp only [aosoaSlot, hDiv, hMod]
+  omega
+
+theorem aosoa_tile_cache_aligned (tileWidth fieldCount tile field slotBytes : Nat)
+    (hLine : tileWidth * slotBytes = 64) :
+    (aosoaSlot tileWidth fieldCount (tile * tileWidth) field * slotBytes) % 64 = 0 := by
+  have hw : 0 < tileWidth := by
+    rcases Nat.eq_zero_or_pos tileWidth with rfl | hPos
+    · simp at hLine
+    · exact hPos
+  have hDiv : (tile * tileWidth) / tileWidth = tile := Nat.mul_div_cancel tile hw
+  have hMod : (tile * tileWidth) % tileWidth = 0 := Nat.mul_mod_left tile tileWidth
+  simp only [aosoaSlot, hDiv, hMod, Nat.add_zero]
+  have hFactor : (tile * (fieldCount * tileWidth) + field * tileWidth) * slotBytes =
+      (tile * fieldCount + field) * (tileWidth * slotBytes) := by
+    simp only [Nat.add_mul, Nat.mul_assoc]
+  rw [hFactor, hLine]
+  exact Nat.mul_mod_left _ 64
+
+/-- Collection representation variants including Tiled AoSoA. -/
+inductive CollectionLayout where
+  | aos
+  | soa
+  | aosoa (tileWidth : Nat)
+  deriving Repr, DecidableEq
+
+def CollectionLayout.Valid : CollectionLayout → Prop
+  | .aos => True
+  | .soa => True
+  | .aosoa w => 0 < w
+
+def collectionSlot (layout : CollectionLayout) (length fieldCount element field : Nat) : Nat :=
+  match layout with
+  | .aos => aosSlot fieldCount element field
+  | .soa => soaSlot length element field
+  | .aosoa w => aosoaSlot w fieldCount element field
+
+theorem collectionSlot_eq_iff {layout : CollectionLayout} (hValid : layout.Valid)
+    {length fieldCount i j f g : Nat}
+    (hi : i < length) (hj : j < length) (hf : f < fieldCount) (hg : g < fieldCount) :
+    collectionSlot layout length fieldCount i f =
+      collectionSlot layout length fieldCount j g ↔ i = j ∧ f = g := by
+  cases layout with
+  | aos => exact aosSlot_eq_iff fieldCount i j f g hf hg
+  | soa => exact soaSlot_eq_iff length i j f g hi hj
+  | aosoa w => exact aosoaSlot_eq_iff w fieldCount i j f g hValid hf hg
+
+/-- Byte-level physical collection representation in `Core.State` unified across
+AoS, SoA, and Tiled AoSoA layouts. -/
+def ByteCollectionRep (s : Core.State) (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount : Nat) (table : Nat → Nat → UInt8) : Prop :=
+  ∀ i, i < length → ∀ f, f < fieldCount →
+    s.byte ⟨owner, collectionSlot layout length fieldCount i f⟩ = some (table i f)
+
+def writeByteTable (table : Nat → Nat → UInt8) (element field : Nat) (val : UInt8) :
+    Nat → Nat → UInt8 :=
+  fun i f => if i = element ∧ f = field then val else table i f
+
+theorem byteCollection_write_simulation {s : Core.State} {owner : Core.OwnerId}
+    {layout : CollectionLayout} (hValid : layout.Valid)
+    {length fieldCount i f : Nat} {table : Nat → Nat → UInt8} (newVal : UInt8)
+    (hi : i < length) (hf : f < fieldCount)
+    (hRep : ByteCollectionRep s owner layout length fieldCount table) :
+    ByteCollectionRep
+      (s.store ⟨owner, collectionSlot layout length fieldCount i f⟩ newVal)
+      owner layout length fieldCount (writeByteTable table i f newVal) := by
+  intro j hj g hg
+  by_cases hEq : j = i ∧ g = f
+  · obtain ⟨rfl, rfl⟩ := hEq
+    simp only [writeByteTable, and_self, ite_true]
+    exact Core.State.store_byte_written s ⟨owner, collectionSlot layout length fieldCount j g⟩
+      (table j g) newVal (hRep j hj g hg)
+  · have hNot : ¬ (j = i ∧ g = f) := hEq
+    simp only [writeByteTable, ite_eq_right hNot]
+    have hSlotNe : collectionSlot layout length fieldCount i f ≠
+        collectionSlot layout length fieldCount j g := by
+      intro hSlotEq
+      have hSame := (collectionSlot_eq_iff hValid hi hj hf hg).mp hSlotEq
+      exact hNot ⟨hSame.1.symm, hSame.2.symm⟩
+    have hLocNe : (⟨owner, collectionSlot layout length fieldCount i f⟩ : ByteLocation) ≠
+        ⟨owner, collectionSlot layout length fieldCount j g⟩ := by
+      intro hLocEq
+      exact hSlotNe (congrArg ByteLocation.offset hLocEq)
+    rw [Core.State.store_byte_other s _ _ newVal hLocNe]
+    exact hRep j hj g hg
+
+theorem byteCollection_write_preserves_other_owner {s : Core.State}
+    {written : ByteLocation} {newVal : UInt8}
+    {other : Core.OwnerId} {layout : CollectionLayout} {length fieldCount : Nat}
+    {table : Nat → Nat → UInt8}
+    (hNe : other ≠ written.allocation)
+    (hRep : ByteCollectionRep s other layout length fieldCount table) :
+    ByteCollectionRep (s.store written newVal) other layout length fieldCount table := by
+  intro j hj g hg
+  have hLocNe : written ≠ ⟨other, collectionSlot layout length fieldCount j g⟩ := by
+    intro hEq
+    exact hNe (congrArg ByteLocation.allocation hEq).symm
+  rw [Core.State.store_byte_other s written _ newVal hLocNe]
+  exact hRep j hj g hg
+
+/-- Profitability profile used to pick AoS, SoA, or Tiled AoSoA for an allocation site. -/
+structure LoopAccessProfile where
+  totalFields : Nat
+  hotFieldCount : Nat
+  elementCount : Nat
+  simdPreferred : Bool
+  elemFieldBytes : Nat
+  deriving Repr, DecidableEq
+
+def selectCollectionLayout (p : LoopAccessProfile) : CollectionLayout :=
+  if p.elementCount ≤ 8 ∨ p.hotFieldCount == p.totalFields && !p.simdPreferred then
+    .aos
+  else if p.simdPreferred && 0 < p.elemFieldBytes && p.elemFieldBytes ≤ 64 then
+    let lanes := max 1 (64 / p.elemFieldBytes)
+    .aosoa lanes
+  else
+    .soa
+
+theorem selectCollectionLayout_valid (p : LoopAccessProfile) :
+    (selectCollectionLayout p).Valid := by
+  unfold selectCollectionLayout
+  split
+  · exact trivial
+  · split
+    · dsimp [CollectionLayout.Valid]
+      omega
+    · exact trivial
+
+/-- Hot/cold field clustering: places frequently co-accessed fields first so
+hot fields stay packed inside the leading 64-byte L1 cache line. -/
+def reorderHotFirst (isHot : α → Bool) (fields : List α) : List α :=
+  fields.filter isHot ++ fields.filter (fun x => !isHot x)
+
+theorem reorderHotFirst_length (isHot : α → Bool) (fields : List α) :
+    (reorderHotFirst isHot fields).length = fields.length := by
+  induction fields with
+  | nil => rfl
+  | cons x xs ih =>
+    cases hx : isHot x <;> simp [reorderHotFirst, hx] at ih ⊢ <;> omega
+
+theorem reorderHotFirst_mem_iff (isHot : α → Bool) (fields : List α) (x : α) :
+    x ∈ reorderHotFirst isHot fields ↔ x ∈ fields := by
+  simp only [reorderHotFirst, List.mem_append, List.mem_filter]
+  constructor
+  · rintro (⟨hx, _⟩ | ⟨hx, _⟩) <;> exact hx
+  · intro hx
+    cases hHot : isHot x
+    · right; exact ⟨hx, by simp⟩
+    · left; exact ⟨hx, rfl⟩
+
+end Aethel.CacheLayout

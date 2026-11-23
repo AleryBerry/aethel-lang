@@ -1,0 +1,53 @@
+// Tiled AoSoA (`@layout(aosoa(8))`) Collection Example:
+// Demonstrates a 10-asteroid belt processed in 8-element L1-cache tiles (1 full tile of 8 + 2 scalar tail),
+// with path-scoped borrow contracts (`~>.{x, y, vx, vy}`) and a Constitutional `law` proving
+// at Tier 0 that `mass` and `active` are never modified by the orbital update pass.
+
+@layout(aosoa(8))
+type Asteroid {
+  x: i32,
+  y: i32,
+  vx: i7,
+  vy: i7,
+  mass: Int(1..=100),
+  active: u1,
+}
+
+// Path-scoped borrow contract on a Collection:
+// `step_belt` is only authorized to touch `{x, y, vx, vy}` across the collection.
+fn step_belt(belt: Collection(Asteroid) ~>.{x, y, vx, vy}) {
+  @layout(aosoa(8))
+  belt |> map_in_place(fn(a) {
+    a.x = a.x +% (a.vx as i32)
+    a.y = a.y +% (a.vy as i32)
+  })
+}
+
+law orbit_preserves_mass(a: View(Asteroid, Exclusive)) {
+  preserves a.mass, a.active
+  always a.mass <= 100
+}
+
+fn main() {
+  // 10 asteroids = one full 8-element AoSoA tile (indices 0..7) + 2-element tail (indices 8..9)
+  let belt: Collection(Asteroid) = [
+    Asteroid { x: 10, y: 20, vx: 1,  vy: -1, mass: 50, active: 1 },
+    Asteroid { x: 20, y: 30, vx: 2,  vy: -2, mass: 60, active: 1 },
+    Asteroid { x: 30, y: 40, vx: 3,  vy: -3, mass: 70, active: 1 },
+    Asteroid { x: 40, y: 50, vx: 4,  vy: -4, mass: 80, active: 1 },
+    Asteroid { x: 50, y: 60, vx: 5,  vy: -5, mass: 90, active: 1 },
+    Asteroid { x: 60, y: 70, vx: 6,  vy: -6, mass: 40, active: 1 },
+    Asteroid { x: 70, y: 80, vx: 7,  vy: -7, mass: 30, active: 1 },
+    Asteroid { x: 80, y: 90, vx: 8,  vy: -8, mass: 20, active: 1 },
+    Asteroid { x: 90, y: 95, vx: 9,  vy: -9, mass: 10, active: 1 },
+    Asteroid { x: 100, y: 100, vx: 10, vy: -10, mass: 99, active: 1 },
+  ]
+
+  step_belt(belt)
+  step_belt(belt)
+
+  println("After 2 AoSoA(8) orbital ticks across ", 10, " asteroids:")
+  for a in belt {
+    println("  asteroid(mass=", a.mass, "): x=", a.x, ", y=", a.y)
+  }
+}

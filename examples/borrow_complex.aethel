@@ -1,0 +1,128 @@
+// Complex Borrow-Checker Showcase for Aethel:
+// 1. Path-scoped borrow contracts (`~>.{...}`) confining per-function field authority
+// 2. Scoped `view shared` and `view exclusive` reservations with automatic permission restoration
+// 3. Co-borrow conflict extraction (`CoBorrowGraph`) separating interfering `u1` bits into
+//    distinct addressable bytes while FFD-packing non-interfering sub-byte fields
+// 4. Scoped `fork / join` parallel execution verified race-free across disjoint fields
+// 5. Constitutional `law` Tier 0 frame preservation + interval invariant discharge
+
+@layout(aosoa(8))
+type Spaceship {
+  x: i32,
+  y: i32,
+  vx: i7,
+  vy: i7,
+  shield: Int(0..=100),
+  hull: Int(0..=100),
+  thruster_on: u1,
+  shield_on: u1,
+}
+
+// Non-interfering sub-byte fields (1 + 1 + 3 + 7 = 12 bits):
+// No concurrent exclusive views touch these together, so FFD bin-packing packs all 4 into 2 bytes.
+type PackedTelemetry {
+  nav_ok: u1,
+  comm_ok: u1,
+  channel: u3,
+  trim: i7,
+}
+
+// Interfering sub-byte fields (1 + 1 = 2 bits):
+// Concurrent exclusive views in `lock_both_subsystems` insert a CoBorrowGraph conflict edge,
+// forcing the layout engine to place `nav_lock` and `weapons_lock` in 2 separate addressable bytes!
+type ConcurrentLocks {
+  nav_lock: u1,
+  weapons_lock: u1,
+}
+
+// 1. Path-scoped borrow contract: ONLY `{x, y, vx, vy}` may be mutated.
+// Attempting `ship.shield = 0` or `ship.hull = 0` here is a compile-time error.
+fn integrate_motion(ship: Spaceship ~>.{x, y, vx, vy}) {
+  ship.x = ship.x +% (ship.vx as i32)
+  ship.y = ship.y +% (ship.vy as i32)
+}
+
+// Disjoint subsystem contract: ONLY `{shield, hull, shield_on}` may be mutated.
+fn absorb_hit(ship: Spaceship ~>.{shield, hull, shield_on}, dmg: u8) {
+  let prev_shield: u8 = ship.shield as u8
+  ship.shield = ship.shield -| dmg
+  if dmg > prev_shield {
+    let bleed: u8 = dmg -| prev_shield
+    ship.hull = ship.hull -| bleed
+  }
+}
+
+// 2. Scoped shared view followed by permission restoration and mutation.
+fn inspect_then_boost(ship: Spaceship ~>.{x, vx, thruster_on}) -> i32 {
+  let mut snapshot: i32 = 0
+  view shared rx = ship.x {
+    // While `rx` holds a shared reservation on `ship.x`, mutating `ship.x` is forbidden.
+    // Reading `ship.x` (and mutating disjoint sibling `ship.thruster_on`) is allowed:
+    snapshot = ship.x
+    ship.thruster_on = 1u1
+  }
+  // Shared view `rx` has ended; exclusive authority over `ship.x` is restored:
+  ship.x = snapshot +% (ship.vx as i32)
+  ship.x
+}
+
+// 3. Nested exclusive views on sibling `u1` fields record a CoBorrowGraph conflict edge,
+// preventing shared-byte bit tearing.
+fn lock_both_subsystems(mut locks: ConcurrentLocks) -> u1 {
+  view exclusive va = locks.nav_lock {
+    view exclusive vb = locks.weapons_lock {
+      locks.weapons_lock = 1u1
+    }
+  }
+  locks.weapons_lock
+}
+
+// 4. Scoped `fork / join` parallelism across pairwise-disjoint fields (`x`, `y`, `shield`).
+// Two branches writing the same field (or one reading while another writes) is rejected
+// at compile time with `fork_data_race`.
+fn parallel_tick(mut ship: Spaceship) -> i32 {
+  fork {
+    { ship.x = ship.x +% 10 }
+    { ship.y = ship.y -% 5 }
+    { ship.shield = ship.shield -| 4 }
+  } join
+  ship.x +% ship.y
+}
+
+// 5. Constitutional law: verifies at compile time that all subsystem functions preserve
+// `shield_on`, and that `shield` and `hull` `Int(0..=100)` interval bounds never overflow.
+law subsystem_invariants(s: View(Spaceship, Exclusive)) {
+  preserves s.shield_on
+  always s.shield <= 100
+  never s.hull > 100
+}
+
+fn main() {
+  let mut ship = Spaceship {
+    x: 100,
+    y: 50,
+    vx: 15,
+    vy: -8,
+    shield: 30,
+    hull: 100,
+    thruster_on: 0,
+    shield_on: 1,
+  }
+
+  integrate_motion(ship)
+  println("after integrate_motion: x = ", ship.x, ", y = ", ship.y)
+
+  absorb_hit(ship, 45)
+  println("after absorb_hit(45):   shield = ", ship.shield, ", hull = ", ship.hull)
+
+  let boosted_x = inspect_then_boost(ship)
+  println("after inspect_boost:    x = ", boosted_x, ", thruster_on = ", ship.thruster_on)
+
+  let combined_xy = parallel_tick(ship)
+  println("after parallel_tick:    x+y = ", combined_xy)
+
+  let telem = PackedTelemetry { nav_ok: 1, comm_ok: 1, channel: 5, trim: -12 }
+  let locks = ConcurrentLocks { nav_lock: 1, weapons_lock: 0 }
+  let w_locked = lock_both_subsystems(locks)
+  println("telemetry channel = ", telem.channel, ", weapons_lock = ", w_locked)
+}

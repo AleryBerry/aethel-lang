@@ -1,0 +1,10 @@
+name = "aethel"
+version = "0.1.0"
+defaultTargets = ["Aethel", "aethel-check"]
+
+[[lean_lib]]
+name = "Aethel"
+
+[[lean_exe]]
+name = "aethel-check"
+root = "Main"

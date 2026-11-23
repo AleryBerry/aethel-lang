@@ -1,0 +1,91 @@
+// Advanced Borrow-Checker Showcase (Stage A):
+// 1. Two-phase lazy `view exclusive` allowing shared reads before first write activation
+// 2. Automatic last-use early view release without nested lexical boilerplate
+// 3. Guarded `i != j` affine index disjointness + `arr[0..mid]` / `arr[mid..n]` split slices in `fork / join`
+// 4. Transitive call-graph effect tracking & returned caller-rooted `View`
+
+type Spaceship {
+  x: i32,
+  y: i32,
+  shield_on: u1,
+}
+
+fn add_boost_x(s: Spaceship ~>.{x}, delta: i32) {
+  s.x = s.x +% delta
+}
+
+// Transitive effect call: `outer_boost` calls `add_boost_x`, so callers & Constitutional laws
+// automatically know `outer_boost` writes `s.x` while preserving `s.shield_on`.
+fn outer_boost(s: Spaceship ~>.{x}, delta: i32) {
+  add_boost_x(s, delta)
+}
+
+// Returned caller-rooted `View`: proven to borrow caller parameter `s` without dangling.
+fn borrow_ship(s: Spaceship ~>.{x, y}) -> View(Spaceship, Exclusive) {
+  s
+}
+
+// 1 & 2. Two-phase lazy borrow + automatic last-use early release.
+fn lazy_and_early_release(mut s: Spaceship) -> i32 {
+  view shared r = s {
+    let snap = r.x
+    // `r`'s last use was above, so `r` is released early right here:
+    s.x = snap +% 10
+  }
+
+  view exclusive w = s {
+    // `w` starts `.reserved`, so reading `s.x` concurrently succeeds:
+    let cur = s.x
+    // First write activates `w` to `.activeExclusive`, then `w` is released after its last use:
+    w.x = cur +% 5
+    // Reading `s.x` again works immediately after `w` is released:
+    let after = s.x
+    let _ = after
+  }
+  s.x
+}
+
+// 3. Guarded `if i != j` element disjointness + split half-open slices under `fork / join`.
+fn parallel_array_ops(mut arr: [mut u32], i: u32, j: u32, mid: u32) {
+  if i != j {
+    fork {
+      { arr[i] = arr[i] +% 10u32 }
+      { arr[j] = arr[j] +% 20u32 }
+    } join
+  }
+
+  view exclusive left = arr[0..mid] {
+    view exclusive right = arr[mid..arr.len] {
+      fork {
+        { left[0] = left[0] +% 1u32 }
+        { right[0] = right[0] +% 2u32 }
+      } join
+    }
+  }
+}
+
+law shield_flag_preserved(s: View(Spaceship, Exclusive)) {
+  preserves s.shield_on
+}
+
+fn main() {
+  let mut ship = Spaceship { x: 100, y: 20, shield_on: 1 }
+  let x1 = lazy_and_early_release(ship)
+  println("after lazy + early release: x = ", x1)
+
+  outer_boost(ship, 25)
+  println("after transitive outer_boost(25): x = ", ship.x)
+
+  let v = borrow_ship(ship)
+  v.y = v.y +% 7
+  println("after returned View mutation: y = ", ship.y)
+
+  let mut sectors: [mut u32] = [10, 20, 30, 40]
+  parallel_array_ops(sectors, 0, 3, 2)
+  println(
+    "after parallel array ops: [0]=", sectors[0],
+    " [1]=", sectors[1],
+    " [2]=", sectors[2],
+    " [3]=", sectors[3]
+  )
+}

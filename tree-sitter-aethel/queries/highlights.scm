@@ -50,6 +50,7 @@
 [
   "const"
   "move"
+  "once"
   (opacity_modifier)
   (visibility_modifier)
   (mutable_modifier)

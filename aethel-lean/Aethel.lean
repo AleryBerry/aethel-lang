@@ -36,6 +36,7 @@ import Aethel.LawFrameDischarge
 import Aethel.LawFalsifier
 import Aethel.LawAutoProver
 import Aethel.ConstitutionalLaws
+import Aethel.InterprocBorrow
 import Aethel.MIRValidator
 import Aethel.ScopedForkJoin
 import Aethel.RustFFI

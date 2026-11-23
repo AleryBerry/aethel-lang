@@ -706,28 +706,85 @@ theorem proveEq_sound {hyps : List LawProp} {fuel : Nat} {a b : LawExpr}
 def proveLt (hyps : List LawProp) : Nat → LawExpr → LawExpr → Bool
   | 0, _, _ => false
   | fuel + 1, a, b =>
-    if hyps.any (hypImpliesLt a b) then true
-    else if linearLt a b then true
-    else proveLe hyps fuel (.add a (.const 1)) b
+    hyps.any (hypImpliesLt a b) ||
+    linearLt a b ||
+    proveLe hyps fuel (.add a (.const 1)) b ||
+    (match b with
+      | .add y1 y2 =>
+        (proveLe hyps fuel a y1 && proveLt hyps fuel (.const 0) y2) ||
+        (proveLe hyps fuel a y2 && proveLt hyps fuel (.const 0) y1) ||
+        proveLt hyps fuel a y1 ||
+        proveLt hyps fuel a y2
+      | _ => false) ||
+    (match a, b with
+      | .sub x1 y1, .sub x2 y2 =>
+        (proveLe hyps fuel x1 x2 && proveLt hyps fuel y2 x2 && proveLt hyps fuel y2 y1) ||
+        (proveLt hyps fuel (.const 0) x1 && proveLt hyps fuel (.const 0) y1 && proveLe hyps fuel x1 (.sub x2 y2))
+      | _, _ => false) ||
+    (match a with
+      | .sub x y =>
+        proveLt hyps fuel (.const 0) x && proveLt hyps fuel (.const 0) y && proveLe hyps fuel x b
+      | _ => false)
 
 theorem proveLt_sound {hyps : List LawProp} {fuel : Nat} {a b : LawExpr}
     (hPrv : proveLt hyps fuel a b = true)
     (env : Nat → Nat) (hHyps : ∀ h ∈ hyps, h.Holds env) :
     a.eval env < b.eval env := by
-  cases fuel with
+  induction fuel generalizing a b with
   | zero => cases hPrv
-  | succ f =>
+  | succ f ih =>
     dsimp [proveLt] at hPrv
-    split at hPrv
-    · next hAny =>
-      obtain ⟨h, hhMem, hhMatch⟩ := List.any_eq_true.mp hAny
+    simp only [Bool.or_eq_true] at hPrv
+    rcases hPrv with ((((hAny | hLin) | hPlus1) | hAddR) | hSubSub) | hSubL
+    · obtain ⟨h, hhMem, hhMatch⟩ := List.any_eq_true.mp hAny
       exact hypImpliesLt_sound env hhMatch (hHyps h hhMem)
-    split at hPrv
-    · next hLin =>
-      exact linearLt_sound env hLin
-    · have hLe := proveLe_sound hPrv env hHyps
+    · exact linearLt_sound env hLin
+    · have hLe := proveLe_sound hPlus1 env hHyps
       dsimp [LawExpr.eval] at hLe
       omega
+    · cases b with
+      | add y1 y2 =>
+        simp only [Bool.or_eq_true, Bool.and_eq_true] at hAddR
+        dsimp [LawExpr.eval]
+        rcases hAddR with ((⟨hLe1, hPos2⟩ | ⟨hLe2, hPos1⟩) | hLt1) | hLt2
+        · have := proveLe_sound hLe1 env hHyps
+          have := ih hPos2
+          dsimp [LawExpr.eval] at *
+          omega
+        · have := proveLe_sound hLe2 env hHyps
+          have := ih hPos1
+          dsimp [LawExpr.eval] at *
+          omega
+        · have := ih hLt1; omega
+        · have := ih hLt2; omega
+      | _ => cases hAddR
+    · cases a with
+      | sub x1 y1 =>
+        cases b with
+        | sub x2 y2 =>
+          simp only [Bool.or_eq_true, Bool.and_eq_true] at hSubSub
+          dsimp [LawExpr.eval]
+          rcases hSubSub with ⟨⟨hX12, hY2X2⟩, hY21⟩ | ⟨⟨hX1Pos, hY1Pos⟩, hX1Sub⟩
+          · have := proveLe_sound hX12 env hHyps
+            have := ih hY2X2
+            have := ih hY21
+            omega
+          · have := ih hX1Pos
+            have := ih hY1Pos
+            have := proveLe_sound hX1Sub env hHyps
+            dsimp [LawExpr.eval] at *
+            omega
+        | _ => cases hSubSub
+      | _ => cases hSubSub
+    · cases a with
+      | sub x y =>
+        simp only [Bool.and_eq_true] at hSubL
+        have := ih hSubL.1.1
+        have := ih hSubL.1.2
+        have := proveLe_sound hSubL.2 env hHyps
+        dsimp [LawExpr.eval] at *
+        omega
+      | _ => cases hSubL
 
 def flattenHyp : LawProp → List LawProp
   | .tt => []
@@ -738,7 +795,12 @@ def flattenHyp : LawProp → List LawProp
   | .eq a b => [.eq (normalizeExpr a) (normalizeExpr b)]
   | .le a b => [.le (normalizeExpr a) (normalizeExpr b)]
   | .lt a b => [.lt (normalizeExpr a) (normalizeExpr b)]
-  | .ne a b => [.ne (normalizeExpr a) (normalizeExpr b)]
+  | .ne a b =>
+    let a' := normalizeExpr a
+    let b' := normalizeExpr b
+    if a' == .const 0 then [.ne a' b', .lt (.const 0) b']
+    else if b' == .const 0 then [.ne a' b', .lt (.const 0) a']
+    else [.ne a' b']
   | p => [p]
 
 theorem flattenHyp_sound (env : Nat → Nat) (p : LawProp) (hp : p.Holds env) :
@@ -793,11 +855,32 @@ theorem flattenHyp_sound (env : Nat → Nat) (p : LawProp) (hp : p.Holds env) :
     exact hp
   | .ne a b =>
     intro q hq
-    simp only [flattenHyp, List.mem_singleton] at hq
-    subst hq
-    dsimp [LawProp.Holds] at hp ⊢
-    rw [normalizeExpr_sound, normalizeExpr_sound]
-    exact hp
+    dsimp [flattenHyp] at hq
+    have hNe : (normalizeExpr a).eval env ≠ (normalizeExpr b).eval env := by
+      dsimp [LawProp.Holds] at hp
+      rw [normalizeExpr_sound, normalizeExpr_sound]
+      exact hp
+    split at hq
+    · next hZero =>
+      have ha0 : normalizeExpr a = .const 0 := beq_iff_eq.mp hZero
+      simp only [List.mem_cons, List.mem_nil_iff, or_false] at hq
+      rcases hq with rfl | rfl
+      · exact hNe
+      · rw [ha0] at hNe
+        dsimp [LawProp.Holds, LawExpr.eval] at hNe ⊢
+        omega
+    · split at hq
+      · next hZero =>
+        have hb0 : normalizeExpr b = .const 0 := beq_iff_eq.mp hZero
+        simp only [List.mem_cons, List.mem_nil_iff, or_false] at hq
+        rcases hq with rfl | rfl
+        · exact hNe
+        · rw [hb0] at hNe
+          dsimp [LawProp.Holds, LawExpr.eval] at hNe ⊢
+          omega
+      · simp only [List.mem_singleton] at hq
+        subst hq
+        exact hNe
   | .ff => exact False.elim hp
   | .or _ _ =>
     intro q hq
@@ -1055,5 +1138,48 @@ theorem law_buggy_damage_falsified : ¬ (∀ hp dmg : Nat, ¬ (hp < hp + dmg)) :
   apply hFal
   intro env _
   exact hAll (env 0) (env 1)
+
+def exprCountdownDec : LawProp :=
+  .lt (.sub (.var 0) (.var 1)) (.var 0)
+
+def exprNeZeroDec : LawProp :=
+  .lt (.sub (.var 0) (.const 1)) (.var 0)
+
+def exprUpwardDec : LawProp :=
+  .lt (.sub (.var 1) (.add (.var 0) (.var 2))) (.sub (.var 1) (.var 0))
+
+theorem law_countdown_decreases : ∀ n k : Nat, 0 < n → 0 < k → n - k < n := by
+  intro n k hn hk
+  let env : Nat → Nat | 0 => n | _ => k
+  exact autoProveNorm_sound
+    (hyps := [.lt (.const 0) (.var 0), .lt (.const 0) (.var 1)])
+    (fuel := 12) (goal := exprCountdownDec) (by decide) env
+    (by
+      intro h hh
+      simp only [List.mem_cons, List.mem_nil_iff, or_false] at hh
+      rcases hh with rfl | rfl <;> simpa [LawProp.Holds, LawExpr.eval, env])
+
+theorem law_ne_zero_decreases : ∀ n : Nat, n ≠ 0 → n - 1 < n := by
+  intro n hne
+  let env : Nat → Nat | _ => n
+  exact autoProveNorm_sound
+    (hyps := [.ne (.var 0) (.const 0)])
+    (fuel := 12) (goal := exprNeZeroDec) (by decide) env
+    (by
+      intro h hh
+      simp only [List.mem_singleton] at hh
+      subst hh
+      simpa [LawProp.Holds, LawExpr.eval, env] using hne)
+
+theorem law_upward_decreases : ∀ x lim k : Nat, x < lim → 0 < k → lim - (x + k) < lim - x := by
+  intro x lim k hlt hk
+  let env : Nat → Nat | 0 => x | 1 => lim | _ => k
+  exact autoProveNorm_sound
+    (hyps := [.lt (.var 0) (.var 1), .lt (.const 0) (.var 2)])
+    (fuel := 12) (goal := exprUpwardDec) (by decide) env
+    (by
+      intro h hh
+      simp only [List.mem_cons, List.mem_nil_iff, or_false] at hh
+      rcases hh with rfl | rfl <;> simpa [LawProp.Holds, LawExpr.eval, env])
 
 end Aethel.LawAutoProver

@@ -1,0 +1,112 @@
+// Stage B Showcase:
+// 1. FFD sub-byte bit packing (PackedTelemetry: 6 -> 2 bytes with comptime @sizeOf verification)
+// 2. Compact single-byte ADT (CompactStatus: 2-bit tag + 4-bit payload = 1 byte)
+// 3. @layout(auto) hot/cold reordering + 64B-aligned AoSoA(8) @Vector(8, f32) SIMD pass
+// 4. @parallel fork / join executing concurrent branches on real OS threads via std.Thread
+
+type PackedTelemetry {
+  ok: bool,
+  mode: Int(0..=7),
+  armed: bool,
+  fault: bool,
+  retry: Int(0..=3),
+  code: u8,
+}
+
+type ConcurrentLocks {
+  lane_a: bool,
+  lane_b: bool,
+}
+
+type CompactStatus {
+  Idle,
+  Moving(u4),
+  Poisoned(u4),
+  Dead,
+}
+
+@layout(auto)
+type Particle {
+  id: u32,
+  cooldown: f32,
+  x: f32,
+  vx: f32,
+}
+
+law preserve_particle_id(p: View(Particle, Exclusive)) {
+  preserves p.id
+}
+
+fn integrate_particles(fleet: View(Collection(Particle), Exclusive), dt: f32) {
+  fleet |> map_in_place(fn(p) {
+    p.x += p.vx * dt
+  })
+}
+
+fn status_score(st: CompactStatus) -> u8 {
+  case st {
+    Idle -> 0
+    Moving(spd) -> (spd as u8) *% 10
+    Poisoned(dmg) -> 100 -% (dmg as u8)
+    Dead -> 255
+  }
+}
+
+fn main() {
+  let mut tel = PackedTelemetry {
+    ok: true,
+    mode: 5,
+    armed: true,
+    fault: false,
+    retry: 2,
+    code: 42,
+  }
+  tel.fault = true
+
+  let s1 = Moving(6)
+  let s2 = Poisoned(12)
+  let s3 = Idle
+
+  let mut swarm: Collection(Particle) = [
+    Particle { id: 1u32, cooldown: 0.0f32, x: 0.0f32, vx: 2.0f32 },
+    Particle { id: 2u32, cooldown: 0.0f32, x: 1.0f32, vx: 3.0f32 },
+    Particle { id: 3u32, cooldown: 0.0f32, x: 2.0f32, vx: 4.0f32 },
+    Particle { id: 4u32, cooldown: 0.0f32, x: 3.0f32, vx: 5.0f32 },
+    Particle { id: 5u32, cooldown: 0.0f32, x: 4.0f32, vx: 6.0f32 },
+    Particle { id: 6u32, cooldown: 0.0f32, x: 5.0f32, vx: 7.0f32 },
+    Particle { id: 7u32, cooldown: 0.0f32, x: 6.0f32, vx: 8.0f32 },
+    Particle { id: 8u32, cooldown: 0.0f32, x: 7.0f32, vx: 9.0f32 },
+    Particle { id: 9u32, cooldown: 0.0f32, x: 8.0f32, vx: 10.0f32 },
+    Particle { id: 10u32, cooldown: 0.0f32, x: 9.0f32, vx: 11.0f32 },
+  ]
+
+  integrate_particles(swarm, 0.5f32)
+
+  let mut locks = ConcurrentLocks { lane_a: false, lane_b: false }
+  let mut sum_low: f32 = 0.0f32
+  let mut sum_high: f32 = 0.0f32
+  let mut score_sum: u16 = 0
+
+  @parallel fork {
+    {
+      locks.lane_a = true
+      for i in 0..5 {
+        sum_low = sum_low + swarm[i].x
+      }
+    }
+    {
+      locks.lane_b = true
+      for j in 5..10 {
+        sum_high = sum_high + swarm[j].x
+      }
+    }
+    {
+      score_sum = (status_score(s1) as u16) +% (status_score(s2) as u16) +% (status_score(s3) as u16)
+    }
+  } join
+
+  println("PackedTelemetry.code=", tel.code, " fault=", tel.fault)
+  println("CompactStatus scores=", score_sum)
+  println("SIMD swarm[0].x=", swarm[0].x, " swarm[9].x=", swarm[9].x)
+  println("OS thread fork sums=", sum_low, " + ", sum_high, " locks=", locks.lane_a, "/", locks.lane_b)
+}

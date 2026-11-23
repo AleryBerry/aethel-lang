@@ -7162,6 +7162,10 @@
     "named": false
   },
   {
+    "type": "once",
+    "named": false
+  },
+  {
     "type": "opacity_modifier",
     "named": true
   },

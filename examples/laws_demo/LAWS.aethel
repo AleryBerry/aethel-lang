@@ -1,0 +1,14 @@
+// Constitutional laws automatically discovered for companion modules in this directory
+
+law preserve_unit_id(u: View(Unit, Exclusive)) {
+  preserves u.id, u.armor
+}
+
+law damage_never_heals(hp: u32, dmg: u32) {
+  always sat_sub(hp, dmg) <= hp
+}
+
+law damage_recovery(hp: u32, dmg: u32) {
+  when dmg <= hp
+  always sat_sub(hp, dmg) + dmg == hp
+}

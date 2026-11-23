@@ -22,6 +22,9 @@ private def runLNLAndLensTests : IO Unit := do
   have hRejLam := reusable_lam_cannot_capture_handle
   have hAccOnce := onceClosure_captures_handle_accepted
   have hRejDouble := onceClosure_double_call_rejected
+  have hRejLamOnce := reusable_lam_cannot_capture_onceClosure
+  have hAccViewOnce := onceClosure_captures_view_accepted
+  have hDropOnce := onceClosure_unused_drop_accepted
   have hCartDup : CtxSplit [(0, .byte), (1, .bool)] [(0, .byte), (1, .bool)] [(0, .byte), (1, .bool)] :=
     CtxSplit.cartesian_dup (fun p hp => by
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hp
@@ -31,6 +34,9 @@ private def runLNLAndLensTests : IO Unit := do
   have _ := hRejLam
   have _ := hAccOnce
   have _ := hRejDouble
+  have _ := hRejLamOnce
+  have _ := hAccViewOnce
+  have _ := hDropOnce
   have _ := hCartDup
 
   -- 2. Byte-level Lens laws on Core.State
@@ -117,6 +123,17 @@ private def runFusionTests : IO Unit := do
     let foldAfter := foldField 0 lay len fields 1 (0 : Nat) (fun acc b => acc + b.toNat) stAdd3
     let foldFused := foldField 0 lay len fields 1 (0 : Nat) (fun acc b => acc + (b + 3).toNat) st0
     require "map-fold deforestation matches" (foldAfter == foldFused)
+    -- 3-stage pipeline fusion & fold deforestation
+    let stages : List (UInt8 → UInt8) := [fn1, fn2, fun b => b + 7]
+    let stPipe := runPipeline 0 lay len fields 0 stages st0
+    let stPipeSingle := mapFieldInPlace 0 lay len fields 0 (composeStages stages) st0
+    for i in List.range len do
+      for f in List.range fields do
+        let loc : ByteLocation := ⟨0, collectionSlot lay len fields i f⟩
+        require "3-stage pipeline fusion matches" (stPipe.byte loc == stPipeSingle.byte loc)
+    let foldPipe := foldField 0 lay len fields 0 (0 : Nat) (fun acc b => acc + b.toNat) stPipe
+    let foldPipeDef := foldField 0 lay len fields 0 (0 : Nat) (fun acc b => acc + (composeStages stages b).toNat) st0
+    require "3-stage pipeline-fold deforestation matches" (foldPipe == foldPipeDef)
 
 private def exceptEq [BEq ε] [BEq α] : Except ε α → Except ε α → Bool
   | .ok a, .ok b => a == b
@@ -165,6 +182,15 @@ private def runCombinatorTests : IO Unit := do
     | .error e => e == "overflowA"
     | .ok _ => false
   require "fallible in-place pipeline rejects out-of-range byte" errMatched
+  require "optMap_unwrapOr some" ((Option.map (· * 3) (some (4 : Nat))).getD 9 == 12)
+  require "optMap_unwrapOr none" ((Option.map (· * 3) (none : Option Nat)).getD 9 == 9)
+  require "resMap_unwrapOr ok" (resUnwrapOr (resMap (· + 5) (Except.ok (4 : Nat) : Except String Nat)) 0 == 9)
+  require "resMap_unwrapOr err" (resUnwrapOr (resMap (· + 5) (Except.error "bad" : Except String Nat)) 99 == 99)
+  let optK : Nat → Option Nat := fun x => if x > 0 then some (x + 2) else none
+  require "optToResult_andThen_natural"
+    (exceptEq
+      (resAndThen (optionToResult "missing" (some (5 : Nat))) (fun x => optionToResult "missing" (optK x)))
+      (optionToResult "missing" (optAndThen (some (5 : Nat)) optK)))
 
 def run : IO Unit := do
   runLNLAndLensTests

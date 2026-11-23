@@ -3,11 +3,14 @@ import Aethel.CoBorrowPacking
 import Aethel.CacheLayout
 import Aethel.LawFrameDischarge
 import Aethel.ConstitutionalLaws
+import Aethel.InterprocBorrow
+import Aethel.Iteration
 
 namespace Aethel.MIRValidator
 
 open Aethel Aethel.Core Aethel.AutomaticLayout Aethel.CoBorrowPacking
-open Aethel.CacheLayout Aethel.LawFrameDischarge
+open Aethel.CacheLayout Aethel.LawFrameDischarge Aethel.Permissions Aethel.InterprocBorrow
+open Aethel.LawAutoProver
 
 /-!
 ## Versioned MIR Certificate Validator (Phase 5 Lean Gate)
@@ -33,18 +36,41 @@ structure MIRCollectionDecl where
   fieldCount : Nat
   deriving Repr, DecidableEq
 
+structure MIRDecreasesCert where
+  guards : List LawProp := []
+  curMeasure : LawExpr
+  nextMeasure : LawExpr
+  deriving Repr, DecidableEq
+
+inductive MIRLawKind where
+  | always
+  | never
+  deriving Repr, DecidableEq
+
+structure MIRLawDecl where
+  name : String
+  kind : MIRLawKind
+  hyps : List LawProp := []
+  goal : LawProp
+  deriving Repr, DecidableEq
+
 structure MIRFunctionDecl where
   name : String
   effects : Effect
   preserves : List (List Nat)
   body : Program
-  deriving Repr, DecidableEq
+  permAllocSize : Nat := 0
+  permTrace : List PermInstr := []
+  disjointCerts : List MIRDisjointCert := []
+  decreasesCerts : List MIRDecreasesCert := []
+  deriving Repr
 
 structure MIRModule where
   version : Nat
   records : List MIRRecordDecl := []
   collections : List MIRCollectionDecl := []
   functions : List MIRFunctionDecl := []
+  laws : List MIRLawDecl := []
   deriving Repr
 
 inductive MIRError where
@@ -54,12 +80,18 @@ inductive MIRError where
   | invalidCollectionLayout (name : String)
   | invalidResources (fnName : String)
   | frameViolation (fnName : String)
+  | invalidPermTrace (fnName : String)
+  | invalidDisjointCert (fnName : String)
+  | invalidDecreasesCert (fnName : String)
+  | lawCounterexample (lawName witness : String)
+  | unprovedLaw (lawName : String)
   deriving Repr, DecidableEq
 
 structure MIRCertificate where
   version : Nat
   recordSizes : List (String × Nat)
   functionCount : Nat
+  lawCount : Nat := 0
   deriving Repr, DecidableEq
 
 /-- Independent mathematical specification of a valid MIR module. -/
@@ -73,15 +105,50 @@ def MIRRecordDecl.Valid (r : MIRRecordDecl) : Prop :=
 def MIRCollectionDecl.Valid (c : MIRCollectionDecl) : Prop :=
   c.layout.Valid ∧ 0 < c.fieldCount
 
+def MIRDecreasesCert.Valid (d : MIRDecreasesCert) : Prop :=
+  ∀ env : Nat → Nat, (∀ h ∈ d.guards, h.Holds env) → d.nextMeasure.eval env < d.curMeasure.eval env
+
+def checkDecreasesCert (d : MIRDecreasesCert) : Bool :=
+  autoProveNorm d.guards 12 (.lt d.nextMeasure d.curMeasure)
+
+theorem checkDecreasesCert_sound {d : MIRDecreasesCert}
+    (hOk : checkDecreasesCert d = true) : d.Valid :=
+  autoProveNorm_sound hOk
+
+theorem decreasesCert_implies_loopWF_progress {S : Type} (cond : S → Bool) (step : S → S)
+    (val : S → Nat → Nat) (d : MIRDecreasesCert) (hVal : d.Valid)
+    (hRel : ∀ s, cond s = true →
+      (∀ h ∈ d.guards, h.Holds (val s)) ∧
+      d.curMeasure.eval (val (step s)) = d.nextMeasure.eval (val s)) :
+    ∀ s, cond s = true → d.curMeasure.eval (val (step s)) < d.curMeasure.eval (val s) := by
+  intro s hs
+  obtain ⟨hGuards, hEq⟩ := hRel s hs
+  rw [hEq]
+  exact hVal (val s) hGuards
+
+private def MIRLawDecl.targetProp (l : MIRLawDecl) : LawProp :=
+  match l.kind with
+  | .always => l.goal
+  | .never => .not l.goal
+
+def MIRLawDecl.Valid (l : MIRLawDecl) : Prop :=
+  match l.kind with
+  | .always => ∀ env : Nat → Nat, (∀ h ∈ l.hyps, h.Holds env) → l.goal.Holds env
+  | .never => ∀ env : Nat → Nat, (∀ h ∈ l.hyps, h.Holds env) → ¬ l.goal.Holds env
+
 def MIRFunctionDecl.Valid (f : MIRFunctionDecl) : Prop :=
   (∃ final, Runs {} f.body final ∧ final.views = []) ∧
-  EffectPreserves f.effects f.preserves
+  EffectPreserves f.effects f.preserves ∧
+  (f.permTrace ≠ [] → PermTraceValid f.permAllocSize f.permTrace) ∧
+  (∀ c ∈ f.disjointCerts, c.Valid) ∧
+  (∀ d ∈ f.decreasesCerts, d.Valid)
 
 def MIRModule.Valid (m : MIRModule) : Prop :=
   m.version = currentMIRVersion ∧
   (∀ r ∈ m.records, r.Valid) ∧
   (∀ c ∈ m.collections, c.Valid) ∧
-  (∀ f ∈ m.functions, f.Valid)
+  (∀ f ∈ m.functions, f.Valid) ∧
+  (∀ l ∈ m.laws, l.Valid)
 
 def validateRecord (r : MIRRecordDecl) : Except MIRError (String × Nat) :=
   let g : CoBorrowGraph := ⟨r.fields.length, r.conflicts⟩
@@ -106,7 +173,18 @@ def validateCollection (c : MIRCollectionDecl) : Except MIRError Unit :=
 def validateFunction (f : MIRFunctionDecl) : Except MIRError Unit :=
   if !verifyResources f.body then .error (.invalidResources f.name)
   else if !checkEffectPreserves f.effects f.preserves then .error (.frameViolation f.name)
+  else if !f.permTrace.isEmpty && !verifyPermTrace f.permAllocSize f.permTrace then .error (.invalidPermTrace f.name)
+  else if !f.disjointCerts.all checkDisjointCert then .error (.invalidDisjointCert f.name)
+  else if !f.decreasesCerts.all checkDecreasesCert then .error (.invalidDecreasesCert f.name)
   else .ok ()
+
+def validateLaw (l : MIRLawDecl) : Except MIRError Unit :=
+  let prop := l.targetProp
+  if autoProveNorm l.hyps 12 prop then .ok ()
+  else
+    match falsifySymbolic 6 l.hyps prop with
+    | some (v0, v1, v2) => .error (.lawCounterexample l.name s!"v0={v0}, v1={v1}, v2={v2}")
+    | none => .error (.unprovedLaw l.name)
 
 def validateRecords : List MIRRecordDecl → Except MIRError (List (String × Nat))
   | [] => .ok []
@@ -132,6 +210,13 @@ def validateFunctions : List MIRFunctionDecl → Except MIRError Unit
     | .error e => .error e
     | .ok () => validateFunctions fs
 
+def validateLaws : List MIRLawDecl → Except MIRError Unit
+  | [] => .ok ()
+  | l :: ls =>
+    match validateLaw l with
+    | .error e => .error e
+    | .ok () => validateLaws ls
+
 def validateMIR (m : MIRModule) : Except MIRError MIRCertificate :=
   if m.version != currentMIRVersion then
     .error (.unsupportedVersion m.version currentMIRVersion)
@@ -144,7 +229,10 @@ def validateMIR (m : MIRModule) : Except MIRError MIRCertificate :=
       | .ok () =>
         match validateFunctions m.functions with
         | .error e => .error e
-        | .ok () => .ok ⟨m.version, sizes, m.functions.length⟩
+        | .ok () =>
+          match validateLaws m.laws with
+          | .error e => .error e
+          | .ok () => .ok ⟨m.version, sizes, m.functions.length, m.laws.length⟩
 
 theorem validateRecord_sound {r : MIRRecordDecl} {pair : String × Nat}
     (hOk : validateRecord r = .ok pair) :
@@ -185,22 +273,70 @@ theorem validateCollection_sound {c : MIRCollectionDecl}
       exact hCond
   · cases hOk
 
+private theorem if_err_eq_ok {α ε : Type} (cond : Bool) (err : ε) (k : Except ε α) (v : α)
+    (h : (if cond then .error err else k) = .ok v) :
+    cond = false ∧ k = .ok v := by
+  by_cases hc : cond = true
+  · simp [hc] at h
+  · have hf : cond = false := Bool.eq_false_iff.mpr hc
+    simp [hf] at h
+    exact ⟨hf, h⟩
+
 theorem validateFunction_sound {f : MIRFunctionDecl}
     (hOk : validateFunction f = .ok ()) :
     f.Valid := by
   dsimp [validateFunction] at hOk
-  by_cases hRes : verifyResources f.body = true
-  · simp only [hRes, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hOk
-    by_cases hFrm : checkEffectPreserves f.effects f.preserves = true
-    · exact ⟨(verifyResources_correct f.body).mp hRes,
-        (checkEffectPreserves_correct f.effects f.preserves).mp hFrm⟩
-    · have hFrmF : checkEffectPreserves f.effects f.preserves = false :=
-        Bool.eq_false_iff.mpr hFrm
-      simp only [hFrmF, Bool.not_false, ↓reduceIte] at hOk
-      cases hOk
-  · have hResF : verifyResources f.body = false := Bool.eq_false_iff.mpr hRes
-    simp only [hResF, Bool.not_false, ↓reduceIte] at hOk
-    cases hOk
+  obtain ⟨hResF, h1⟩ := if_err_eq_ok _ _ _ _ hOk
+  obtain ⟨hFrmF, h2⟩ := if_err_eq_ok _ _ _ _ h1
+  obtain ⟨hPermF, h3⟩ := if_err_eq_ok _ _ _ _ h2
+  obtain ⟨hDisjF, h4⟩ := if_err_eq_ok _ _ _ _ h3
+  obtain ⟨hDecF, _⟩ := if_err_eq_ok _ _ _ _ h4
+  have hRes : verifyResources f.body = true := by
+    cases hb : verifyResources f.body <;> simp_all
+  have hFrm : checkEffectPreserves f.effects f.preserves = true := by
+    cases hb : checkEffectPreserves f.effects f.preserves <;> simp_all
+  have hDisj : f.disjointCerts.all checkDisjointCert = true := by
+    cases hb : f.disjointCerts.all checkDisjointCert <;> simp_all
+  have hDec : f.decreasesCerts.all checkDecreasesCert = true := by
+    cases hb : f.decreasesCerts.all checkDecreasesCert <;> simp_all
+  have hPermSpec : f.permTrace ≠ [] → PermTraceValid f.permAllocSize f.permTrace := by
+    intro hNe
+    have hEmptyFalse : f.permTrace.isEmpty = false := by
+      cases hp : f.permTrace with
+      | nil => exact False.elim (hNe hp)
+      | cons _ _ => rfl
+    by_cases hOkP : verifyPermTrace f.permAllocSize f.permTrace = true
+    · exact (verifyPermTrace_correct f.permAllocSize f.permTrace).mp hOkP
+    · simp_all
+  exact ⟨(verifyResources_correct f.body).mp hRes,
+    (checkEffectPreserves_correct f.effects f.preserves).mp hFrm,
+    hPermSpec,
+    fun c hc => checkDisjointCert_sound (List.all_eq_true.mp hDisj c hc),
+    fun d hd => checkDecreasesCert_sound (List.all_eq_true.mp hDec d hd)⟩
+
+theorem validateLaw_sound {l : MIRLawDecl}
+    (hOk : validateLaw l = .ok ()) : l.Valid := by
+  dsimp [validateLaw] at hOk
+  by_cases hPrv : autoProveNorm l.hyps 12 l.targetProp = true
+  · have hSpec := autoProveNorm_sound hPrv
+    cases hk : l.kind <;>
+      simpa [MIRLawDecl.Valid, MIRLawDecl.targetProp, LawProp.Holds, hk] using hSpec
+  · simp only [hPrv, Bool.false_eq_true, ↓reduceIte] at hOk
+    cases hFal : falsifySymbolic 6 l.hyps l.targetProp <;> rw [hFal] at hOk <;> cases hOk
+
+theorem validateLaw_counterexample_refutes {l : MIRLawDecl} {w : String}
+    (hErr : validateLaw l = .error (.lawCounterexample l.name w)) : ¬ l.Valid := by
+  dsimp [validateLaw] at hErr
+  by_cases hPrv : autoProveNorm l.hyps 12 l.targetProp = true
+  · simp [hPrv] at hErr
+  · simp only [hPrv, Bool.false_eq_true, ↓reduceIte] at hErr
+    cases hFal : falsifySymbolic 6 l.hyps l.targetProp with
+    | none => rw [hFal] at hErr; cases hErr
+    | some triple =>
+      obtain ⟨v0, v1, v2⟩ := triple
+      have hNot := falsifySymbolic_sound hFal
+      cases hk : l.kind <;>
+        simpa [MIRLawDecl.Valid, MIRLawDecl.targetProp, LawProp.Holds, hk] using hNot
 
 theorem validateRecords_sound {rs : List MIRRecordDecl} {sizes : List (String × Nat)}
     (hOk : validateRecords rs = .ok sizes) :
@@ -270,6 +406,27 @@ theorem validateFunctions_sound {fs : List MIRFunctionDecl}
       · exact validateFunction_sound h1
       · exact ih hOk x hxRest
 
+theorem validateLaws_sound {ls : List MIRLawDecl}
+    (hOk : validateLaws ls = .ok ()) :
+    ∀ l ∈ ls, l.Valid := by
+  induction ls with
+  | nil =>
+    intro _ hl
+    cases hl
+  | cons l ls ih =>
+    dsimp [validateLaws] at hOk
+    cases h1 : validateLaw l with
+    | error e =>
+      rw [h1] at hOk
+      cases hOk
+    | ok u =>
+      rw [h1] at hOk
+      intro x hx
+      simp only [List.mem_cons] at hx
+      rcases hx with rfl | hxRest
+      · exact validateLaw_sound h1
+      · exact ih hOk x hxRest
+
 theorem validateMIR_sound {m : MIRModule} {cert : MIRCertificate}
     (hOk : validateMIR m = .ok cert) :
     m.Valid := by
@@ -287,8 +444,12 @@ theorem validateMIR_sound {m : MIRModule} {cert : MIRCertificate}
         cases hF : validateFunctions m.functions with
         | error e => rw [hF] at hOk; cases hOk
         | ok u2 =>
-          exact ⟨hVer, validateRecords_sound hR, validateCollections_sound hC,
-            validateFunctions_sound hF⟩
+          rw [hF] at hOk
+          cases hL : validateLaws m.laws with
+          | error e => rw [hL] at hOk; cases hOk
+          | ok u3 =>
+            exact ⟨hVer, validateRecords_sound hR, validateCollections_sound hC,
+              validateFunctions_sound hF, validateLaws_sound hL⟩
   · have hBne : (m.version != currentMIRVersion) = true := bne_iff_ne.mpr hVer
     simp only [hBne, ↓reduceIte] at hOk
     cases hOk
@@ -314,6 +475,59 @@ private def parseNatTok (tok : String) : Except String Nat :=
   match tok.toNat? with
   | some n => .ok n
   | none => .error s!"expected natural number, got '{tok}'"
+
+private def parseBorrowPerm : String → Except String BorrowPerm
+  | "shared" => .ok .shared
+  | "reserved" => .ok .reserved
+  | "exclusive" | "active_exclusive" => .ok .activeExclusive
+  | "frozen" => .ok .frozen
+  | tok => .error s!"expected 'shared', 'reserved', 'exclusive', or 'frozen', got '{tok}'"
+
+private def parseIdxAtom (tok : String) : Except String IdxExpr :=
+  match tok.splitOn "v" with
+  | ["", rest] => return .value (← parseNatTok rest)
+  | _ => return .const (← parseNatTok tok)
+
+private def parseIdxExpr (tok : String) : Except String IdxExpr := do
+  let parts := tok.splitOn "+"
+  let atoms ← parts.mapM parseIdxAtom
+  match atoms with
+  | [] => .error s!"empty index expression '{tok}'"
+  | a :: rest => return rest.foldl .add a
+
+private def parseVarIdTok (tok : String) : Except String Nat :=
+  match tok.splitOn "v" with
+  | ["", rest] => parseNatTok rest
+  | _ => parseNatTok tok
+
+private def stepOrderFact (env : OrderFactEnv) (item : String) : Except String OrderFactEnv := do
+  match item.splitOn ":" with
+  | ["ne", pairTok] =>
+    match pairTok.splitOn "," with
+    | [aTok, bTok] =>
+      let a ← parseIdxExpr aTok
+      let b ← parseIdxExpr bTok
+      return { env with base := env.base.assumeNe a b }
+    | _ => .error s!"expected 'ne:<a>,<b>', got '{item}'"
+  | ["lt", pairTok] =>
+    match pairTok.splitOn "," with
+    | [xTok, yTok] =>
+      let x ← parseVarIdTok xTok
+      let y ← parseVarIdTok yTok
+      return env.assumeLt x y
+    | _ => .error s!"expected 'lt:<x>,<y>', got '{item}'"
+  | ["le", pairTok] =>
+    match pairTok.splitOn "," with
+    | [xTok, yTok] =>
+      let x ← parseVarIdTok xTok
+      let y ← parseVarIdTok yTok
+      return env.assumeLe x y
+    | _ => .error s!"expected 'le:<x>,<y>', got '{item}'"
+  | _ => .error s!"expected order fact 'ne:...', 'lt:...', or 'le:...', got '{item}'"
+
+private def parseOrderFactEnv (tok : String) : Except String OrderFactEnv :=
+  if tok == "none" then .ok {}
+  else (tok.splitOn ";").foldlM stepOrderFact {}
 
 private def parseAccessMode : String → Except String AccessMode
   | "shared" => .ok .shared
@@ -355,10 +569,110 @@ private def parseInstruction : List String → Except String Instruction
   | ["destroy", ownerTok] => return .destroy (← parseNatTok ownerTok)
   | toks => .error s!"unrecognized MIR instruction '{String.intercalate " " toks}'"
 
+private def parseLawExprFuel : Nat → List String → Except String (LawExpr × List String)
+  | 0, _ => .error "law expression exceeded parser depth budget"
+  | _, [] => .error "unexpected end of law expression"
+  | fuel + 1, tok :: rest =>
+    if tok == "add" then do
+      let (a, r1) ← parseLawExprFuel fuel rest
+      let (b, r2) ← parseLawExprFuel fuel r1
+      return (.add a b, r2)
+    else if tok == "sub" then do
+      let (a, r1) ← parseLawExprFuel fuel rest
+      let (b, r2) ← parseLawExprFuel fuel r1
+      return (.sub a b, r2)
+    else if tok == "mul" then do
+      match rest with
+      | cTok :: r0 =>
+        let c ← parseNatTok cTok
+        let (e, r1) ← parseLawExprFuel fuel r0
+        return (.mulConst c e, r1)
+      | [] => .error "expected constant after 'mul' in law expression"
+    else if tok == "min" then do
+      let (a, r1) ← parseLawExprFuel fuel rest
+      let (b, r2) ← parseLawExprFuel fuel r1
+      return (.min a b, r2)
+    else if tok == "max" then do
+      let (a, r1) ← parseLawExprFuel fuel rest
+      let (b, r2) ← parseLawExprFuel fuel r1
+      return (.max a b, r2)
+    else
+      match tok.splitOn "v" with
+      | ["", nTok] => do
+        let n ← parseNatTok nTok
+        return (.var n, rest)
+      | _ => do
+        let n ← parseNatTok tok
+        return (.const n, rest)
+
+private def parseLawPropFuel : Nat → List String → Except String (LawProp × List String)
+  | 0, _ => .error "law proposition exceeded parser depth budget"
+  | _, [] => .error "unexpected end of law proposition"
+  | fuel + 1, tok :: rest =>
+    if tok == "tt" then return (.tt, rest)
+    else if tok == "ff" then return (.ff, rest)
+    else if tok == "eq" then do
+      let (a, r1) ← parseLawExprFuel (rest.length + 1) rest
+      let (b, r2) ← parseLawExprFuel (r1.length + 1) r1
+      return (.eq a b, r2)
+    else if tok == "ne" then do
+      let (a, r1) ← parseLawExprFuel (rest.length + 1) rest
+      let (b, r2) ← parseLawExprFuel (r1.length + 1) r1
+      return (.ne a b, r2)
+    else if tok == "le" then do
+      let (a, r1) ← parseLawExprFuel (rest.length + 1) rest
+      let (b, r2) ← parseLawExprFuel (r1.length + 1) r1
+      return (.le a b, r2)
+    else if tok == "lt" then do
+      let (a, r1) ← parseLawExprFuel (rest.length + 1) rest
+      let (b, r2) ← parseLawExprFuel (r1.length + 1) r1
+      return (.lt a b, r2)
+    else if tok == "not" then do
+      let (p, r1) ← parseLawPropFuel fuel rest
+      return (.not p, r1)
+    else if tok == "and" then do
+      let (p, r1) ← parseLawPropFuel fuel rest
+      let (q, r2) ← parseLawPropFuel fuel r1
+      return (.and p q, r2)
+    else if tok == "or" then do
+      let (p, r1) ← parseLawPropFuel fuel rest
+      let (q, r2) ← parseLawPropFuel fuel r1
+      return (.or p q, r2)
+    else if tok == "imp" then do
+      let (p, r1) ← parseLawPropFuel fuel rest
+      let (q, r2) ← parseLawPropFuel fuel r1
+      return (.imp p q, r2)
+    else .error s!"unexpected token '{tok}' in law proposition"
+
+private def parseLawPropListFuel : Nat → Nat → List String → Except String (List LawProp × List String)
+  | _, 0, toks => return ([], toks)
+  | 0, _ + 1, _ => .error "decreases guard list exceeded parser depth budget"
+  | fuel + 1, n + 1, toks => do
+    let (p, r1) ← parseLawPropFuel (toks.length + 1) toks
+    let (ps, r2) ← parseLawPropListFuel fuel n r1
+    return (p :: ps, r2)
+
+private def parseLawPropExact (toks : List String) : Except String LawProp := do
+  let (p, rest) ← parseLawPropFuel (toks.length + 1) toks
+  if rest.isEmpty then return p
+  else .error s!"trailing tokens in law proposition: '{String.intercalate " " rest}'"
+
+private def parseDecreasesArgs (toks : List String) : Except String MIRDecreasesCert := do
+  match toks with
+  | nTok :: rest =>
+    let n ← parseNatTok nTok
+    let (guards, r1) ← parseLawPropListFuel (n + 1) n rest
+    let (curM, r2) ← parseLawExprFuel (r1.length + 1) r1
+    let (nextM, r3) ← parseLawExprFuel (r2.length + 1) r2
+    if r3.isEmpty then return ⟨guards, curM, nextM⟩
+    else .error s!"trailing tokens in decreases certificate: '{String.intercalate " " r3}'"
+  | [] => .error "expected guard count after 'decreases'"
+
 private inductive ParseBlock where
   | top
   | inRecord (recDecl : MIRRecordDecl)
   | inFn (fnDecl : MIRFunctionDecl)
+  | inLaw (name : String) (kind : MIRLawKind) (hyps : List LawProp) (goal : Option LawProp)
 
 private structure ParseState where
   mod : MIRModule
@@ -391,7 +705,11 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
       let sz ← parseNatTok szTok
       return { st with block := .inRecord ⟨name, [], [], some sz⟩ }
     | ["fn", name] =>
-      return { st with block := .inFn ⟨name, .empty, [], []⟩ }
+      return { st with block := .inFn { name := name, effects := .empty, preserves := [], body := [] } }
+    | ["law_always", name] =>
+      return { st with block := .inLaw name .always [] none }
+    | ["law_never", name] =>
+      return { st with block := .inLaw name .never [] none }
     | _ => .error s!"unexpected top-level MIR directive '{String.intercalate " " toks}'"
   | .inRecord r =>
     match toks with
@@ -418,6 +736,45 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
     | ["preserves", pTok] =>
       let p ← parsePath pTok
       return { st with block := .inFn { f with preserves := f.preserves ++ [p] } }
+    | ["perm_alloc", lenTok] =>
+      let len ← parseNatTok lenTok
+      return { st with block := .inFn { f with permAllocSize := len } }
+    | ["perm_reserve", vidTok, offTok, permTok] =>
+      let vid ← parseNatTok vidTok
+      let off ← parseNatTok offTok
+      let perm ← parseBorrowPerm permTok
+      return { st with block := .inFn { f with permTrace := f.permTrace ++ [.reserve vid ⟨0, off⟩ perm] } }
+    | ["perm_activate", vidTok] =>
+      let vid ← parseNatTok vidTok
+      return { st with block := .inFn { f with permTrace := f.permTrace ++ [.activate vid] } }
+    | ["perm_freeze", vidTok] =>
+      let vid ← parseNatTok vidTok
+      return { st with block := .inFn { f with permTrace := f.permTrace ++ [.freeze vid] } }
+    | ["perm_read", vidTok] =>
+      let vid ← parseNatTok vidTok
+      return { st with block := .inFn { f with permTrace := f.permTrace ++ [.read vid] } }
+    | ["perm_write", vidTok, valTok] =>
+      let vid ← parseNatTok vidTok
+      let val ← parseNatTok valTok
+      return { st with block := .inFn { f with permTrace := f.permTrace ++ [.write vid val.toUInt8] } }
+    | ["perm_release", vidTok] =>
+      let vid ← parseNatTok vidTok
+      return { st with block := .inFn { f with permTrace := f.permTrace ++ [.release vid] } }
+    | ["disjoint_idx", envTok, aTok, bTok] =>
+      let env ← parseOrderFactEnv envTok
+      let a ← parseIdxExpr aTok
+      let b ← parseIdxExpr bTok
+      return { st with block := .inFn { f with disjointCerts := f.disjointCerts ++ [⟨env, .idxNe a b⟩] } }
+    | ["disjoint_slice", envTok, lo1Tok, hi1Tok, lo2Tok, hi2Tok] =>
+      let env ← parseOrderFactEnv envTok
+      let lo1 ← parseIdxExpr lo1Tok
+      let hi1 ← parseIdxExpr hi1Tok
+      let lo2 ← parseIdxExpr lo2Tok
+      let hi2 ← parseIdxExpr hi2Tok
+      return { st with block := .inFn { f with disjointCerts := f.disjointCerts ++ [⟨env, .sliceDisjoint ⟨lo1, hi1⟩ ⟨lo2, hi2⟩⟩] } }
+    | "decreases" :: rest =>
+      let dc ← parseDecreasesArgs rest
+      return { st with block := .inFn { f with decreasesCerts := f.decreasesCerts ++ [dc] } }
     | ["end_fn"] =>
       return { st with
         mod := { st.mod with functions := st.mod.functions ++ [f] }
@@ -425,10 +782,26 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
     | _ =>
       let instr ← parseInstruction toks
       return { st with block := .inFn { f with body := f.body ++ [instr] } }
+  | .inLaw lname lkind hyps goal =>
+    match toks with
+    | "hyp" :: rest =>
+      let hp ← parseLawPropExact rest
+      return { st with block := .inLaw lname lkind (hyps ++ [hp]) goal }
+    | "goal" :: rest =>
+      let gp ← parseLawPropExact rest
+      return { st with block := .inLaw lname lkind hyps (some gp) }
+    | ["end_law"] =>
+      match goal with
+      | some gp =>
+        return { st with
+          mod := { st.mod with laws := st.mod.laws ++ [⟨lname, lkind, hyps, gp⟩] }
+          block := .top }
+      | none => .error s!"law '{lname}' missing 'goal' directive before 'end_law'"
+    | _ => .error s!"unexpected law directive '{String.intercalate " " toks}'"
 
 def parseMIR (input : String) : Except String MIRModule := do
   let lines := input.splitOn "\n"
-  let init : ParseState := ⟨⟨0, [], [], []⟩, false, .top⟩
+  let init : ParseState := ⟨⟨0, [], [], [], []⟩, false, .top⟩
   let final ← lines.foldlM stepParseLine init
   if !final.hasVersion then
     .error "missing required 'mir_version <n>' header"
@@ -437,6 +810,7 @@ def parseMIR (input : String) : Except String MIRModule := do
     | .top => .ok final.mod
     | .inRecord r => .error s!"unterminated record block '{r.name}'"
     | .inFn f => .error s!"unterminated function block '{f.name}'"
+    | .inLaw n _ _ _ => .error s!"unterminated law block '{n}'"
 
 private def formatMIRError : MIRError → String
   | .unsupportedVersion actual expected =>
@@ -451,6 +825,16 @@ private def formatMIRError : MIRError → String
     s!"resource/borrow check failed in function '{fnName}'"
   | .frameViolation fnName =>
     s!"effect frame preservation failed in function '{fnName}'"
+  | .invalidPermTrace fnName =>
+    s!"two-phase lazy permission trace failed in function '{fnName}'"
+  | .invalidDisjointCert fnName =>
+    s!"affine index/slice disjointness certificate failed in function '{fnName}'"
+  | .invalidDecreasesCert fnName =>
+    s!"termination 'decreases' certificate failed in function '{fnName}'"
+  | .lawCounterexample lawName witness =>
+    s!"constitutional law '{lawName}' falsified at {witness}"
+  | .unprovedLaw lawName =>
+    s!"constitutional law '{lawName}' could not be proved at Tier 3"
 
 def validateMIRText (input : String) : Except String MIRCertificate := do
   let mod ← parseMIR input
@@ -519,9 +903,9 @@ def sampleValidCFMIR : MIRModule :=
             , .destroy 0 ] } ] }
 
 theorem validateMIR_accepts_valid_module :
-    validateMIR sampleValidCFMIR = .ok ⟨1, [], 1⟩ ∧
+    validateMIR sampleValidCFMIR = .ok ⟨1, [], 1, 0⟩ ∧
     sampleValidCFMIR.Valid := by
-  have hOk : validateMIR sampleValidCFMIR = .ok ⟨1, [], 1⟩ := by rfl
+  have hOk : validateMIR sampleValidCFMIR = .ok ⟨1, [], 1, 0⟩ := by rfl
   exact ⟨hOk, validateMIR_sound hOk⟩
 
 theorem validateMIR_rejects_forged_size (r : MIRRecordDecl) {lay : Layout} {sz : Nat}

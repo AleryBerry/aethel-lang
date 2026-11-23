@@ -314,3 +314,453 @@ test "10. Lean-compatible .mir v1 emission format" {
     try std.testing.expect(std.mem.indexOf(u8, mir_txt, "  effect_write 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, mir_txt, "  preserves 3\n") != null);
 }
+
+test "11. two-phase lazy exclusive borrow allows shared reads until activation write" {
+    var ok = try analyzeOk(
+        \\type Spaceship {
+        \\  x: i32,
+        \\  y: i32,
+        \\}
+        \\fn two_phase(mut ship: Spaceship) -> i32 {
+        \\  view exclusive w = ship {
+        \\    let snap = ship.x
+        \\    w.x = snap +% 10
+        \\  }
+        \\  ship.x
+        \\}
+    );
+    defer ok.deinit();
+
+    // Activating a reserved exclusive view while a shared view is still live must fail.
+    try expectSemaError(
+        \\type Spaceship { x: i32 }
+        \\fn blocked_activate(mut ship: Spaceship) -> i32 {
+        \\  let mut out: i32 = 0
+        \\  view shared r = ship.x {
+        \\    view exclusive w = ship.x {
+        \\      w.x = 10
+        \\    }
+        \\    let _ = r
+        \\  }
+        \\  out
+        \\}
+    , .borrow_conflict);
+
+    // Raw read after activation while `w` still has a later use must fail.
+    try expectSemaError(
+        \\type Spaceship { x: i32, y: i32 }
+        \\fn raw_read_after_activate(mut ship: Spaceship) -> i32 {
+        \\  view exclusive w = ship {
+        \\    w.x = 10
+        \\    let clash = ship.x
+        \\    w.y = clash
+        \\  }
+        \\  ship.x
+        \\}
+    , .borrow_conflict);
+}
+
+test "12. automatic last-use early view release unlocks same-block mutation and reads" {
+    var ok = try analyzeOk(
+        \\type Spaceship {
+        \\  x: i32,
+        \\  y: i32,
+        \\}
+        \\fn early_release_demo(mut ship: Spaceship) -> i32 {
+        \\  view shared r = ship {
+        \\    let snap = r.x
+        \\    ship.x = snap +% 5
+        \\  }
+        \\  view exclusive w = ship {
+        \\    w.x = ship.x +% 3
+        \\    let after = ship.x
+        \\    let _ = after
+        \\  }
+        \\  ship.x
+        \\}
+    );
+    defer ok.deinit();
+
+    // Mutating `ship.x` BEFORE the last use of `r` must still be rejected.
+    try expectSemaError(
+        \\type Spaceship { x: i32 }
+        \\fn early_conflict(mut ship: Spaceship) -> i32 {
+        \\  view shared r = ship {
+        \\    ship.x = 5
+        \\    let snap = r.x
+        \\    let _ = snap
+        \\  }
+        \\  ship.x
+        \\}
+    , .borrow_conflict);
+}
+
+test "13. affine index and half-open slice disjointness (AffineIndex.lean)" {
+    var ok = try analyzeOk(
+        \\fn parallel_indexed(mut arr: [mut u32], i: u32, j: u32, mid: u32) {
+        \\  if i != j {
+        \\    fork {
+        \\      { arr[i] = 1u32 }
+        \\      { arr[j] = 2u32 }
+        \\    } join
+        \\  }
+        \\  fork {
+        \\    { arr[0] = 3u32 }
+        \\    { arr[1] = 4u32 }
+        \\  } join
+        \\  fork {
+        \\    { arr[i] = 5u32 }
+        \\    { arr[i + 1] = 6u32 }
+        \\  } join
+        \\  view exclusive left = arr[0..mid] {
+        \\    view exclusive right = arr[mid..arr.len] {
+        \\      fork {
+        \\        { left[0] = 10u32 }
+        \\        { right[0] = 20u32 }
+        \\      } join
+        \\    }
+        \\  }
+        \\}
+    );
+    defer ok.deinit();
+
+    // Unguarded `arr[i]` and `arr[j]` must fail with fork_data_race.
+    try expectSemaError(
+        \\fn bad_unguarded(mut arr: [mut u32], i: u32, j: u32) {
+        \\  fork {
+        \\    { arr[i] = 1u32 }
+        \\    { arr[j] = 2u32 }
+        \\  } join
+        \\}
+    , .fork_data_race);
+
+    // Reassigning `i` invalidates the SSA guard fact `i != j`.
+    try expectSemaError(
+        \\fn bad_reassigned(mut arr: [mut u32], mut i: u32, j: u32) {
+        \\  if i != j {
+        \\    i = i +% 1u32
+        \\    fork {
+        \\      { arr[i] = 1u32 }
+        \\      { arr[j] = 2u32 }
+        \\    } join
+        \\  }
+        \\}
+    , .fork_data_race);
+
+    // Overlapping slices `[0..mid)` and `[0..n)` conflict under exclusive view.
+    try expectSemaError(
+        \\fn bad_overlap_slices(mut arr: [mut u32], mid: u32, n: u32) {
+        \\  view exclusive left = arr[0..mid] {
+        \\    view exclusive right = arr[0..n] {
+        \\      let _ = left
+        \\      let _ = right
+        \\    }
+        \\  }
+        \\}
+    , .borrow_conflict);
+}
+
+test "14. transitive call-graph effects and returned caller-rooted Views" {
+    // 1. Transitive law violation through helper declared AFTER caller
+    try expectSemaError(
+        \\type Spaceship { x: i32, shield_on: u1 }
+        \\fn outer(s: Spaceship ~>.{x, shield_on}) {
+        \\  helper_hurt(s)
+        \\}
+        \\fn helper_hurt(s: Spaceship ~>.{shield_on}) {
+        \\  s.shield_on = 0u1
+        \\}
+        \\law keep_shield(s: View(Spaceship, Exclusive)) {
+        \\  preserves s.shield_on
+        \\}
+    , .law_violation);
+
+    // 2. Transitive fork_data_race through helper call
+    try expectSemaError(
+        \\type Spaceship { x: i32, y: i32 }
+        \\fn bump_x(s: Spaceship ~>.{x}) {
+        \\  s.x = s.x +% 1
+        \\}
+        \\fn race_via_call(mut s: Spaceship) {
+        \\  fork {
+        \\    { bump_x(s) }
+        \\    { s.x = 9 }
+        \\  } join
+        \\}
+    , .fork_data_race);
+
+    // 3. Transitive unauthorized field mutation via ~>.{x}
+    try expectSemaError(
+        \\type Spaceship { x: i32, y: i32 }
+        \\fn constrained(s: Spaceship ~>.{x}) {
+        \\  touch_y(s)
+        \\}
+        \\fn touch_y(s: Spaceship ~>.{y}) {
+        \\  s.y = 5
+        \\}
+    , .unauthorized_field_access);
+
+    // 4. Positive returned caller-rooted View
+    var ok_ret = try analyzeOk(
+        \\type Spaceship { x: i32, y: i32 }
+        \\fn borrow_ship(s: Spaceship ~>.{x}) -> View(Spaceship, Exclusive) {
+        \\  s
+        \\}
+        \\fn use_returned(mut s: Spaceship) -> i32 {
+        \\  let v = borrow_ship(s)
+        \\  v.x = 77
+        \\  s.x
+        \\}
+    );
+    defer ok_ret.deinit();
+
+    // 5. Returning a View to a stack-local variable must fail
+    try expectSemaError(
+        \\type Spaceship { x: i32, y: i32 }
+        \\fn dangling_local() -> View(Spaceship, Exclusive) {
+        \\  let mut s = Spaceship { x: 1, y: 2 }
+        \\  s
+        \\}
+    , .borrow_conflict);
+}
+
+test "15. Stage A .mir v1 emission includes two-phase perm_* and disjoint_* certificates" {
+    var checked = try analyzeOk(
+        \\type Ship { x: i32, y: i32 }
+        \\fn stage_a_fn(mut s: Ship, mut arr: [mut u32], i: u32, j: u32, mid: u32) {
+        \\  view exclusive w = s {
+        \\    let snap = s.x
+        \\    w.x = snap +% 1
+        \\  }
+        \\  if i != j {
+        \\    fork {
+        \\      { arr[i] = 1u32 }
+        \\      { arr[j] = 2u32 }
+        \\    } join
+        \\  }
+        \\  view exclusive l = arr[0..mid] {
+        \\    view exclusive r = arr[mid..arr.len] {
+        \\      fork {
+        \\        { l[0] = 3u32 }
+        \\        { r[0] = 4u32 }
+        \\      } join
+        \\    }
+        \\  }
+        \\}
+    );
+    defer checked.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try mir.emitMir(&checked, &out.writer);
+    const mir_txt = out.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "perm_alloc ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "reserved\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "perm_activate ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "perm_release ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "disjoint_idx ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "disjoint_slice ") != null);
+}
+
+test "16. Stage B @layout(auto), hot-first ordering, and @parallel scalar/field race checks" {
+    // 1. @layout(auto) picks AoSoA(8) on SIMD hot-field traversal and reorders hot fields before cold ones
+    var auto_res = try analyzeOk(
+        \\@layout(auto)
+        \\type Particle {
+        \\  note_tag: u32,
+        \\  cooldown: f32,
+        \\  x: f32,
+        \\  vx: f32,
+        \\}
+        \\fn step_all(fleet: Collection(Particle), dt: f32) {
+        \\  fleet |> map_in_place(fn(p) {
+        \\    p.x += p.vx * dt
+        \\  })
+        \\}
+    );
+    defer auto_res.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), auto_res.records.len);
+    const p_rec = auto_res.records[0];
+    try std.testing.expect(p_rec.collection_layout != null);
+    try std.testing.expect(p_rec.collection_layout.? == .aosoa);
+    try std.testing.expectEqual(@as(usize, 8), p_rec.collection_layout.?.aosoa);
+    try std.testing.expect(p_rec.auto_layout_decision != null);
+    // Hot fields (x=2, vx=3) must have lower byte_offset than cold fields (note_tag=0, cooldown=1)
+    try std.testing.expect(!p_rec.hot_fields[0]);
+    try std.testing.expect(!p_rec.hot_fields[1]);
+    try std.testing.expect(p_rec.hot_fields[2]);
+    try std.testing.expect(p_rec.hot_fields[3]);
+    try std.testing.expect(p_rec.record_layout.fields[2].byte_offset < p_rec.record_layout.fields[0].byte_offset);
+    try std.testing.expect(p_rec.record_layout.fields[3].byte_offset < p_rec.record_layout.fields[1].byte_offset);
+
+    // 2. @layout(auto) picks AoS on tiny len<=2 non-SIMD collections
+    var tiny_res = try analyzeOk(
+        \\@layout(auto)
+        \\type TinyRec {
+        \\  a: u32,
+        \\  b: u32,
+        \\}
+        \\fn mk() -> u32 {
+        \\  let mut items: Collection(TinyRec) = [
+        \\    TinyRec { a: 1u32, b: 2u32 },
+        \\    TinyRec { a: 3u32, b: 4u32 },
+        \\  ]
+        \\  items[0].a
+        \\}
+    );
+    defer tiny_res.deinit();
+    try std.testing.expect(tiny_res.records[0].collection_layout.? == .aos);
+
+    // 3. @parallel fork accepts disjoint branches + identically named branch-local accumulators + read-read shared scalar
+    var ok_par = try analyzeOk(
+        \\type Pair {
+        \\  left: u32,
+        \\  right: u32,
+        \\}
+        \\fn ok_parallel(mut pair: Pair, scale: u32) {
+        \\  @parallel fork {
+        \\    {
+        \\      let mut acc: u32 = 1u32
+        \\      acc = acc +% scale
+        \\      pair.left = acc
+        \\    }
+        \\    {
+        \\      let mut acc: u32 = 2u32
+        \\      acc = acc +% scale
+        \\      pair.right = acc
+        \\    }
+        \\  } join
+        \\}
+    );
+    defer ok_par.deinit();
+
+    // 4. @parallel fork rejects outer scalar variable write/read and write/write races
+    try expectSemaError(
+        \\fn bad_scalar_rw(mut total: u32) -> u32 {
+        \\  @parallel fork {
+        \\    { total = total +% 1u32 }
+        \\    { let _ = total }
+        \\  } join
+        \\  total
+        \\}
+    , .fork_data_race);
+
+    try expectSemaError(
+        \\fn bad_scalar_ww() -> u32 {
+        \\  let mut total: u32 = 0u32
+        \\  @parallel fork {
+        \\    { total = 1u32 }
+        \\    { total = 2u32 }
+        \\  } join
+        \\  total
+        \\}
+    , .fork_data_race);
+}
+
+test "17. Stage C LNL once closures, rank-1 generics, fused pipelines, combinators, and ? propagation" {
+    // 1. once fn captures affine Collection and can be called once; double call or post-capture use fails.
+    var ok_once = try analyzeOk(
+        \\fn consume_with_once(buf: Collection(u32)) -> u32 {
+        \\  let f: once fn() -> u32 = once fn() -> u32 { buf[0] }
+        \\  f()
+        \\}
+    );
+    defer ok_once.deinit();
+
+    try expectSemaError(
+        \\fn double_once_call(buf: Collection(u32)) -> u32 {
+        \\  let f = once fn() -> u32 { buf[0] }
+        \\  let a = f()
+        \\  let b = f()
+        \\  a +% b
+        \\}
+    , .use_after_move);
+
+    try expectSemaError(
+        \\fn use_after_once_capture(buf: Collection(u32)) -> u32 {
+        \\  let f = once fn() -> u32 { buf[0] }
+        \\  let x = buf[0]
+        \\  x +% f()
+        \\}
+    , .use_after_move);
+
+    try expectSemaError(
+        \\fn reusable_captures_affine(buf: Collection(u32)) -> fn() -> u32 {
+        \\  fn() -> u32 { buf[0] }
+        \\}
+    , .affine_capture);
+
+    try expectSemaError(
+        \\fn reusable_captures_once(buf: Collection(u32)) -> fn() -> u32 {
+        \\  let f = once fn() -> u32 { buf[0] }
+        \\  fn() -> u32 { f() }
+        \\}
+    , .affine_capture);
+
+    // 2. Gleam-style rank-1 generics
+    var ok_gen = try analyzeOk(
+        \\fn identity(x: a) -> a { x }
+        \\fn apply_twice(x: a, f: fn(a) -> a) -> a { f(f(x)) }
+        \\fn use_gen() -> i32 {
+        \\  let b: bool = identity(true)
+        \\  let _ = b
+        \\  apply_twice(10i32, fn(n: i32) -> i32 { n +% 1i32 })
+        \\}
+    );
+    defer ok_gen.deinit();
+
+    try expectSemaError(
+        \\fn same_pair(x: a, y: a) -> a { x }
+        \\fn bad_unify() -> i32 {
+        \\  same_pair(1i32, true)
+        \\}
+    , .type_mismatch);
+
+    // 3. Chained map_in_place |> map_in_place |> fold pipeline + hot-field marking
+    var ok_pipe = try analyzeOk(
+        \\@layout(auto)
+        \\type Signal {
+        \\  cold_tag: u32,
+        \\  x: f32,
+        \\  vx: f32,
+        \\}
+        \\fn fuse_sum(fleet: View(Collection(Signal), Exclusive), dt: f32) -> f32 {
+        \\  fleet
+        \\    |> map_in_place(fn(s) { s.x += s.vx * dt })
+        \\    |> map_in_place(fn(s) { s.x += 1.0f32 })
+        \\    |> fold(0.0f32, fn(acc, s) { acc + s.x })
+        \\}
+    );
+    defer ok_pipe.deinit();
+    try std.testing.expect(!ok_pipe.records[0].hot_fields[0]);
+    try std.testing.expect(ok_pipe.records[0].hot_fields[1]);
+    try std.testing.expect(ok_pipe.records[0].hot_fields[2]);
+    try std.testing.expect(ok_pipe.records[0].collection_layout.? == .aosoa);
+
+    // 4. Option/Result combinators + ? early-return propagation checks
+    var ok_comb = try analyzeOk(
+        \\fn comb_opt(x: Option(i32)) -> i32 {
+        \\  x |> map(fn(v) { v *% 2i32 }) |> and_then(fn(v) { Some(v +% 1i32) }) |> unwrap_or(0i32)
+        \\}
+        \\fn comb_res(x: Option(i32)) -> i32 {
+        \\  x |> ok_or(404u32) |> map(fn(v) { v +% 10i32 }) |> unwrap_or(-1i32)
+        \\}
+        \\fn prop_opt(a: Option(i32)) -> Option(i32) {
+        \\  let v = a?
+        \\  Some(v +% 1i32)
+        \\}
+        \\fn prop_res(r: Result(i32, u32)) -> Result(i32, u32) {
+        \\  let v = r?
+        \\  Ok(v +% 2i32)
+        \\}
+    );
+    defer ok_comb.deinit();
+
+    try expectSemaError(
+        \\fn bad_try(a: Option(i32)) -> i32 {
+        \\  a?
+        \\}
+    , .type_mismatch);
+}

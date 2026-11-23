@@ -330,6 +330,7 @@ module.exports = grammar({
 
     function_type: ($) =>
       seq(
+        optional("once"),
         "fn",
         "(",
         sepBy(",", $._type),
@@ -708,6 +709,7 @@ module.exports = grammar({
 
     anonymous_function: ($) =>
       seq(
+        optional("once"),
         "fn",
         field("parameters", $.function_parameters),
         optional(seq("->", field("return_type", $._type))),

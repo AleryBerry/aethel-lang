@@ -1,0 +1,21 @@
+// Companion LAWS.aethel discovery demo (`aethel verify examples/laws_demo/combat.aethel`)
+
+type Unit {
+  id: u32,
+  hp: u32,
+  armor: u32,
+}
+
+fn sat_sub(a: u32, b: u32) -> u32 {
+  a -| b
+}
+
+fn strike(u: Unit ~>.{hp}, raw_dmg: u32) {
+  u.hp = sat_sub(u.hp, raw_dmg)
+}
+
+fn main() {
+  let mut unit = Unit { id: 7u32, hp: 50u32, armor: 10u32 }
+  strike(unit, 18u32)
+  println("Unit hp=", unit.hp, " armor=", unit.armor, " id=", unit.id)
+}

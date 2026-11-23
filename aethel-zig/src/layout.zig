@@ -52,6 +52,102 @@ pub const CollectionLayout = union(enum) {
     }
 };
 
+pub const LoopAccessProfile = struct {
+    total_record_bytes: usize,
+    hot_record_bytes: usize,
+    hot_field_count: usize,
+    total_field_count: usize,
+    has_simd_loop: bool,
+    observed_len: ?usize,
+};
+
+pub const AutoLayoutDecision = struct {
+    selected: CollectionLayout,
+    hot_ratio_pct: usize,
+    reason: []const u8,
+};
+
+/// Select an L1-cache-aware collection layout from whole-module loop access profiling,
+/// mirroring `CacheLayout.selectCollectionLayout` in Lean.
+pub fn selectAutoCollectionLayout(profile: LoopAccessProfile) AutoLayoutDecision {
+    const total_bytes = @max(@as(usize, 1), profile.total_record_bytes);
+    const hot_bytes = if (profile.hot_field_count > 0)
+        @min(total_bytes, @max(@as(usize, 1), profile.hot_record_bytes))
+    else
+        total_bytes;
+    const ratio_pct = (hot_bytes * 100) / total_bytes;
+
+    if (!profile.has_simd_loop and profile.observed_len != null and profile.observed_len.? <= 2) {
+        return .{
+            .selected = .aos,
+            .hot_ratio_pct = ratio_pct,
+            .reason = "small collection (len <= 2) without SIMD loop; AoS avoids tile padding",
+        };
+    }
+
+    const has_partial_hot_access = profile.hot_field_count > 0 and
+        (profile.hot_field_count < profile.total_field_count or hot_bytes < total_bytes);
+
+    if (profile.has_simd_loop or has_partial_hot_access) {
+        if (hot_bytes * 8 <= 4096) {
+            return .{
+                .selected = .{ .aosoa = 8 },
+                .hot_ratio_pct = ratio_pct,
+                .reason = if (profile.has_simd_loop)
+                    "SIMD map_in_place loop detected; AoSoA(8) packs 8 contiguous lanes per L1 tile"
+                else
+                    "partial hot-field scan; AoSoA(8) packs hot fields into 8-element L1 cache tiles",
+            };
+        }
+        return .{
+            .selected = .soa,
+            .hot_ratio_pct = ratio_pct,
+            .reason = "large sparse hot fields (>4 KiB per 8-tile); SoA isolates cold fields",
+        };
+    }
+
+    if (profile.hot_field_count == 0 and total_bytes > 64 and
+        profile.observed_len != null and profile.observed_len.? >= 16)
+    {
+        return .{
+            .selected = .soa,
+            .hot_ratio_pct = ratio_pct,
+            .reason = "record exceeds 64B cache line on large collection; SoA improves streaming bandwidth",
+        };
+    }
+
+    return .{
+        .selected = .aos,
+        .hot_ratio_pct = ratio_pct,
+        .reason = "full-record spatial locality fits cleanly in AoS",
+    };
+}
+
+/// Stably partition `items` so entries with `is_hot[i] == true` precede cold entries,
+/// matching `CacheLayout.reorderHotFirst` in Lean.
+pub fn reorderHotFieldsFirst(
+    comptime T: type,
+    alloc: std.mem.Allocator,
+    items: []const T,
+    is_hot: []const bool,
+) std.mem.Allocator.Error![]T {
+    const out = try alloc.alloc(T, items.len);
+    var out_i: usize = 0;
+    for (items, 0..) |item, i| {
+        if (i < is_hot.len and is_hot[i]) {
+            out[out_i] = item;
+            out_i += 1;
+        }
+    }
+    for (items, 0..) |item, i| {
+        if (!(i < is_hot.len and is_hot[i])) {
+            out[out_i] = item;
+            out_i += 1;
+        }
+    }
+    return out;
+}
+
 pub const CompactADTLayout = struct {
     tag_bits: u16,
     max_payload_bits: u16,

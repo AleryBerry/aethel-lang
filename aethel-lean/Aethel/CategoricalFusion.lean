@@ -418,4 +418,54 @@ theorem map_fold_fusion {owner : OwnerId} {layout : CollectionLayout}
       foldField owner layout length fieldCount field init (fun acc b => step acc (f b)) s :=
   map_fold_fusion_loop hValid (Nat.le_refl _) hField f init step s
 
+def composeStages : List (UInt8 → UInt8) → UInt8 → UInt8
+  | [] => id
+  | f :: rest => composeStages rest ∘ f
+
+def runPipeline (owner : OwnerId) (layout : CollectionLayout)
+    (length fieldCount field : Nat) : List (UInt8 → UInt8) → Core.State → Core.State
+  | [], s => s
+  | f :: rest, s =>
+    runPipeline owner layout length fieldCount field rest
+      (mapFieldInPlace owner layout length fieldCount field f s)
+
+theorem runPipeline_eq_single_pass {owner : OwnerId} {layout : CollectionLayout}
+    (hValid : layout.Valid) {length fieldCount field : Nat}
+    (hField : field < fieldCount) (stages : List (UInt8 → UInt8)) (s : Core.State) :
+    ∀ loc, (runPipeline owner layout length fieldCount field stages s).byte loc =
+      (mapFieldInPlace owner layout length fieldCount field (composeStages stages) s).byte loc := by
+  induction stages generalizing s with
+  | nil =>
+    intro loc
+    exact (mapFieldInPlace_id hValid hField s loc).symm
+  | cons f rest ih =>
+    intro loc
+    dsimp [runPipeline, composeStages]
+    rw [ih (mapFieldInPlace owner layout length fieldCount field f s) loc]
+    exact mapFieldInPlace_fusion hValid hField f (composeStages rest) s loc
+
+private theorem foldFieldLoop_byte_congr {owner : OwnerId} {layout : CollectionLayout}
+    {length fieldCount field n : Nat} {β : Type} (step : β → UInt8 → β)
+    (init : β) {s₁ s₂ : Core.State}
+    (hEq : ∀ loc, s₁.byte loc = s₂.byte loc) :
+    foldFieldLoop owner layout length fieldCount field step s₁ init n =
+      foldFieldLoop owner layout length fieldCount field step s₂ init n := by
+  induction n with
+  | zero => rfl
+  | succ n ih =>
+    dsimp [foldFieldLoop, foldFieldStep]
+    rw [ih, hEq ⟨owner, collectionSlot layout length fieldCount n field⟩]
+
+theorem runPipeline_fold_deforestation {owner : OwnerId} {layout : CollectionLayout}
+    (hValid : layout.Valid) {length fieldCount field : Nat}
+    (hField : field < fieldCount) (stages : List (UInt8 → UInt8))
+    {β : Type} (init : β) (step : β → UInt8 → β) (s : Core.State) :
+    foldField owner layout length fieldCount field init step
+        (runPipeline owner layout length fieldCount field stages s) =
+      foldField owner layout length fieldCount field init
+        (fun acc b => step acc (composeStages stages b)) s := by
+  dsimp [foldField]
+  rw [foldFieldLoop_byte_congr step init (runPipeline_eq_single_pass hValid hField stages s)]
+  exact map_fold_fusion hValid hField (composeStages stages) init step s
+
 end Aethel.CategoricalFusion

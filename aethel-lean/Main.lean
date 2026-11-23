@@ -60,7 +60,7 @@ def main (args : List String) : IO UInt32 := do
       let contents ← IO.FS.readFile mirPath
       match Aethel.MIRValidator.validateMIRText contents with
       | .ok cert =>
-        IO.println s!"MIR verified (v{cert.version}, records={cert.recordSizes.length}, functions={cert.functionCount})"
+        IO.println s!"MIR verified (v{cert.version}, records={cert.recordSizes.length}, functions={cert.functionCount}, laws={cert.lawCount})"
         return 0
       | .error err =>
         IO.eprintln s!"MIR verification failed: {err}"

@@ -61,6 +61,7 @@ pub const LayoutSpec = union(enum) {
     aos,
     soa,
     aosoa: ?*const Expr,
+    auto,
     @"packed",
 };
 
@@ -105,6 +106,7 @@ pub const TypeExpr = union(enum) {
         span: Span,
         params: []const *const TypeExpr,
         ret: *const TypeExpr,
+        is_once: bool = false,
     },
     tuple: struct {
         span: Span,
@@ -408,6 +410,7 @@ pub const Expr = union(enum) {
         params: []const Param,
         ret: ?*const TypeExpr,
         body: Block,
+        is_once: bool = false,
     },
     view_expr: struct {
         span: Span,
@@ -420,6 +423,7 @@ pub const Expr = union(enum) {
         span: Span,
         branches: []const Block,
         explicit_join: bool,
+        is_parallel: bool = false,
     },
     todo_expr: struct {
         span: Span,
@@ -693,6 +697,7 @@ fn formatAttributes(source: []const u8, attrs: []const Attribute, writer: *Io.Wr
                         }
                         try writer.writeByte(')');
                     },
+                    .auto => try writer.writeAll("auto"),
                     .@"packed" => try writer.writeAll("packed"),
                 }
             },
@@ -934,7 +939,7 @@ pub fn formatType(source: []const u8, ty: *const TypeExpr, writer: *Io.Writer) I
             try writer.writeAll("})");
         },
         .fn_type => |ft| {
-            try writer.writeAll("(fn (");
+            try writer.writeAll(if (ft.is_once) "(once fn (" else "(fn (");
             for (ft.params, 0..) |p, i| {
                 if (i > 0) try writer.writeByte(' ');
                 try formatType(source, p, writer);
@@ -1250,7 +1255,7 @@ pub fn formatExpr(source: []const u8, expr: *const Expr, depth: usize, writer: *
             try writer.writeByte(')');
         },
         .lambda => |lam| {
-            try writer.writeAll("(fn ");
+            try writer.writeAll(if (lam.is_once) "(once fn " else "(fn ");
             try formatParams(source, lam.params, writer);
             if (lam.ret) |ret| {
                 try writer.writeAll(" -> ");
@@ -1272,6 +1277,7 @@ pub fn formatExpr(source: []const u8, expr: *const Expr, depth: usize, writer: *
         },
         .fork_expr => |fk| {
             try writer.writeAll("(fork");
+            if (fk.is_parallel) try writer.writeAll(" parallel");
             if (fk.explicit_join) try writer.writeAll(" join");
             for (fk.branches) |*br| {
                 try writer.writeByte(' ');

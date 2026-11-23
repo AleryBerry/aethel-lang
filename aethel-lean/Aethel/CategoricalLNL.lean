@@ -253,6 +253,24 @@ theorem onceClosure_double_call_rejected :
     exact CtxSplit.affine_not_both (by decide) hSplit
       (hSplitA.mem_left hInA) (hSplitB.mem_left hInB) rfl
 
+theorem reusable_lam_cannot_capture_onceClosure :
+    ¬ LNLWellTyped [(0, .onceArrow .unit .unit)]
+        (.lam 1 .unit (.var 0)) (.arrow .unit (.onceArrow .unit .unit)) := by
+  intro hT
+  cases hT with
+  | lam _ _ hAll _ =>
+    have hCopy := hAll (0, .onceArrow .unit .unit) List.mem_cons_self
+    cases hCopy
+
+theorem onceClosure_captures_view_accepted :
+    LNLWellTyped [(0, .view .exclusive)]
+        (.onceLam 1 .unit (.var 0)) (.onceArrow .unit (.view .exclusive)) :=
+  .onceLam 1 .unit (.var 0 (.view .exclusive) (List.mem_cons_of_mem _ List.mem_cons_self))
+
+theorem onceClosure_unused_drop_accepted :
+    LNLWellTyped [(0, .onceArrow .unit .unit)] .unit .unit :=
+  .unit _
+
 /-!
 ## Part B: Categorical Lens Laws for Mutable Byte Views & Bit-Packed Record Leaves
 -/

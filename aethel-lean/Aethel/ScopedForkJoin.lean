@@ -274,4 +274,84 @@ theorem fork_parent_write_during_child_read_rejected :
     checkForkDisjoint ⟨[⟨0, 0⟩], []⟩ ⟨[], [⟨0, 0⟩]⟩ = false := by
   decide
 
+/-! ## Multi-Branch OS-Thread Schedule Determinism (`@parallel fork / join`) -/
+
+structure ForkTask where
+  footprint : TaskFootprint
+  writes : TaskWrites
+  within : WritesWithin writes footprint
+
+def PairwiseForkDisjoint (tasks : List ForkTask) : Prop :=
+  tasks.Pairwise fun a b => ForkDisjoint a.footprint b.footprint
+
+def runForkSchedule (s : Core.State) (tasks : List ForkTask) : Core.State :=
+  tasks.foldl (fun st t => applyTaskWrites st t.writes) s
+
+private theorem runForkSchedule_byte_at {s1 s2 : Core.State} (tasks : List ForkTask)
+    (loc : ByteLocation) (hEq : s1.byte loc = s2.byte loc) :
+    (runForkSchedule s1 tasks).byte loc = (runForkSchedule s2 tasks).byte loc := by
+  induction tasks generalizing s1 s2 with
+  | nil => exact hEq
+  | cons t rest ih =>
+    dsimp [runForkSchedule]
+    exact ih (applyTaskWrites_byte_at t.writes loc hEq)
+
+theorem pairwiseForkDisjoint_perm {l1 l2 : List ForkTask}
+    (hPerm : List.Perm l1 l2) (hDisj : PairwiseForkDisjoint l1) :
+    PairwiseForkDisjoint l2 := by
+  induction hPerm with
+  | nil => exact .nil
+  | @cons x xs ys _ ih =>
+    dsimp [PairwiseForkDisjoint] at hDisj ⊢
+    rw [List.pairwise_cons] at hDisj ⊢
+    refine ⟨?_, ih hDisj.2⟩
+    intro z hz
+    exact hDisj.1 z ((List.Perm.mem_iff (by assumption)).mpr hz)
+  | swap x y l =>
+    dsimp [PairwiseForkDisjoint] at hDisj ⊢
+    rw [List.pairwise_cons] at hDisj
+    obtain ⟨hYAll, hXL⟩ := hDisj
+    rw [List.pairwise_cons] at hXL
+    obtain ⟨hXAll, hL⟩ := hXL
+    rw [List.pairwise_cons]
+    refine ⟨?_, ?_⟩
+    · intro z hz
+      simp only [List.mem_cons] at hz
+      rcases hz with rfl | hzL
+      · exact forkDisjoint_symm (hYAll x (by simp))
+      · exact hXAll z hzL
+    · rw [List.pairwise_cons]
+      exact ⟨fun z hz => hYAll z (by simp [hz]), hL⟩
+  | trans h12 h23 ih1 ih2 =>
+    exact ih2 (ih1 hDisj)
+
+/-- Regardless of how `@parallel fork` OS threads are interleaved by the kernel
+scheduler, any two schedules with pairwise-disjoint footprints produce bitwise
+identical final heap memory across every byte location. -/
+theorem parallel_fork_join_deterministic (s : Core.State) {sched1 sched2 : List ForkTask}
+    (hPerm : List.Perm sched1 sched2) (hDisj : PairwiseForkDisjoint sched1) :
+    ∀ loc : ByteLocation,
+      (runForkSchedule s sched1).byte loc = (runForkSchedule s sched2).byte loc := by
+  induction hPerm generalizing s with
+  | nil =>
+    intro _
+    rfl
+  | cons x _ ih =>
+    intro loc
+    dsimp [PairwiseForkDisjoint] at hDisj
+    rw [List.pairwise_cons] at hDisj
+    exact ih (applyTaskWrites s x.writes) hDisj.2 loc
+  | swap x y l =>
+    intro loc
+    dsimp [PairwiseForkDisjoint] at hDisj
+    rw [List.pairwise_cons] at hDisj
+    have hYX : ForkDisjoint y.footprint x.footprint := hDisj.1 x (by simp)
+    have hCheck := (checkForkDisjoint_correct y.footprint x.footprint).mpr hYX
+    dsimp [runForkSchedule]
+    apply runForkSchedule_byte_at l loc
+    exact forkDisjoint_writes_commute hCheck y.within x.within s loc
+  | trans h12 _ ih1 ih2 =>
+    intro loc
+    exact (ih1 s hDisj loc).trans (ih2 s (pairwiseForkDisjoint_perm h12 hDisj) loc)
+
 end Aethel.ScopedForkJoin

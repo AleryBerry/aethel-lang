@@ -13,7 +13,7 @@ private def require (msg : String) (ok : Bool) : IO Unit := do
 private def runMIRTests : IO Unit := do
   match validateMIR sampleValidMIR with
   | .ok cert =>
-    require "MIR valid certificate" (cert == ⟨1, [("EntityFlags", 8)], 1⟩)
+    require "MIR valid certificate" (cert == ⟨1, [("EntityFlags", 8)], 1, 0⟩)
   | .error _ =>
     throw (IO.userError "valid MIR unexpectedly failed")
 
@@ -62,7 +62,7 @@ private def runMIRTests : IO Unit := do
     "end_fn\n"
   match validateMIRText validText with
   | .ok cert =>
-    require "MIR text parser certificate" (cert == ⟨1, [("Player", 8)], 1⟩)
+    require "MIR text parser certificate" (cert == ⟨1, [("Player", 8)], 1, 0⟩)
   | .error err =>
     throw (IO.userError s!"valid MIR text failed: {err}")
 
@@ -70,6 +70,87 @@ private def runMIRTests : IO Unit := do
   match validateMIRText staleText with
   | .error _ => pure ()
   | .ok _ => throw (IO.userError "stale MIR text unexpectedly passed")
+
+  let stageAValidText :=
+    "mir_version 1\n" ++
+    "fn two_phase_and_disjoint\n" ++
+    "  perm_alloc 8\n" ++
+    "  perm_reserve 0 0 reserved\n" ++
+    "  perm_reserve 1 0 shared\n" ++
+    "  perm_read 1\n" ++
+    "  perm_release 1\n" ++
+    "  perm_activate 0\n" ++
+    "  perm_write 0 42\n" ++
+    "  perm_release 0\n" ++
+    "  disjoint_idx ne:v0,v1 v0 v1\n" ++
+    "  disjoint_idx none v0 v0+1\n" ++
+    "  disjoint_slice none 0 v0 v0 v1\n" ++
+    "end_fn\n"
+  match validateMIRText stageAValidText with
+  | .ok cert =>
+    require "Stage A two-phase + disjoint MIR text certificate" (cert == ⟨1, [], 1, 0⟩)
+  | .error err =>
+    throw (IO.userError s!"Stage A valid MIR text failed: {err}")
+
+  let stageABadActivate :=
+    "mir_version 1\n" ++
+    "fn bad_activate\n" ++
+    "  perm_alloc 8\n" ++
+    "  perm_reserve 0 0 reserved\n" ++
+    "  perm_reserve 1 0 shared\n" ++
+    "  perm_activate 0\n" ++
+    "  perm_release 1\n" ++
+    "  perm_release 0\n" ++
+    "end_fn\n"
+  match validateMIRText stageABadActivate with
+  | .error _ => pure ()
+  | .ok _ => throw (IO.userError "activating reserved view while shared view is live was not rejected")
+
+  let stageABadDisjoint :=
+    "mir_version 1\n" ++
+    "fn bad_disjoint\n" ++
+    "  disjoint_idx none v0 v1\n" ++
+    "end_fn\n"
+  match validateMIRText stageABadDisjoint with
+  | .error _ => pure ()
+  | .ok _ => throw (IO.userError "unguarded disjoint_idx v0 v1 was not rejected")
+
+  let stageDValidLaws :=
+    "mir_version 1\n" ++
+    "fn countdown_fn\n" ++
+    "  decreases 2 lt 0 v0 lt 0 v1 v0 sub v0 v1\n" ++
+    "  decreases 1 ne v0 0 v0 sub v0 1\n" ++
+    "end_fn\n" ++
+    "law_always damage_recovery\n" ++
+    "  hyp le v1 v0\n" ++
+    "  goal eq add sub v0 v1 v1 v0\n" ++
+    "end_law\n" ++
+    "law_never bounded_damage\n" ++
+    "  goal lt v0 sub v0 v1\n" ++
+    "end_law\n"
+  match validateMIRText stageDValidLaws with
+  | .ok cert =>
+    require "Stage D MIR laws & decreases certificate" (cert == ⟨1, [], 1, 2⟩)
+  | .error err =>
+    throw (IO.userError s!"Stage D valid MIR laws failed: {err}")
+
+  let stageDBadDecreases :=
+    "mir_version 1\n" ++
+    "fn nonterm_fn\n" ++
+    "  decreases 0 v0 add v0 1\n" ++
+    "end_fn\n"
+  match validateMIRText stageDBadDecreases with
+  | .error _ => pure ()
+  | .ok _ => throw (IO.userError "non-decreasing 'decreases' certificate was not rejected")
+
+  let stageDBadLaw :=
+    "mir_version 1\n" ++
+    "law_never buggy_damage\n" ++
+    "  goal lt v0 add v0 v1\n" ++
+    "end_law\n"
+  match validateMIRText stageDBadLaw with
+  | .error _ => pure ()
+  | .ok _ => throw (IO.userError "falsifiable constitutional law in MIR was not rejected")
 
 private def runForkJoinTests : IO Unit := do
   let fpA : TaskFootprint := ⟨[⟨0, 0⟩], [⟨0, 1⟩]⟩
@@ -102,6 +183,21 @@ private def runForkJoinTests : IO Unit := do
   | some child =>
     let restored := joinRelease child (childViews.map PermView.id)
     require "joinRelease restores exact parent PermState" (restored == parent)
+
+  -- Check 3-way OS-thread permutation determinism across distinct schedules
+  let tA : ForkTask :=
+    ⟨⟨[⟨0, 3⟩], [⟨0, 0⟩]⟩, [(⟨0, 0⟩, 11)], fun _ h => by simp at h; subst h; simp⟩
+  let tB : ForkTask :=
+    ⟨⟨[⟨0, 3⟩], [⟨0, 1⟩]⟩, [(⟨0, 1⟩, 22)], fun _ h => by simp at h; subst h; simp⟩
+  let tC : ForkTask :=
+    ⟨⟨[⟨0, 3⟩], [⟨0, 2⟩]⟩, [(⟨0, 2⟩, 33)], fun _ h => by simp at h; subst h; simp⟩
+  let resABC := runForkSchedule st0 [tA, tB, tC]
+  let resCAB := runForkSchedule st0 [tC, tA, tB]
+  let resBCA := runForkSchedule st0 [tB, tC, tA]
+  for off in [0, 1, 2, 3] do
+    let loc : ByteLocation := ⟨0, off⟩
+    require "3-thread @parallel fork permutations produce identical bytes"
+      (resABC.byte loc == resCAB.byte loc && resABC.byte loc == resBCA.byte loc)
 
 private def runRustFFITests : IO Unit := do
   let st0 : Core.State := ({} : Core.State).addAllocation 0 [1, 2, 3, 4, 5, 6, 7, 8]

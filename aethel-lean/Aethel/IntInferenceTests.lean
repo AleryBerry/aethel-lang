@@ -95,7 +95,7 @@ private def runParsingAndABILayoutTests : IO Unit := do
   match validateMIRText mirText with
   | .ok cert =>
     require "MIRValidator validates i7/u1/i24 record"
-      (cert == ⟨1, [("ArbitrarySensor", 8)], 0⟩)
+      (cert == ⟨1, [("ArbitrarySensor", 8)], 0, 0⟩)
   | .error err =>
     throw (IO.userError s!"MIRValidator rejected i7/u1/i24 record: {err}")
 

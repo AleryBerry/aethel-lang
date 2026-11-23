@@ -331,4 +331,178 @@ theorem reorderHotFirst_mem_iff (isHot : α → Bool) (fields : List α) (x : α
     · right; exact ⟨hx, by simp⟩
     · left; exact ⟨hx, rfl⟩
 
+/-! ## Tiled SIMD + Scalar Tail Equivalence (`@layout(aosoa(W))` Lowering Refinement) -/
+
+def applyElemField (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount field : Nat) (f : UInt8 → UInt8)
+    (s : Core.State) (i : Nat) : Core.State :=
+  let loc : ByteLocation := ⟨owner, collectionSlot layout length fieldCount i field⟩
+  match s.byte loc with
+  | some b => s.store loc (f b)
+  | none => s
+
+def applyRange (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount field : Nat) (f : UInt8 → UInt8)
+    (start : Nat) : Nat → Core.State → Core.State
+  | 0, s => s
+  | count + 1, s =>
+    let mid := applyElemField owner layout length fieldCount field f s start
+    applyRange owner layout length fieldCount field f (start + 1) count mid
+
+def applyFullTiles (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount tileWidth field : Nat) (f : UInt8 → UInt8) :
+    Nat → Core.State → Core.State
+  | 0, s => s
+  | tiles + 1, s =>
+    let mid := applyFullTiles owner layout length fieldCount tileWidth field f tiles s
+    applyRange owner layout length fieldCount field f (tiles * tileWidth) tileWidth mid
+
+/-- Two-phase lowering used by `@layout(aosoa(W))`: executes `length / tileWidth`
+vectorized `tileWidth`-lane tiles followed by the `length % tileWidth` scalar tail. -/
+def applyTiledSimdPass (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount tileWidth field : Nat) (f : UInt8 → UInt8)
+    (s : Core.State) : Core.State :=
+  let tiles := length / tileWidth
+  let tailStart := tiles * tileWidth
+  let mid := applyFullTiles owner layout length fieldCount tileWidth field f tiles s
+  applyRange owner layout length fieldCount field f tailStart (length % tileWidth) mid
+
+theorem applyRange_append (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount field : Nat) (f : UInt8 → UInt8)
+    (start n m : Nat) (s : Core.State) :
+    applyRange owner layout length fieldCount field f (start + n) m
+      (applyRange owner layout length fieldCount field f start n s) =
+    applyRange owner layout length fieldCount field f start (n + m) s := by
+  induction n generalizing start s with
+  | zero =>
+    simp [applyRange]
+  | succ n ih =>
+    have hEq : start + (n + 1) = (start + 1) + n := by omega
+    have hSum : n + 1 + m = (n + m) + 1 := by omega
+    rw [hEq, hSum]
+    dsimp [applyRange]
+    exact ih (start + 1) (applyElemField owner layout length fieldCount field f s start)
+
+theorem applyFullTiles_eq_applyRange (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount tileWidth field : Nat) (f : UInt8 → UInt8)
+    (tiles : Nat) (s : Core.State) :
+    applyFullTiles owner layout length fieldCount tileWidth field f tiles s =
+    applyRange owner layout length fieldCount field f 0 (tiles * tileWidth) s := by
+  induction tiles with
+  | zero =>
+    simp [applyFullTiles, applyRange]
+  | succ tiles ih =>
+    dsimp [applyFullTiles]
+    rw [ih]
+    have hZero : 0 + tiles * tileWidth = tiles * tileWidth := Nat.zero_add _
+    have hMul : (tiles + 1) * tileWidth = tiles * tileWidth + tileWidth := Nat.succ_mul _ _
+    rw [hMul]
+    simpa [hZero] using
+      applyRange_append owner layout length fieldCount field f 0 (tiles * tileWidth) tileWidth s
+
+theorem applyTiledSimdPass_eq_applyRange (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount tileWidth field : Nat) (f : UInt8 → UInt8) (s : Core.State) :
+    applyTiledSimdPass owner layout length fieldCount tileWidth field f s =
+    applyRange owner layout length fieldCount field f 0 length s := by
+  dsimp [applyTiledSimdPass]
+  rw [applyFullTiles_eq_applyRange]
+  have hZero : 0 + (length / tileWidth) * tileWidth = (length / tileWidth) * tileWidth := Nat.zero_add _
+  have hDivMod : (length / tileWidth) * tileWidth + length % tileWidth = length := by
+    rw [Nat.mul_comm]
+    exact Nat.div_add_mod length tileWidth
+  have hApp := applyRange_append owner layout length fieldCount field f
+    0 ((length / tileWidth) * tileWidth) (length % tileWidth) s
+  rw [hZero] at hApp
+  rw [hApp, hDivMod]
+
+theorem applyElemField_rep {owner : Core.OwnerId} {layout : CollectionLayout}
+    (hValid : layout.Valid) {length fieldCount field : Nat}
+    (hField : field < fieldCount) (f : UInt8 → UInt8)
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner layout length fieldCount table)
+    {k : Nat} (hk : k < length) :
+    ByteCollectionRep (applyElemField owner layout length fieldCount field f s k)
+      owner layout length fieldCount
+      (fun i g => if i = k ∧ g = field then f (table i g) else table i g) := by
+  dsimp [applyElemField]
+  rw [hRep k hk field hField]
+  intro j hj g hg
+  by_cases hEq : j = k ∧ g = field
+  · obtain ⟨rfl, rfl⟩ := hEq
+    simp only [and_self, ↓reduceIte]
+    exact Core.State.store_byte_written s ⟨owner, collectionSlot layout length fieldCount j g⟩
+      (table j g) (f (table j g)) (hRep j hj g hg)
+  · have hNot : ¬ (j = k ∧ g = field) := hEq
+    simp only [ite_eq_right hNot]
+    have hSlotNe : collectionSlot layout length fieldCount k field ≠
+        collectionSlot layout length fieldCount j g := by
+      intro hSlotEq
+      have hSame := (collectionSlot_eq_iff hValid hk hj hField hg).mp hSlotEq
+      exact hNot ⟨hSame.1.symm, hSame.2.symm⟩
+    have hLocNe : (⟨owner, collectionSlot layout length fieldCount k field⟩ : ByteLocation) ≠
+        ⟨owner, collectionSlot layout length fieldCount j g⟩ := by
+      intro hLocEq
+      exact hSlotNe (congrArg ByteLocation.offset hLocEq)
+    rw [Core.State.store_byte_other s _ _ (f (table k field)) hLocNe]
+    exact hRep j hj g hg
+
+theorem applyRange_rep {owner : Core.OwnerId} {layout : CollectionLayout}
+    (hValid : layout.Valid) {length fieldCount field : Nat}
+    (hField : field < fieldCount) (f : UInt8 → UInt8)
+    (start count : Nat) (hBound : start + count ≤ length)
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner layout length fieldCount table) :
+    ByteCollectionRep (applyRange owner layout length fieldCount field f start count s)
+      owner layout length fieldCount
+      (fun i g => if start ≤ i ∧ i < start + count ∧ g = field then f (table i g) else table i g) := by
+  induction count generalizing start s table with
+  | zero =>
+    intro i hi g hg
+    have hFalse : ¬ (start ≤ i ∧ i < start + 0 ∧ g = field) := by omega
+    simp only [hFalse, ↓reduceIte]
+    exact hRep i hi g hg
+  | succ count ih =>
+    have hStartLt : start < length := by omega
+    have hStepRep := applyElemField_rep hValid hField f hRep hStartLt
+    have hRestRep := ih (start + 1) (by omega) hStepRep
+    intro i hi g hg
+    have hAt := hRestRep i hi g hg
+    dsimp [applyRange]
+    rw [hAt]
+    congr 1
+    dsimp only
+    by_cases hIsStart : i = start ∧ g = field
+    · have hNotTail : ¬ (start + 1 ≤ i ∧ i < start + 1 + count ∧ g = field) := by omega
+      have hInFull : start ≤ i ∧ i < start + (count + 1) ∧ g = field := by omega
+      rw [ite_eq_right hNotTail, ite_eq_left hIsStart, ite_eq_left hInFull]
+    · by_cases hInTail : start + 1 ≤ i ∧ i < start + 1 + count ∧ g = field
+      · have hInFull : start ≤ i ∧ i < start + (count + 1) ∧ g = field := by omega
+        rw [ite_eq_left hInTail, ite_eq_right hIsStart, ite_eq_left hInFull]
+      · have hNotFull : ¬ (start ≤ i ∧ i < start + (count + 1) ∧ g = field) := by omega
+        rw [ite_eq_right hInTail, ite_eq_right hIsStart, ite_eq_right hNotFull]
+
+/-- Tiled AoSoA SIMD execution + scalar tail refines exact element-wise
+physical collection representation identically across every element and field. -/
+theorem aosoa_simd_tile_step_refines {owner : Core.OwnerId} {w length fieldCount field : Nat}
+    (hw : 0 < w) (hField : field < fieldCount) (f : UInt8 → UInt8)
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner (.aosoa w) length fieldCount table) :
+    ByteCollectionRep
+      (applyTiledSimdPass owner (.aosoa w) length fieldCount w field f s)
+      owner (.aosoa w) length fieldCount
+      (fun i g => if g = field then f (table i g) else table i g) := by
+  rw [applyTiledSimdPass_eq_applyRange]
+  have hRng := applyRange_rep (layout := .aosoa w) hw hField f 0 length (by omega) hRep
+  intro i hi g hg
+  have hCell := hRng i hi g hg
+  rw [hCell]
+  congr 1
+  dsimp only
+  have hBound : 0 ≤ i ∧ i < 0 + length := ⟨Nat.zero_le _, by omega⟩
+  by_cases hgEq : g = field
+  · have hAll : 0 ≤ i ∧ i < 0 + length ∧ g = field := ⟨hBound.1, hBound.2, hgEq⟩
+    rw [ite_eq_left hAll, ite_eq_left hgEq]
+  · have hNot : ¬ (0 ≤ i ∧ i < 0 + length ∧ g = field) := fun h => hgEq h.2.2
+    rw [ite_eq_right hNot, ite_eq_right hgEq]
+
 end Aethel.CacheLayout

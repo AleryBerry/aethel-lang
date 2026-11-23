@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    build_options.addOption([]const u8, "lean_dir", b.pathResolve(&.{ b.root.root_dir.path orelse ".", b.root.sub_path, "../aethel-lean" }));
 
     const mod = b.addModule("aethel", .{
         .root_source_file = b.path("src/root.zig"),

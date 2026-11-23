@@ -97,14 +97,28 @@ fn runCli(
         std.mem.eql(u8, args[1], "emit-mir") or
         std.mem.eql(u8, args[1], "emit-zig"))
     {
+        const is_check = std.mem.eql(u8, args[1], "check");
         const emit_mir = std.mem.eql(u8, args[1], "emit-mir");
         const emit_zig = std.mem.eql(u8, args[1], "emit-zig");
-        if (args.len != 3) {
-            try stderr.print("usage: aethel {s} <file.aethel>\n", .{args[1]});
+        var explain_layout = false;
+        var path_opt: ?[]const u8 = null;
+        if (args.len == 3) {
+            if (!std.mem.startsWith(u8, args[2], "--")) path_opt = args[2];
+        } else if (is_check and args.len == 4) {
+            if (std.mem.eql(u8, args[2], "--explain-layout")) {
+                explain_layout = true;
+                path_opt = args[3];
+            } else if (std.mem.eql(u8, args[3], "--explain-layout")) {
+                explain_layout = true;
+                path_opt = args[2];
+            }
+        }
+        const path = path_opt orelse {
+            const flag_hint = if (is_check) "[--explain-layout] " else "";
+            try stderr.print("usage: aethel {s} {s}<file.aethel>\n", .{ args[1], flag_hint });
             try stderr.flush();
             return 2;
-        }
-        const path = args[2];
+        };
         const source = readSourceFile(io, arena, path, stderr) orelse return 1;
 
         var tree = try aethel.parse(arena, source);
@@ -152,12 +166,78 @@ fn runCli(
                 rec.record_layout.alignment,
                 rec.conflicts.len,
             });
+            if (explain_layout) {
+                var naive_bytes: usize = 0;
+                for (rec.record_layout.fields) |fp| {
+                    naive_bytes += @max(@as(usize, 1), fp.size);
+                }
+                const saved_bytes: isize = @as(isize, @intCast(naive_bytes)) - @as(isize, @intCast(rec.record_layout.size));
+                try stdout.print("    naive_size={d} saved={d}B", .{ naive_bytes, saved_bytes });
+                if (rec.collection_layout) |cl| {
+                    switch (cl) {
+                        .aos => try stdout.writeAll(" collection=aos"),
+                        .soa => try stdout.writeAll(" collection=soa"),
+                        .aosoa => |w| try stdout.print(" collection=aosoa({d})", .{w}),
+                    }
+                } else {
+                    try stdout.writeAll(" collection=scalar");
+                }
+                if (rec.auto_layout_decision) |dec| {
+                    try stdout.print(" auto_policy(hot_ratio={d}%: {s})", .{ dec.hot_ratio_pct, dec.reason });
+                }
+                try stdout.writeAll("\n");
+                for (rec.fields, 0..) |cf, fi| {
+                    const fp = rec.record_layout.fields[fi];
+                    const is_hot = fi < rec.hot_fields.len and rec.hot_fields[fi];
+                    const temp_label: []const u8 = if (is_hot) "hot" else "cold";
+                    if (fp.bit_offset) |boff| {
+                        try stdout.print("    field {s}: bits={d} byte={d} bit={d} ({s}, ffd_packed)\n", .{
+                            cf.name,
+                            cf.bits,
+                            fp.byte_offset,
+                            boff,
+                            temp_label,
+                        });
+                    } else {
+                        try stdout.print("    field {s}: bits={d} byte={d} size={d} align={d} ({s}, addressable)\n", .{
+                            cf.name,
+                            cf.bits,
+                            fp.byte_offset,
+                            fp.size,
+                            fp.alignment,
+                            temp_label,
+                        });
+                    }
+                }
+            }
+        }
+        if (explain_layout) {
+            for (checked.adts) |adt_def| {
+                const mode_str: []const u8 = if (adt_def.adt_layout.tag_bits >= 1 and adt_def.adt_layout.max_payload_bits >= 1 and adt_def.adt_layout.total_bits <= 8)
+                    "compact_packed_byte"
+                else if (adt_def.adt_layout.max_payload_bits == 0)
+                    "compact_enum"
+                else
+                    "tagged_union";
+                try stdout.print("  adt {s}: tag_bits={d} max_payload_bits={d} total_bits={d} total_bytes={d} mode={s}\n", .{
+                    adt_def.name,
+                    adt_def.adt_layout.tag_bits,
+                    adt_def.adt_layout.max_payload_bits,
+                    adt_def.adt_layout.total_bits,
+                    adt_def.adt_layout.total_bytes,
+                    mode_str,
+                });
+            }
         }
         for (checked.laws) |law| {
             try stdout.print("  law {s}: {s}\n", .{ law.name, @tagName(law.verdict) });
         }
         try stdout.flush();
         return 0;
+    }
+
+    if (std.mem.eql(u8, args[1], "verify")) {
+        return try handleVerify(io, arena, args[2..], stdout, stderr);
     }
 
     if (std.mem.eql(u8, args[1], "build") or std.mem.eql(u8, args[1], "run")) {
@@ -409,6 +489,237 @@ fn readSourceFile(
     };
 }
 
+fn handleVerify(
+    io: Io,
+    arena: std.mem.Allocator,
+    rest: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !u8 {
+    var input_path: ?[]const u8 = null;
+    var explicit_laws: ?[]const u8 = null;
+    var run_lean = true;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg = rest[i];
+        if (std.mem.eql(u8, arg, "--laws")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stderr.print("error: missing file path after '--laws'\n", .{});
+                try stderr.flush();
+                return 2;
+            }
+            explicit_laws = rest[i];
+        } else if (std.mem.eql(u8, arg, "--lean")) {
+            run_lean = true;
+        } else if (std.mem.eql(u8, arg, "--no-lean")) {
+            run_lean = false;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try stderr.print("error: unknown flag '{s}'\n", .{arg});
+            try stderr.flush();
+            return 2;
+        } else if (input_path == null) {
+            input_path = arg;
+        } else {
+            try stderr.print("error: unexpected argument '{s}'\n", .{arg});
+            try stderr.flush();
+            return 2;
+        }
+    }
+
+    const path = input_path orelse {
+        try stderr.print("usage: aethel verify <file.aethel> [--laws <LAWS.aethel>] [--lean|--no-lean]\n", .{});
+        try stderr.flush();
+        return 2;
+    };
+
+    const main_src = readSourceFile(io, arena, path, stderr) orelse return 1;
+
+    var companion_path: ?[]const u8 = null;
+    var companion_src: ?[:0]const u8 = null;
+    if (explicit_laws) |lp| {
+        companion_path = lp;
+        companion_src = readSourceFile(io, arena, lp, stderr) orelse return 1;
+    } else {
+        const bname = std.fs.path.basename(path);
+        if (!std.mem.eql(u8, bname, "LAWS.aethel") and !std.mem.eql(u8, bname, "laws.aethel")) {
+            const dir_opt = std.fs.path.dirname(path);
+            const cands = [_][]const u8{ "LAWS.aethel", "laws.aethel" };
+            for (cands) |cand_name| {
+                const cand_path = if (dir_opt) |d|
+                    if (d.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ d, cand_name }) else cand_name
+                else
+                    cand_name;
+                if (Io.Dir.cwd().readFileAllocOptions(
+                    io,
+                    cand_path,
+                    arena,
+                    .limited(16 * 1024 * 1024),
+                    .of(u8),
+                    0,
+                )) |laws_bytes| {
+                    companion_path = cand_path;
+                    companion_src = laws_bytes;
+                    break;
+                } else |_| {}
+            }
+        }
+    }
+
+    const combined_src: [:0]const u8 = if (companion_src) |cs| blk: {
+        const buf = try arena.allocSentinel(u8, main_src.len + 1 + cs.len, 0);
+        @memcpy(buf[0..main_src.len], main_src);
+        buf[main_src.len] = '\n';
+        @memcpy(buf[main_src.len + 1 ..], cs);
+        break :blk buf;
+    } else main_src;
+
+    var tree = try aethel.parse(arena, combined_src);
+    defer tree.deinit();
+    if (tree.hasErrors()) {
+        for (tree.diagnostics) |diag| {
+            try printSplitCaretDiagnostic(stderr, path, main_src, companion_path, companion_src, diag.span, diag.message);
+        }
+        try stderr.flush();
+        return 1;
+    }
+
+    var checked = try aethel.check(arena, &tree);
+    defer checked.deinit();
+
+    var has_non_law_error = false;
+    for (checked.diagnostics) |diag| {
+        if (diag.kind != .law_violation and diag.kind != .termination_error) {
+            has_non_law_error = true;
+            break;
+        }
+    }
+    if (has_non_law_error) {
+        for (checked.diagnostics) |diag| {
+            try printSplitCaretDiagnostic(stderr, path, main_src, companion_path, companion_src, diag.span, diag.message);
+        }
+        try stderr.flush();
+        return 1;
+    }
+
+    var any_blocked = checked.hasErrors();
+    var total_decreases_certs: usize = 0;
+    for (checked.functions) |cf| {
+        total_decreases_certs += cf.decreases_certs.len;
+    }
+
+    var lean_summary: ?[]const u8 = null;
+    if (run_lean and !checked.hasErrors()) {
+        var mir_buf: Io.Writer.Allocating = .init(arena);
+        try aethel.emitMir(&checked, &mir_buf.writer);
+
+        Io.Dir.cwd().createDirPath(io, ".aethel-build") catch |err| {
+            try stderr.print("error: failed to create .aethel-build directory: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return 1;
+        };
+        const stem = std.fs.path.basename(path);
+        const mir_path = try std.fmt.allocPrint(arena, ".aethel-build/{s}.verify.mir", .{stem});
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = mir_path, .data = mir_buf.written() }) catch |err| {
+            try stderr.print("error: failed to write MIR '{s}': {s}\n", .{ mir_path, @errorName(err) });
+            try stderr.flush();
+            return 1;
+        };
+        defer Io.Dir.cwd().deleteFile(io, mir_path) catch {};
+
+        const checker_bin = try std.fmt.allocPrint(arena, "{s}/.lake/build/bin/aethel-check", .{build_options.lean_dir});
+        const lean_res = std.process.run(arena, io, .{ .argv = &.{ checker_bin, mir_path } }) catch |err| {
+            try stderr.print("error: failed to invoke Lean MIR validator '{s}': {s}\n", .{ checker_bin, @errorName(err) });
+            try stderr.flush();
+            return 1;
+        };
+        if (!lean_res.term.success()) {
+            any_blocked = true;
+            try stderr.print("error: Lean Tier 3 verifier rejected '{s}':\n{s}\n", .{ path, lean_res.stderr });
+            try stderr.flush();
+        } else {
+            lean_summary = std.mem.trim(u8, lean_res.stdout, " \r\n\t");
+        }
+    }
+
+    try stdout.print("Aethel Constitutional Verification: {s}\n", .{path});
+    if (companion_path) |cp| {
+        try stdout.print("  companion laws: {s}\n", .{cp});
+    }
+    for (checked.laws) |law| {
+        switch (law.verdict) {
+            .proved_tier0, .proved_tier1_exhaustive, .proved_tier2_symbolic, .proved_interval, .proved_tier3_lean => {
+                const lean_note: []const u8 = if (lean_summary != null and (law.symbolic_certs.len > 0 or law.verdict == .proved_tier0))
+                    " + Lean Tier 3"
+                else
+                    "";
+                try stdout.print("  [PROVED]    {s} -- {s}{s}\n", .{ law.name, law.tier_detail, lean_note });
+            },
+            .falsified => {
+                any_blocked = true;
+                try stdout.print("  [FALSIFIED] {s} -- {s}\n", .{ law.name, law.counterexample orelse law.tier_detail });
+            },
+            .violated => {
+                any_blocked = true;
+                try stdout.print("  [VIOLATED]  {s} -- {s}\n", .{ law.name, law.tier_detail });
+            },
+            .unverified_symbolic => {
+                any_blocked = true;
+                try stdout.print("  [UNPROVED]  {s} -- requires Lean Tier 3 proof or bounded domain\n", .{law.name});
+            },
+        }
+    }
+    for (checked.functions) |cf| {
+        if (cf.decreases_certs.len > 0) {
+            const lean_note: []const u8 = if (lean_summary != null) " + Lean Tier 3" else "";
+            try stdout.print("  [DECREASES] fn {s} -- {d} termination measure(s) proved{s}\n", .{
+                cf.name,
+                cf.decreases_certs.len,
+                lean_note,
+            });
+        }
+    }
+    if (lean_summary) |ls| {
+        try stdout.print("  [LEAN MIR]  {s}\n", .{ls});
+    }
+
+    if (checked.hasErrors()) {
+        for (checked.diagnostics) |diag| {
+            try printSplitCaretDiagnostic(stderr, path, main_src, companion_path, companion_src, diag.span, diag.message);
+        }
+        try stderr.flush();
+    }
+
+    if (any_blocked) {
+        try stdout.print("Verdict: BLOCKED ({d} law(s), {d} decreases cert(s))\n", .{ checked.laws.len, total_decreases_certs });
+        try stdout.flush();
+        return 1;
+    }
+
+    try stdout.print("Verdict: ALL LAWS PROVED ({d} law(s), {d} decreases cert(s))\n", .{ checked.laws.len, total_decreases_certs });
+    try stdout.flush();
+    return 0;
+}
+
+fn printSplitCaretDiagnostic(
+    stderr: *Io.Writer,
+    main_path: []const u8,
+    main_src: [:0]const u8,
+    companion_path: ?[]const u8,
+    companion_src: ?[:0]const u8,
+    span: aethel.ast.Span,
+    message: []const u8,
+) Io.Writer.Error!void {
+    if (companion_path != null and companion_src != null and span.start > main_src.len) {
+        const adj_start = span.start - main_src.len - 1;
+        const adj_end = if (span.end > main_src.len + 1) span.end - main_src.len - 1 else adj_start;
+        try printCaretDiagnostic(stderr, companion_path.?, companion_src.?, .{ .start = adj_start, .end = adj_end }, message);
+    } else {
+        try printCaretDiagnostic(stderr, main_path, main_src, span, message);
+    }
+}
+
 fn printCaretDiagnostic(
     stderr: *Io.Writer,
     path: []const u8,
@@ -440,7 +751,8 @@ fn printUsage(writer: *Io.Writer) Io.Writer.Error!void {
         \\  aethel --help
         \\  aethel lex <file.aethel>
         \\  aethel parse <file.aethel>
-        \\  aethel check <file.aethel>
+        \\  aethel check [--explain-layout] <file.aethel>
+        \\  aethel verify <file.aethel> [--laws <LAWS.aethel>] [--lean|--no-lean]
         \\  aethel emit-mir <file.aethel>
         \\  aethel emit-zig <file.aethel>
         \\  aethel build <file.aethel> [-o <out>] [-O debug|safe|fast|small] [--keep-zig]

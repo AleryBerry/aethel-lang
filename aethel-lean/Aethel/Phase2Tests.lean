@@ -113,6 +113,24 @@ private def runCacheLayoutTests : IO Unit := do
   let clustered := reorderHotFirst (fun idx => idx == 0 || idx == 3) [0, 1, 2, 3, 4]
   require "reorderHotFirst groups hot fields ahead of cold fields"
     (clustered == [0, 3, 1, 2, 4])
+  -- Check AoSoA(8) tiled SIMD pass + tail agrees with full 10-element sequential range
+  let len10 := 10
+  let fields2 := 2
+  let t10 : Nat → Nat → UInt8 := fun i f => (i * 5 + f).toUInt8
+  let init10 := (List.range (2 * 8 * fields2)).map fun addr =>
+    let tile := addr / (fields2 * 8)
+    let rem := addr % (fields2 * 8)
+    let f := rem / 8
+    let i := tile * 8 + rem % 8
+    if i < len10 then t10 i f else 0
+  let st10 : Core.State := ({} : Core.State).addAllocation 0 init10
+  let simdOut := applyTiledSimdPass 0 (.aosoa 8) len10 fields2 8 0 (fun b => b + 10) st10
+  let seqOut := applyRange 0 (.aosoa 8) len10 fields2 0 (fun b => b + 10) 0 len10 st10
+  for i in List.range len10 do
+    for f in List.range fields2 do
+      let slot := collectionSlot (.aosoa 8) len10 fields2 i f
+      require "applyTiledSimdPass matches sequential pass across AoSoA(8) tile + tail"
+        (simdOut.byte ⟨0, slot⟩ == seqOut.byte ⟨0, slot⟩)
 
 private def runADTLayoutTests : IO Unit := do
   -- Test all 22 valid inhabitants of statusCompactADT (1 idle + 4 moving + 16 poisoned + 1 dead)

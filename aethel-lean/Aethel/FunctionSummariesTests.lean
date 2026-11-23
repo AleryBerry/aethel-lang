@@ -43,6 +43,16 @@ def runFunctionSummaries : IO Unit := do
     throw (IO.userError "ADT exhaustive match check failed")
   unless resultADT.isExhaustive [0] == false do
     throw (IO.userError "ADT incomplete match rejection failed")
+  unless boolExhaustive true true && !(boolExhaustive true false) do
+    throw (IO.userError "Bool exhaustiveness check failed")
+  unless optionExhaustive true true && !(optionExhaustive false true) do
+    throw (IO.userError "Option exhaustiveness check failed")
+  unless resultExhaustive true true && !(resultExhaustive true false) do
+    throw (IO.userError "Result exhaustiveness check failed")
+  unless intRangeExhaustive 0 100 [(0, 50), (51, 100)] do
+    throw (IO.userError "IntRange exhaustive sweep check failed")
+  unless !intRangeExhaustive 0 100 [(0, 49), (51, 100)] do
+    throw (IO.userError "IntRange gap rejection check failed")
 
   -- 4. Effect footprints and conflict detection
   let eff1 : Effect := ⟨[[0, 1]], [[0, 2]], []⟩

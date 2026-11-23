@@ -100,6 +100,82 @@ theorem ADTDef.exhaustive_covers {adt : ADTDef} {covered : List Nat}
   rw [← htag]
   exact exhaustive v hv
 
+def boolExhaustive (hasFalse hasTrue : Bool) : Bool := hasFalse && hasTrue
+
+theorem boolExhaustive_covers {hasFalse hasTrue : Bool}
+    (h : boolExhaustive hasFalse hasTrue = true) (b : Bool) :
+    (b = false ∧ hasFalse = true) ∨ (b = true ∧ hasTrue = true) := by
+  simp only [boolExhaustive, Bool.and_eq_true] at h
+  cases b
+  · exact Or.inl ⟨rfl, h.1⟩
+  · exact Or.inr ⟨rfl, h.2⟩
+
+def optionExhaustive (hasNone hasSome : Bool) : Bool := hasNone && hasSome
+
+theorem optionExhaustive_covers {α : Type} {hasNone hasSome : Bool}
+    (h : optionExhaustive hasNone hasSome = true) (o : Option α) :
+    (o = none ∧ hasNone = true) ∨ (∃ x, o = some x ∧ hasSome = true) := by
+  simp only [optionExhaustive, Bool.and_eq_true] at h
+  cases o with
+  | none => exact Or.inl ⟨rfl, h.1⟩
+  | some x => exact Or.inr ⟨x, rfl, h.2⟩
+
+def resultExhaustive (hasOk hasErr : Bool) : Bool := hasOk && hasErr
+
+theorem resultExhaustive_covers {α ε : Type} {hasOk hasErr : Bool}
+    (h : resultExhaustive hasOk hasErr = true) (r : Except ε α) :
+    (∃ v, r = .ok v ∧ hasOk = true) ∨ (∃ e, r = .error e ∧ hasErr = true) := by
+  simp only [resultExhaustive, Bool.and_eq_true] at h
+  cases r with
+  | ok v => exact Or.inl ⟨v, rfl, h.1⟩
+  | error e => exact Or.inr ⟨e, rfl, h.2⟩
+
+def intervalCoversFrom (hi cur : Int) : List (Int × Int) → Bool
+  | [] => decide (hi < cur)
+  | (a, b) :: rest =>
+    if hi < cur then true
+    else if a ≤ cur then
+      let next := if cur ≤ b then b + 1 else cur
+      intervalCoversFrom hi next rest
+    else false
+
+def intRangeExhaustive (lo hi : Int) (sortedIntervals : List (Int × Int)) : Bool :=
+  intervalCoversFrom hi lo sortedIntervals
+
+theorem intervalCoversFrom_sound {hi cur : Int} {ivs : List (Int × Int)}
+    (hOk : intervalCoversFrom hi cur ivs = true) :
+    ∀ x : Int, cur ≤ x → x ≤ hi → ∃ p ∈ ivs, p.1 ≤ x ∧ x ≤ p.2 := by
+  induction ivs generalizing cur with
+  | nil =>
+    intro x hLo hHi
+    simp only [intervalCoversFrom, decide_eq_true_eq] at hOk
+    omega
+  | cons p rest ih =>
+    obtain ⟨a, b⟩ := p
+    dsimp [intervalCoversFrom] at hOk
+    by_cases hDone : hi < cur
+    · intro x hLo hHi
+      omega
+    · by_cases hCover : a ≤ cur
+      · simp only [hDone, ↓reduceIte, hCover] at hOk
+        intro x hLo hHi
+        let next := if cur ≤ b then b + 1 else cur
+        have hRec := ih hOk x
+        by_cases hIn : x ≤ b
+        · exact ⟨(a, b), List.mem_cons.mpr (.inl rfl), by omega, hIn⟩
+        · have hNextLeX : next ≤ x := by
+            dsimp [next]
+            split <;> omega
+          obtain ⟨q, hqMem, hqLo, hqHi⟩ := hRec hNextLeX hHi
+          exact ⟨q, List.mem_cons_of_mem _ hqMem, hqLo, hqHi⟩
+      · simp only [hDone, ↓reduceIte, hCover] at hOk
+        cases hOk
+
+theorem intRangeExhaustive_covers {lo hi : Int} {ivs : List (Int × Int)}
+    (hOk : intRangeExhaustive lo hi ivs = true) :
+    ∀ x : Int, lo ≤ x → x ≤ hi → ∃ p ∈ ivs, p.1 ≤ x ∧ x ≤ p.2 :=
+  intervalCoversFrom_sound hOk
+
 /-- Effect footprints: accessed, modified, and invalidated paths. -/
 structure Effect where
   reads : List (List Nat)

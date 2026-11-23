@@ -305,6 +305,7 @@ const Parser = struct {
         return switch (kw orelse .layout) {
             .aos => .aos,
             .soa => .soa,
+            .auto => .auto,
             .@"packed" => .@"packed",
             .aosoa => blk: {
                 var tile: ?*const ast.Expr = null;
@@ -992,6 +993,27 @@ const Parser = struct {
             },
             .ident => {
                 const slice = tok.loc.slice(self.source);
+                if (self.atContextual(.once) and self.peek2().tag == .kw_fn) {
+                    const once_tok = self.advance(); // 'once'
+                    _ = self.advance(); // 'fn'
+                    _ = self.expect(.l_paren, "expected '(' in once fn(...) type");
+                    var params: std.ArrayList(*const ast.TypeExpr) = .empty;
+                    while (!self.at(.r_paren) and !self.at(.eof)) {
+                        const iter_start = self.cursor;
+                        try params.append(self.alloc, try self.parseType());
+                        if (self.match(.comma) == null) break;
+                        if (self.cursor == iter_start) break;
+                    }
+                    _ = self.expect(.r_paren, "expected ')' after once fn parameter types");
+                    _ = self.expect(.arrow, "expected '->' in once fn type signature");
+                    const ret = try self.parseType();
+                    return try self.allocType(.{ .fn_type = .{
+                        .span = Span.merge(Span.fromLoc(once_tok.loc), ret.getSpan()),
+                        .params = try params.toOwnedSlice(self.alloc),
+                        .ret = ret,
+                        .is_once = true,
+                    } });
+                }
                 if (self.peek2().tag != .dot and self.peek2().tag != .l_paren) {
                     if (lexer.parsePrimitiveType(slice)) |prim| {
                         _ = self.advance();
@@ -1487,6 +1509,13 @@ const Parser = struct {
                     } };
                 }
                 const semi = self.match(.semicolon);
+                if (expr.* == .fork_expr) {
+                    for (attrs) |attr| {
+                        if (std.mem.eql(u8, attr.name.slice(self.source), "parallel")) {
+                            @constCast(expr).fork_expr.is_parallel = true;
+                        }
+                    }
+                }
                 return .{ .expr_stmt = .{
                     .span = Span.merge(attr_start, if (semi) |s| Span.fromLoc(s.loc) else expr.getSpan()),
                     .attrs = attrs,
@@ -1798,6 +1827,12 @@ const Parser = struct {
                 if (self.atContextual(.fork) and self.peek2().tag == .l_brace) {
                     return try self.parseForkExpr();
                 }
+                if (self.atContextual(.once) and self.peek2().tag == .kw_fn) {
+                    const once_tok = self.advance(); // 'once'
+                    const expr = try self.parseLambdaExpr(true);
+                    @constCast(expr).lambda.span = Span.merge(Span.fromLoc(once_tok.loc), expr.getSpan());
+                    return expr;
+                }
                 _ = self.advance();
                 return try self.allocExpr(.{ .ident = Span.fromLoc(tok.loc) });
             },
@@ -1849,7 +1884,7 @@ const Parser = struct {
             },
             .kw_if => return try self.parseIfExpr(),
             .kw_case => return try self.parseCaseExpr(),
-            .kw_fn => return try self.parseLambdaExpr(),
+            .kw_fn => return try self.parseLambdaExpr(false),
             .kw_view => return try self.parseViewExpr(),
             .kw_todo, .kw_panic => {
                 _ = self.advance();
@@ -1968,7 +2003,7 @@ const Parser = struct {
         } });
     }
 
-    fn parseLambdaExpr(self: *Parser) std.mem.Allocator.Error!*const ast.Expr {
+    fn parseLambdaExpr(self: *Parser, is_once: bool) std.mem.Allocator.Error!*const ast.Expr {
         const fn_tok = self.advance(); // 'fn'
         const params = try self.parseParamList(false);
         var ret: ?*const ast.TypeExpr = null;
@@ -1981,6 +2016,7 @@ const Parser = struct {
             .params = params,
             .ret = ret,
             .body = body,
+            .is_once = is_once,
         } });
     }
 

@@ -11,7 +11,10 @@ pub fn emitZig(
     checked: *const sema.CheckedModule,
     writer: *Io.Writer,
 ) Io.Writer.Error!void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
     var em = Emitter{
+        .alloc = arena.allocator(),
         .tree = tree,
         .checked = checked,
         .w = writer,
@@ -19,13 +22,64 @@ pub fn emitZig(
     try em.emitModule();
 }
 
+const ScopeVar = struct {
+    name: []const u8,
+    ty: ?*const sema.Ty,
+    is_mut: bool,
+};
+
 const Emitter = struct {
+    alloc: std.mem.Allocator,
     tree: *const ast.Ast,
     checked: *const sema.CheckedModule,
     w: *Io.Writer,
     label_counter: usize = 0,
     indent: usize = 0,
     current_fn_ret: ?*const sema.Ty = null,
+    scope_vars: std.ArrayList(ScopeVar) = .empty,
+    deref_idents: std.ArrayList([]const u8) = .empty,
+    ctx_value_idents: std.ArrayList([]const u8) = .empty,
+
+    fn pushScopeVars(self: *const Emitter) usize {
+        return self.scope_vars.items.len;
+    }
+
+    fn popScopeVars(self: *Emitter, mark: usize) void {
+        self.scope_vars.shrinkRetainingCapacity(mark);
+    }
+
+    fn bindScopeVar(self: *Emitter, name: []const u8, ty: ?*const sema.Ty, is_mut: bool) void {
+        self.scope_vars.append(self.alloc, .{
+            .name = name,
+            .ty = ty,
+            .is_mut = is_mut,
+        }) catch {};
+    }
+
+    fn lookupScopeVar(self: *const Emitter, name: []const u8) ?ScopeVar {
+        var i = self.scope_vars.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.scope_vars.items[i].name, name)) {
+                return self.scope_vars.items[i];
+            }
+        }
+        return null;
+    }
+
+    fn isDerefIdent(self: *const Emitter, name: []const u8) bool {
+        for (self.deref_idents.items) |dn| {
+            if (std.mem.eql(u8, dn, name)) return true;
+        }
+        return false;
+    }
+
+    fn isCtxValueIdent(self: *const Emitter, name: []const u8) bool {
+        for (self.ctx_value_idents.items) |cn| {
+            if (std.mem.eql(u8, cn, name)) return true;
+        }
+        return false;
+    }
 
     fn nextLabel(self: *Emitter) usize {
         self.label_counter += 1;
@@ -171,8 +225,46 @@ const Emitter = struct {
             \\    return @intCast(clamped);
             \\}
             \\
+            \\fn AethelResult(comptime T: type, comptime E: type) type {
+            \\    return union(enum) { Ok: T, Err: E };
+            \\}
+            \\
+            \\fn AethelCallRet(comptime F: type) type {
+            \\    const info = @typeInfo(F);
+            \\    if (info == .@"struct" and @hasDecl(F, "call")) {
+            \\        return @typeInfo(@TypeOf(F.call)).@"fn".return_type.?;
+            \\    } else if (info == .pointer) {
+            \\        const cinfo = @typeInfo(info.pointer.child);
+            \\        if (cinfo == .@"fn") return cinfo.@"fn".return_type.?;
+            \\    } else if (info == .@"fn") {
+            \\        return info.@"fn".return_type.?;
+            \\    }
+            \\    return void;
+            \\}
+            \\
+            \\fn aethelCall(f: anytype, args: anytype) AethelCallRet(@TypeOf(f)) {
+            \\    const F = @TypeOf(f);
+            \\    if (@typeInfo(F) == .@"struct" and @hasDecl(F, "call")) {
+            \\        return @call(.auto, F.call, .{f} ++ args);
+            \\    } else {
+            \\        return @call(.auto, f, args);
+            \\    }
+            \\}
+            \\
             \\
         );
+    }
+
+    fn emitSliceIndexExpr(self: *Emitter, expr: *const ast.Expr) Io.Writer.Error!void {
+        if (self.isUnsizedIntLit(expr)) |lit| {
+            if (!lit.negative) {
+                try self.w.print("{d}", .{lit.mag});
+                return;
+            }
+        }
+        try self.w.writeAll("@as(usize, @intCast(");
+        try self.emitExpr(expr);
+        try self.w.writeAll("))");
     }
 
     fn emitIdent(self: *Emitter, name: []const u8) Io.Writer.Error!void {
@@ -223,12 +315,16 @@ const Emitter = struct {
                 try self.emitTy(c.elem_ty);
             },
             .view => |v| {
-                if (v.mode == .exclusive) {
-                    try self.w.writeByte('*');
+                if (v.target.* == .collection or v.target.* == .slice) {
+                    try self.emitTy(v.target);
                 } else {
-                    try self.w.writeAll("*const ");
+                    if (v.mode == .exclusive) {
+                        try self.w.writeByte('*');
+                    } else {
+                        try self.w.writeAll("*const ");
+                    }
+                    try self.emitTy(v.target);
                 }
-                try self.emitTy(v.target);
             },
             .path_borrow => |pb| {
                 if (pb.base.* == .collection or pb.base.* == .slice) {
@@ -258,11 +354,11 @@ const Emitter = struct {
                 try self.emitTy(inner);
             },
             .result => |res| {
-                try self.w.writeAll("union(enum) { Ok: ");
+                try self.w.writeAll("AethelResult(");
                 try self.emitTy(res.ok);
-                try self.w.writeAll(", Err: ");
+                try self.w.writeAll(", ");
                 try self.emitTy(res.err);
-                try self.w.writeAll(" }");
+                try self.w.writeByte(')');
             },
             .fn_ty => |ft| {
                 try self.w.writeAll("*const fn (");
@@ -273,7 +369,7 @@ const Emitter = struct {
                 try self.w.writeAll(") ");
                 try self.emitTy(ft.ret);
             },
-            .type_var => try self.w.writeAll("usize"),
+            .type_var => |tv| try self.w.print("__T_{s}", .{tv}),
         }
     }
 
@@ -294,6 +390,12 @@ const Emitter = struct {
                     } else if (std.mem.eql(u8, head, "Option") and n.args.len > 0) {
                         try self.w.writeByte('?');
                         try self.emitAstType(n.args[0]);
+                    } else if (std.mem.eql(u8, head, "Result") and n.args.len >= 2) {
+                        try self.w.writeAll("AethelResult(");
+                        try self.emitAstType(n.args[0]);
+                        try self.w.writeAll(", ");
+                        try self.emitAstType(n.args[1]);
+                        try self.w.writeByte(')');
                     } else {
                         try self.emitIdent(head);
                     }
@@ -301,6 +403,7 @@ const Emitter = struct {
                     try self.w.writeAll("void");
                 }
             },
+            .type_var => |tv| try self.w.print("__T_{s}", .{self.sourceOf(tv.name)}),
             .slice => |sl| {
                 try self.w.writeAll(if (sl.mutable) "[]" else "[]const ");
                 try self.emitAstType(sl.elem);
@@ -326,6 +429,60 @@ const Emitter = struct {
             if (v.field_types.len > 0) return false;
         }
         return true;
+    }
+
+    fn isCompactPackedADT(adt: *const sema.CheckedADT) bool {
+        if (isPureEnumADT(adt)) return false;
+        if (adt.adt_layout.tag_bits == 0 or adt.adt_layout.max_payload_bits == 0) return false;
+        if (adt.adt_layout.total_bits > 8) return false;
+        for (adt.variants) |v| {
+            if (v.field_types.len > 1) return false;
+            if (v.field_types.len == 1) {
+                const ft = v.field_types[0];
+                if (ft.* != .bool and ft.isInteger() == null) return false;
+            }
+        }
+        return true;
+    }
+
+    fn recordBinCount(rec: *const sema.CheckedRecord, byte_off: usize) usize {
+        var count: usize = 0;
+        for (rec.record_layout.fields) |fp| {
+            if (fp.bit_offset != null and fp.byte_offset == byte_off) count += 1;
+        }
+        return count;
+    }
+
+    fn fieldBinByte(rec: *const sema.CheckedRecord, fidx: usize) ?usize {
+        if (fidx >= rec.record_layout.fields.len) return null;
+        const fp = rec.record_layout.fields[fidx];
+        if (fp.bit_offset != null and recordBinCount(rec, fp.byte_offset) >= 2) {
+            return fp.byte_offset;
+        }
+        return null;
+    }
+
+    fn recordHasAnyBin(rec: *const sema.CheckedRecord) bool {
+        for (0..rec.fields.len) |fi| {
+            if (fieldBinByte(rec, fi) != null) return true;
+        }
+        return false;
+    }
+
+    fn recordRecordIdxOfTy(ty: *const sema.Ty) ?usize {
+        return switch (ty.*) {
+            .record => |ri| ri,
+            .view => |v| recordRecordIdxOfTy(v.target),
+            .path_borrow => |pb| recordRecordIdxOfTy(pb.base),
+            else => null,
+        };
+    }
+
+    fn findRecordFieldIdx(rec: *const sema.CheckedRecord, fname: []const u8) ?usize {
+        for (rec.fields, 0..) |cf, fi| {
+            if (std.mem.eql(u8, cf.name, fname)) return fi;
+        }
+        return null;
     }
 
     fn findCheckedRecordIndex(self: *const Emitter, name: []const u8) ?usize {
@@ -381,60 +538,169 @@ const Emitter = struct {
                         rec.record_layout.alignment,
                         rec.conflicts.len,
                     });
+                    const has_bins = recordHasAnyBin(&rec);
+                    var can_assert_size = has_bins;
+                    for (rec.fields) |f| {
+                        switch (f.ty.*) {
+                            .int, .int_range, .f32, .f64, .bool => {},
+                            else => can_assert_size = false,
+                        }
+                    }
+
+                    // Order physical fields by layout byte_offset ascending so hot fields & FFD bins lead cache line 0.
+                    const order: []usize = self.alloc.alloc(usize, rec.fields.len) catch &.{};
+                    if (order.len == rec.fields.len) {
+                        for (order, 0..) |*slot, i| slot.* = i;
+                        var a: usize = 0;
+                        while (a < order.len) : (a += 1) {
+                            var b: usize = a + 1;
+                            while (b < order.len) : (b += 1) {
+                                const fa = rec.record_layout.fields[order[a]];
+                                const fb = rec.record_layout.fields[order[b]];
+                                const swap = if (fb.byte_offset != fa.byte_offset)
+                                    fb.byte_offset < fa.byte_offset
+                                else
+                                    (fb.bit_offset orelse 0) < (fa.bit_offset orelse 0);
+                                if (swap) {
+                                    const tmp = order[a];
+                                    order[a] = order[b];
+                                    order[b] = tmp;
+                                }
+                            }
+                        }
+                    }
+
+                    var emitted_bins = std.AutoHashMapUnmanaged(usize, void).empty;
                     try self.w.writeAll("const ");
                     try self.emitIdent(name);
                     try self.w.writeAll(" = struct {\n");
                     self.indent += 1;
-                    for (rec.fields) |f| {
-                        try self.writeIndent();
-                        try self.emitIdent(f.name);
-                        try self.w.writeAll(": ");
-                        try self.emitTy(f.ty);
-                        try self.w.writeAll(",\n");
+                    const iter_len = if (order.len == rec.fields.len) order.len else rec.fields.len;
+                    for (0..iter_len) |oi| {
+                        const fi = if (order.len == rec.fields.len) order[oi] else oi;
+                        if (fieldBinByte(&rec, fi)) |bbyte| {
+                            if (emitted_bins.contains(bbyte)) continue;
+                            emitted_bins.put(self.alloc, bbyte, {}) catch {};
+                            try self.writeIndent();
+                            try self.w.print("__bin_{d}: packed struct(u8) {{\n", .{bbyte});
+                            self.indent += 1;
+                            var used_bits: u16 = 0;
+                            for (0..iter_len) |oj| {
+                                const fj = if (order.len == rec.fields.len) order[oj] else oj;
+                                if (fieldBinByte(&rec, fj)) |jb| {
+                                    if (jb == bbyte) {
+                                        const bf = rec.fields[fj];
+                                        const bfp = rec.record_layout.fields[fj];
+                                        try self.writeIndent();
+                                        try self.emitIdent(bf.name);
+                                        try self.w.writeAll(": ");
+                                        try self.emitTy(bf.ty);
+                                        try self.w.writeAll(",\n");
+                                        used_bits += bfp.bits;
+                                    }
+                                }
+                            }
+                            if (used_bits < 8) {
+                                try self.writeIndent();
+                                try self.w.print("__pad: u{d} = 0,\n", .{8 - used_bits});
+                            }
+                            self.indent -= 1;
+                            try self.writeIndent();
+                            try self.w.writeAll("},\n");
+                        } else {
+                            const f = rec.fields[fi];
+                            try self.writeIndent();
+                            try self.emitIdent(f.name);
+                            try self.w.writeAll(": ");
+                            try self.emitTy(f.ty);
+                            try self.w.writeAll(",\n");
+                        }
                     }
                     self.indent -= 1;
                     try self.w.writeAll("};\n");
+                    if (can_assert_size) {
+                        try self.w.writeAll("comptime {\n");
+                        try self.w.writeAll("    if (@sizeOf(");
+                        try self.emitIdent(name);
+                        try self.w.print(") > {d}) @compileError(\"packed record size exceeds verified layout\");\n", .{rec.record_layout.size});
+                        try self.w.writeAll("}\n");
+                    }
                 }
             },
             .variants => {
                 if (self.findCheckedADTIndex(name)) |aidx| {
                     const adt_def = &self.checked.adts[aidx];
                     const pure_enum = isPureEnumADT(adt_def);
+                    const compact_packed = isCompactPackedADT(adt_def);
                     try self.w.print("// Aethel compact ADT layout: tag_bits={d} max_payload_bits={d} total_bytes={d}\n", .{
                         adt_def.adt_layout.tag_bits,
                         adt_def.adt_layout.max_payload_bits,
                         adt_def.adt_layout.total_bytes,
                     });
-                    try self.w.writeAll("const ");
-                    try self.emitIdent(name);
-                    if (pure_enum) {
-                        try self.w.writeAll(" = enum {\n");
-                    } else {
-                        try self.w.writeAll(" = union(enum) {\n");
-                    }
-                    self.indent += 1;
-                    for (adt_def.variants) |v| {
+                    if (compact_packed) {
+                        try self.w.writeAll("const ");
+                        try self.emitIdent(name);
+                        try self.w.writeAll(" = packed struct(u8) {\n");
+                        self.indent += 1;
                         try self.writeIndent();
-                        try self.emitIdent(v.name);
-                        if (!pure_enum) {
-                            try self.w.writeAll(": ");
-                            if (v.field_types.len == 0) {
-                                try self.w.writeAll("void");
-                            } else if (v.field_types.len == 1) {
-                                try self.emitTy(v.field_types[0]);
-                            } else {
-                                try self.w.writeAll("struct { ");
-                                for (v.field_types, 0..) |ft, fi| {
-                                    if (fi > 0) try self.w.writeAll(", ");
-                                    try self.emitTy(ft);
-                                }
-                                try self.w.writeAll(" }");
-                            }
+                        try self.w.print("pub const Tag = enum(u{d}) {{\n", .{adt_def.adt_layout.tag_bits});
+                        self.indent += 1;
+                        for (adt_def.variants, 0..) |v, vi| {
+                            try self.writeIndent();
+                            try self.emitIdent(v.name);
+                            try self.w.print(" = {d},\n", .{vi});
                         }
-                        try self.w.writeAll(",\n");
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("};\n");
+                        try self.writeIndent();
+                        try self.w.writeAll("tag: Tag,\n");
+                        try self.writeIndent();
+                        try self.w.print("payload: u{d} = 0,\n", .{adt_def.adt_layout.max_payload_bits});
+                        const used_bits: u16 = @intCast(adt_def.adt_layout.tag_bits + adt_def.adt_layout.max_payload_bits);
+                        if (used_bits < 8) {
+                            try self.writeIndent();
+                            try self.w.print("__pad: u{d} = 0,\n", .{8 - used_bits});
+                        }
+                        self.indent -= 1;
+                        try self.w.writeAll("};\n");
+                        try self.w.writeAll("comptime {\n");
+                        try self.w.writeAll("    if (@sizeOf(");
+                        try self.emitIdent(name);
+                        try self.w.writeAll(") != 1) @compileError(\"compact ADT must occupy 1 byte\");\n");
+                        try self.w.writeAll("}\n");
+                    } else {
+                        try self.w.writeAll("const ");
+                        try self.emitIdent(name);
+                        if (pure_enum) {
+                            try self.w.writeAll(" = enum {\n");
+                        } else {
+                            try self.w.writeAll(" = union(enum) {\n");
+                        }
+                        self.indent += 1;
+                        for (adt_def.variants) |v| {
+                            try self.writeIndent();
+                            try self.emitIdent(v.name);
+                            if (!pure_enum) {
+                                try self.w.writeAll(": ");
+                                if (v.field_types.len == 0) {
+                                    try self.w.writeAll("void");
+                                } else if (v.field_types.len == 1) {
+                                    try self.emitTy(v.field_types[0]);
+                                } else {
+                                    try self.w.writeAll("struct { ");
+                                    for (v.field_types, 0..) |ft, fi| {
+                                        if (fi > 0) try self.w.writeAll(", ");
+                                        try self.emitTy(ft);
+                                    }
+                                    try self.w.writeAll(" }");
+                                }
+                            }
+                            try self.w.writeAll(",\n");
+                        }
+                        self.indent -= 1;
+                        try self.w.writeAll("};\n");
                     }
-                    self.indent -= 1;
-                    try self.w.writeAll("};\n");
                 }
             },
             .alias => |ty_ast| {
@@ -523,7 +789,10 @@ const Emitter = struct {
         if (ty.* == .path_borrow) {
             return ty.path_borrow.base.* != .collection and ty.path_borrow.base.* != .slice;
         }
-        return ty.* == .view;
+        if (ty.* == .view) {
+            return ty.view.target.* != .collection and ty.view.target.* != .slice;
+        }
+        return false;
     }
 
     fn emitFnDecl(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
@@ -540,8 +809,17 @@ const Emitter = struct {
             try self.emitIdent(fname);
         }
         try self.w.writeByte('(');
+        var need_comma = false;
+        if (cf) |f| {
+            for (f.type_params) |tp| {
+                if (need_comma) try self.w.writeAll(", ");
+                need_comma = true;
+                try self.w.print("comptime __T_{s}: type", .{tp});
+            }
+        }
         for (fd.params, 0..) |p, pi| {
-            if (pi > 0) try self.w.writeAll(", ");
+            if (need_comma) try self.w.writeAll(", ");
+            need_comma = true;
             const pty: ?*const sema.Ty = if (cf != null and pi < cf.?.param_types.len) cf.?.param_types[pi] else null;
             const pname = self.sourceOf(p.name);
             const is_mut_by_val = p.mutable and !(pty != null and isPointerType(pty.?));
@@ -551,7 +829,9 @@ const Emitter = struct {
                 try self.emitIdent(pname);
             }
             try self.w.writeAll(": ");
-            if (pty) |t| {
+            if (pty != null and pty.?.* == .fn_ty) {
+                try self.w.writeAll("anytype");
+            } else if (pty) |t| {
                 try self.emitTy(t);
             } else if (p.ty) |pt| {
                 try self.emitAstType(pt);
@@ -573,18 +853,25 @@ const Emitter = struct {
         const prev_ret = self.current_fn_ret;
         self.current_fn_ret = ret_ty;
         defer self.current_fn_ret = prev_ret;
+        const sv_mark = self.pushScopeVars();
+        defer self.popScopeVars(sv_mark);
 
         // Bind mutable by-value params to local `var` and silence genuinely unused parameter warnings.
         for (fd.params, 0..) |p, pi| {
             const pty: ?*const sema.Ty = if (cf != null and pi < cf.?.param_types.len) cf.?.param_types[pi] else null;
             const pname = self.sourceOf(p.name);
             const is_mut_by_val = p.mutable and !(pty != null and isPointerType(pty.?));
+            self.bindScopeVar(pname, pty, is_mut_by_val or (pty != null and isPointerType(pty.?)));
             if (is_mut_by_val) {
                 try self.writeIndent();
                 try self.w.writeAll("var ");
                 try self.emitIdent(pname);
-                try self.w.writeAll(": ");
-                if (pty) |t| try self.emitTy(t) else try self.w.writeAll("usize");
+                if (pty != null and pty.?.* != .fn_ty) {
+                    try self.w.writeAll(": ");
+                    try self.emitTy(pty.?);
+                } else if (pty == null) {
+                    try self.w.writeAll(": usize");
+                }
                 try self.w.print(" = __param_{s};\n", .{pname});
                 if (!self.blockMutatesOrBorrowsIdent(&fd.body, pname)) {
                     try self.writeIndent();
@@ -680,8 +967,24 @@ const Emitter = struct {
                         {
                             const arr_id = self.nextLabel();
                             const elem_ty = if (lty.?.* == .collection) lty.?.collection.elem_ty else lty.?.slice.elem;
+                            const needs_cache_align = blk: {
+                                if (lty.?.* == .collection) {
+                                    if (lty.?.collection.elem_record) |ri| {
+                                        if (ri < self.checked.records.len) {
+                                            if (self.checked.records[ri].collection_layout) |cl| {
+                                                break :blk cl == .aosoa or cl == .soa;
+                                            }
+                                        }
+                                    }
+                                }
+                                break :blk false;
+                            };
                             try self.writeIndent();
-                            try self.w.print("var __arr_{d} = [_]", .{arr_id});
+                            if (needs_cache_align) {
+                                try self.w.print("var __arr_{d} align(64) = [_]", .{arr_id});
+                            } else {
+                                try self.w.print("var __arr_{d} = [_]", .{arr_id});
+                            }
                             try self.emitTy(elem_ty);
                             try self.w.writeAll("{ ");
                             for (ls.value.list.elems, 0..) |el, ei| {
@@ -695,6 +998,7 @@ const Emitter = struct {
                             try self.w.writeAll(": ");
                             try self.emitTy(lty.?);
                             try self.w.print(" = __arr_{d}[0..];\n", .{arr_id});
+                            self.bindScopeVar(vname, lty, false);
                             if (!self.stmtsMentionIdent(rest_stmts, rest_tail, vname)) {
                                 try self.writeIndent();
                                 try self.w.writeAll("_ = ");
@@ -707,7 +1011,7 @@ const Emitter = struct {
                         try self.w.writeAll(if (is_mut) "var " else "const ");
                         try self.emitIdent(vname);
                         if (lty) |ty| {
-                            if (ty.* != .err) {
+                            if (ty.* != .err and ty.* != .fn_ty) {
                                 try self.w.writeAll(": ");
                                 try self.emitTy(ty);
                             }
@@ -719,6 +1023,7 @@ const Emitter = struct {
                             try self.emitExpr(ls.value);
                         }
                         try self.w.writeAll(";\n");
+                        self.bindScopeVar(vname, lty orelse self.checked.exprType(ls.value), is_mut);
                         if (is_mut) {
                             if (!self.stmtsMutateOrBorrowIdent(rest_stmts, rest_tail, vname)) {
                                 try self.writeIndent();
@@ -794,6 +1099,7 @@ const Emitter = struct {
                     try self.w.writeAll("const ");
                     try self.emitIdent(bn);
                     try self.w.print(" = __use_{d};\n", .{tmp_id});
+                    self.bindScopeVar(bn, self.checked.exprType(us.expr), false);
                     if (!self.stmtsMentionIdent(rest_stmts, rest_tail, bn)) {
                         try self.writeIndent();
                         try self.w.writeAll("_ = ");
@@ -806,7 +1112,10 @@ const Emitter = struct {
                 }
             },
             .assign_stmt => |asg| {
-                const target_ty = self.checked.exprType(asg.target);
+                const target_ty = self.checked.exprType(asg.target) orelse if (asg.target.* == .ident) blk: {
+                    if (self.lookupScopeVar(self.sourceOf(asg.target.ident))) |sv| break :blk sv.ty;
+                    break :blk null;
+                } else null;
                 try self.writeIndent();
                 try self.emitExpr(asg.target);
                 try self.w.print(" {s} ", .{asg.op.symbol()});
@@ -852,17 +1161,35 @@ const Emitter = struct {
         }
     }
 
+    fn isCollectionMapInPlaceExpr(self: *const Emitter, expr: *const ast.Expr) bool {
+        return expr.* == .binary and
+            expr.binary.op == .pipe and
+            expr.binary.right.* == .call and
+            expr.binary.right.call.callee.* == .ident and
+            std.mem.eql(u8, self.sourceOf(expr.binary.right.call.callee.ident), "map_in_place");
+    }
+
     fn isBlockLikeVoidExpr(self: *const Emitter, expr: *const ast.Expr) bool {
         return switch (expr.*) {
             .if_expr, .block, .view_expr, .fork_expr, .case_expr => true,
-            .binary => |b| b.op == .pipe and b.right.* == .call and b.right.call.callee.* == .ident and
-                std.mem.eql(u8, self.sourceOf(b.right.call.callee.ident), "map_in_place"),
+            .binary => |b| b.op == .pipe and b.right.* == .call and b.right.call.callee.* == .ident and blk: {
+                const cn = self.sourceOf(b.right.call.callee.ident);
+                break :blk std.mem.eql(u8, cn, "map_in_place");
+            },
             else => false,
         };
     }
 
     fn emitTailStmt(self: *Emitter, expr: *const ast.Expr) Io.Writer.Error!void {
         try self.writeIndent();
+        if (self.isCollectionMapInPlaceExpr(expr)) {
+            const pipe = self.flattenCollectionPipeline(expr);
+            if (pipe.map_stages.len > 0 and pipe.fold_arg == null) {
+                try self.emitCollectionPipeline(expr, pipe, false);
+                try self.w.writeByte('\n');
+                return;
+            }
+        }
         if (self.isVoidExpr(expr)) {
             try self.emitExpr(expr);
             if (self.isBlockLikeVoidExpr(expr)) {
@@ -941,6 +1268,7 @@ const Emitter = struct {
                 try self.w.writeAll("const ");
                 try self.emitIdent(pname);
                 try self.w.print(" = __i_{d};\n", .{idx_id});
+                self.bindScopeVar(pname, iter_ty, false);
                 if (!self.blockMentionsIdent(&fs.body, pname)) {
                     try self.writeIndent();
                     try self.w.writeAll("_ = ");
@@ -948,6 +1276,8 @@ const Emitter = struct {
                     try self.w.writeAll(";\n");
                 }
             }
+            const fsv_mark = self.pushScopeVars();
+            defer self.popScopeVars(fsv_mark);
             try self.emitStmtsWithRest(fs.body.stmts, fs.body.tail);
             if (fs.body.tail) |t| try self.emitTailStmt(t);
 
@@ -975,12 +1305,21 @@ const Emitter = struct {
         try self.w.writeAll("for (");
         try self.emitExpr(fs.iter);
         try self.w.writeAll(") |");
+        const csv_mark = self.pushScopeVars();
+        defer self.popScopeVars(csv_mark);
         switch (fs.pattern.*) {
             .ident => |id| {
                 const pn = self.sourceOf(id.name);
                 try self.emitIdent(pn);
                 try self.w.writeAll("| {\n");
                 self.indent += 1;
+                const it_ty = self.checked.exprType(fs.iter);
+                const el_ty: ?*const sema.Ty = if (it_ty) |t| switch (t.*) {
+                    .collection => |c| c.elem_ty,
+                    .slice => |s| s.elem,
+                    else => null,
+                } else null;
+                self.bindScopeVar(pn, el_ty, false);
                 if (!self.blockMentionsIdent(&fs.body, pn)) {
                     try self.writeIndent();
                     try self.w.writeAll("_ = ");
@@ -1056,6 +1395,14 @@ const Emitter = struct {
         if (target.* == .option and expr.* == .upper_ident and std.mem.eql(u8, self.sourceOf(expr.upper_ident), "None")) {
             try self.w.writeAll("null");
             return;
+        }
+        if (isPointerType(target)) {
+            const src_ty = self.checked.exprType(expr);
+            if (src_ty == null or !isPointerType(src_ty.?)) {
+                try self.w.writeByte('&');
+                try self.emitExpr(expr);
+                return;
+            }
         }
         try self.emitExpr(expr);
     }
@@ -1145,7 +1492,19 @@ const Emitter = struct {
             },
             .string_lit => |sp| try self.emitStringLit(sp),
             .bool_lit => |bl| try self.w.writeAll(if (bl.value) "true" else "false"),
-            .ident => |sp| try self.emitIdent(self.sourceOf(sp)),
+            .ident => |sp| {
+                const name = self.sourceOf(sp);
+                if (self.isDerefIdent(name)) {
+                    try self.w.writeAll("(__ctx.");
+                    try self.emitIdent(name);
+                    try self.w.writeAll(".*)");
+                } else if (self.isCtxValueIdent(name)) {
+                    try self.w.writeAll("__ctx.");
+                    try self.emitIdent(name);
+                } else {
+                    try self.emitIdent(name);
+                }
+            },
             .upper_ident => |sp| {
                 const name = self.sourceOf(sp);
                 if (std.mem.eql(u8, name, "None")) {
@@ -1158,6 +1517,11 @@ const Emitter = struct {
                         try self.emitIdent(adt_def.name);
                         try self.w.writeByte('.');
                         try self.emitIdent(name);
+                    } else if (isCompactPackedADT(adt_def)) {
+                        try self.emitIdent(adt_def.name);
+                        try self.w.writeAll("{ .tag = .");
+                        try self.emitIdent(name);
+                        try self.w.writeAll(", .payload = 0 }");
                     } else {
                         try self.emitIdent(adt_def.name);
                         try self.w.writeAll("{ .");
@@ -1254,7 +1618,7 @@ const Emitter = struct {
                 }
             },
             .call => |call_expr| {
-                try self.emitCall(call_expr.callee, call_expr.args, null);
+                try self.emitCall(expr, call_expr.callee, call_expr.args, null);
             },
             .field => |fld| {
                 if (fld.target.* == .upper_ident) {
@@ -1266,6 +1630,11 @@ const Emitter = struct {
                             try self.emitIdent(adt_def.name);
                             try self.w.writeByte('.');
                             try self.emitIdent(var_name);
+                        } else if (isCompactPackedADT(adt_def)) {
+                            try self.emitIdent(adt_def.name);
+                            try self.w.writeAll("{ .tag = .");
+                            try self.emitIdent(var_name);
+                            try self.w.writeAll(", .payload = 0 }");
                         } else {
                             try self.emitIdent(adt_def.name);
                             try self.w.writeAll("{ .");
@@ -1275,14 +1644,34 @@ const Emitter = struct {
                         return;
                     }
                 }
+                const fname = self.sourceOf(fld.name);
+                if (self.checked.exprType(fld.target)) |tty| {
+                    if (recordRecordIdxOfTy(tty)) |ridx| {
+                        const rec = self.checked.records[ridx];
+                        if (findRecordFieldIdx(&rec, fname)) |fidx| {
+                            if (fieldBinByte(&rec, fidx)) |bbyte| {
+                                try self.emitExpr(fld.target);
+                                try self.w.print(".__bin_{d}.", .{bbyte});
+                                try self.emitIdent(fname);
+                                return;
+                            }
+                        }
+                    }
+                }
                 try self.emitExpr(fld.target);
                 try self.w.writeByte('.');
-                try self.emitIdent(self.sourceOf(fld.name));
+                try self.emitIdent(fname);
             },
             .index => |ix| {
                 try self.emitExpr(ix.target);
                 try self.w.writeByte('[');
-                try self.emitExpr(ix.idx);
+                if (ix.idx.* == .binary and (ix.idx.binary.op == .range or ix.idx.binary.op == .range_eq)) {
+                    try self.emitSliceIndexExpr(ix.idx.binary.left);
+                    try self.w.writeAll("..");
+                    try self.emitSliceIndexExpr(ix.idx.binary.right);
+                } else {
+                    try self.emitSliceIndexExpr(ix.idx);
+                }
                 try self.w.writeByte(']');
             },
             .try_op => |t| {
@@ -1290,11 +1679,20 @@ const Emitter = struct {
                 if (inner_ty != null and inner_ty.?.* == .option) {
                     try self.w.writeByte('(');
                     try self.emitExpr(t.operand);
-                    try self.w.writeAll(" orelse @panic(\"unwrap None\"))");
+                    if (self.current_fn_ret != null and self.current_fn_ret.?.* == .option) {
+                        try self.w.writeAll(" orelse return null)");
+                    } else {
+                        try self.w.writeAll(" orelse @panic(\"unwrap None\"))");
+                    }
                 } else if (inner_ty != null and inner_ty.?.* == .result) {
+                    const r_lbl = self.nextLabel();
                     try self.w.writeAll("(switch (");
                     try self.emitExpr(t.operand);
-                    try self.w.writeAll(") { .Ok => |v| v, .Err => @panic(\"unwrap Err\") })");
+                    if (self.current_fn_ret != null and self.current_fn_ret.?.* == .result) {
+                        try self.w.print(") {{ .Ok => |__ok_{d}| __ok_{d}, .Err => |__err_{d}| return .{{ .Err = __err_{d} }} }})", .{ r_lbl, r_lbl, r_lbl, r_lbl });
+                    } else {
+                        try self.w.print(") {{ .Ok => |__ok_{d}| __ok_{d}, .Err => @panic(\"unwrap Err\") }})", .{ r_lbl, r_lbl });
+                    }
                 } else {
                     try self.emitExpr(t.operand);
                 }
@@ -1302,31 +1700,79 @@ const Emitter = struct {
             .record_lit => |rl| {
                 const rname = if (rl.path.len > 0) self.sourceOf(rl.path[rl.path.len - 1]) else "Record";
                 const ridx = self.findCheckedRecordIndex(rname);
+                const has_bins = if (ridx) |ri| recordHasAnyBin(&self.checked.records[ri]) else false;
                 try self.emitIdent(rname);
                 try self.w.writeAll("{ ");
-                for (rl.fields, 0..) |rf, fi| {
-                    if (fi > 0) try self.w.writeAll(", ");
-                    const fname = self.sourceOf(rf.name);
-                    try self.w.writeByte('.');
-                    try self.emitIdent(fname);
-                    try self.w.writeAll(" = ");
-                    var field_ty: ?*const sema.Ty = null;
-                    if (ridx) |ri| {
-                        for (self.checked.records[ri].fields) |cf| {
-                            if (std.mem.eql(u8, cf.name, fname)) {
-                                field_ty = cf.ty;
-                                break;
+                if (has_bins) {
+                    const rec = self.checked.records[ridx.?];
+                    var emitted_bins = std.AutoHashMapUnmanaged(usize, void).empty;
+                    var wrote_any = false;
+                    for (rl.fields) |rf| {
+                        const fname = self.sourceOf(rf.name);
+                        const fidx = findRecordFieldIdx(&rec, fname);
+                        if (fidx != null and fieldBinByte(&rec, fidx.?) != null) {
+                            const bbyte = fieldBinByte(&rec, fidx.?).?;
+                            if (emitted_bins.contains(bbyte)) continue;
+                            emitted_bins.put(self.alloc, bbyte, {}) catch {};
+                            if (wrote_any) try self.w.writeAll(", ");
+                            wrote_any = true;
+                            try self.w.print(".__bin_{d} = .{{ ", .{bbyte});
+                            var wrote_bin_fld = false;
+                            for (rl.fields) |bf| {
+                                const bfname = self.sourceOf(bf.name);
+                                const bfidx = findRecordFieldIdx(&rec, bfname) orelse continue;
+                                if ((fieldBinByte(&rec, bfidx) orelse continue) != bbyte) continue;
+                                if (wrote_bin_fld) try self.w.writeAll(", ");
+                                wrote_bin_fld = true;
+                                try self.w.writeByte('.');
+                                try self.emitIdent(bfname);
+                                try self.w.writeAll(" = ");
+                                if (bf.value) |val| {
+                                    try self.emitCoercedExpr(val, rec.fields[bfidx].ty);
+                                } else {
+                                    try self.emitIdent(bfname);
+                                }
+                            }
+                            try self.w.writeAll(" }");
+                        } else {
+                            if (wrote_any) try self.w.writeAll(", ");
+                            wrote_any = true;
+                            try self.w.writeByte('.');
+                            try self.emitIdent(fname);
+                            try self.w.writeAll(" = ");
+                            const field_ty: ?*const sema.Ty = if (fidx) |fi_val| rec.fields[fi_val].ty else null;
+                            if (rf.value) |val| {
+                                if (field_ty) |ft| try self.emitCoercedExpr(val, ft) else try self.emitExpr(val);
+                            } else {
+                                try self.emitIdent(fname);
                             }
                         }
                     }
-                    if (rf.value) |val| {
-                        if (field_ty) |ft| {
-                            try self.emitCoercedExpr(val, ft);
-                        } else {
-                            try self.emitExpr(val);
-                        }
-                    } else {
+                } else {
+                    for (rl.fields, 0..) |rf, fi| {
+                        if (fi > 0) try self.w.writeAll(", ");
+                        const fname = self.sourceOf(rf.name);
+                        try self.w.writeByte('.');
                         try self.emitIdent(fname);
+                        try self.w.writeAll(" = ");
+                        var field_ty: ?*const sema.Ty = null;
+                        if (ridx) |ri| {
+                            for (self.checked.records[ri].fields) |cf| {
+                                if (std.mem.eql(u8, cf.name, fname)) {
+                                    field_ty = cf.ty;
+                                    break;
+                                }
+                            }
+                        }
+                        if (rf.value) |val| {
+                            if (field_ty) |ft| {
+                                try self.emitCoercedExpr(val, ft);
+                            } else {
+                                try self.emitExpr(val);
+                            }
+                        } else {
+                            try self.emitIdent(fname);
+                        }
                     }
                 }
                 try self.w.writeAll(" }");
@@ -1365,24 +1811,7 @@ const Emitter = struct {
             .block => |*blk| try self.emitBlockExpr(blk),
             .if_expr => |ie| try self.emitIfExpr(expr, &ie),
             .case_expr => |ce| try self.emitCaseExpr(expr, &ce),
-            .lambda => |lam| {
-                try self.w.writeAll("(struct { fn call(");
-                for (lam.params, 0..) |p, pi| {
-                    if (pi > 0) try self.w.writeAll(", ");
-                    try self.emitIdent(self.sourceOf(p.name));
-                    try self.w.writeAll(": ");
-                    if (p.ty) |pt| try self.emitAstType(pt) else try self.w.writeAll("usize");
-                }
-                try self.w.writeAll(") ");
-                if (lam.ret) |rt| try self.emitAstType(rt) else try self.w.writeAll("void");
-                try self.w.writeAll(" { ");
-                if (lam.body.tail) |t| {
-                    try self.w.writeAll("return ");
-                    try self.emitExpr(t);
-                    try self.w.writeAll("; ");
-                }
-                try self.w.writeAll("} }).call");
-            },
+            .lambda => |lam| try self.emitLambdaExpr(expr, &lam),
             .view_expr => |vw| {
                 const res_void = self.isVoidExpr(expr);
                 const lbl = if (res_void) 0 else self.nextLabel();
@@ -1392,17 +1821,29 @@ const Emitter = struct {
                     try self.w.print("blk_{d}: {{\n", .{lbl});
                 }
                 self.indent += 1;
+                const vsv_mark = self.pushScopeVars();
+                defer self.popScopeVars(vsv_mark);
                 if (vw.binding) |bspan| {
                     const bn = self.sourceOf(bspan);
                     const tgt_ty = self.checked.exprType(vw.target);
                     const already_ptr = tgt_ty != null and isPointerType(tgt_ty.?);
+                    const is_slice_like = tgt_ty != null and (tgt_ty.?.* == .slice or tgt_ty.?.* == .collection or
+                        (tgt_ty.?.* == .view and (tgt_ty.?.view.target.* == .slice or tgt_ty.?.view.target.* == .collection)));
                     try self.writeIndent();
                     try self.w.writeAll("const ");
                     try self.emitIdent(bn);
                     try self.w.writeAll(" = ");
-                    if (!already_ptr) try self.w.writeByte('&');
+                    if (!already_ptr and !is_slice_like) try self.w.writeByte('&');
                     try self.emitExpr(vw.target);
                     try self.w.writeAll(";\n");
+                    if (tgt_ty) |tt| {
+                        if (already_ptr or is_slice_like) {
+                            self.bindScopeVar(bn, tt, vw.mode != .shared);
+                        } else if (self.alloc.create(sema.Ty) catch null) |vty| {
+                            vty.* = .{ .view = .{ .mode = vw.mode orelse .shared, .target = tt, .target_record = recordRecordIdxOfTy(tt) } };
+                            self.bindScopeVar(bn, vty, false);
+                        }
+                    }
                     if (!self.blockMentionsIdent(&vw.body, bn)) {
                         try self.writeIndent();
                         try self.w.writeAll("_ = ");
@@ -1426,21 +1867,152 @@ const Emitter = struct {
                 try self.w.writeByte('}');
             },
             .fork_expr => |fk| {
-                try self.w.writeAll("{\n");
-                self.indent += 1;
-                for (fk.branches) |*br| {
-                    try self.writeIndent();
+                if (!fk.is_parallel or fk.branches.len < 2) {
                     try self.w.writeAll("{\n");
                     self.indent += 1;
-                    try self.emitStmtsWithRest(br.stmts, br.tail);
-                    if (br.tail) |t| try self.emitTailStmt(t);
+                    for (fk.branches) |*br| {
+                        const bmark = self.pushScopeVars();
+                        defer self.popScopeVars(bmark);
+                        try self.writeIndent();
+                        try self.w.writeAll("{\n");
+                        self.indent += 1;
+                        try self.emitStmtsWithRest(br.stmts, br.tail);
+                        if (br.tail) |t| try self.emitTailStmt(t);
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("}\n");
+                    }
                     self.indent -= 1;
                     try self.writeIndent();
-                    try self.w.writeAll("}\n");
+                    try self.w.writeByte('}');
+                } else {
+                    const fork_id = self.nextLabel();
+                    const branch_caps: [][]const ForkCapture = self.alloc.alloc([]const ForkCapture, fk.branches.len) catch &.{};
+                    for (fk.branches, 0..) |*br, bi| {
+                        if (bi == 0) continue;
+                        if (bi < branch_caps.len) {
+                            branch_caps[bi] = self.collectFreeCaptures(br) catch &.{};
+                        }
+                    }
+
+                    try self.w.writeAll("{\n");
+                    self.indent += 1;
+                    try self.writeIndent();
+                    try self.w.print("// @parallel fork/join: spawning {d} OS worker thread(s) via std.Thread\n", .{fk.branches.len - 1});
+
+                    for (fk.branches, 0..) |*br, bi| {
+                        if (bi == 0) continue;
+                        const caps = if (bi < branch_caps.len) branch_caps[bi] else &.{};
+                        try self.writeIndent();
+                        try self.w.print("const __ForkWorker_{d}_{d} = struct {{\n", .{ fork_id, bi });
+                        self.indent += 1;
+                        for (caps) |cap| {
+                            try self.writeIndent();
+                            try self.emitIdent(cap.name);
+                            try self.w.writeAll(": ");
+                            if (cap.by_ptr) try self.w.writeByte('*');
+                            try self.emitTy(cap.ty);
+                            try self.w.writeAll(",\n");
+                        }
+                        try self.writeIndent();
+                        try self.w.writeAll("fn run(__ctx: @This()) void {\n");
+                        self.indent += 1;
+                        if (caps.len == 0) {
+                            try self.writeIndent();
+                            try self.w.writeAll("_ = __ctx;\n");
+                        }
+
+                        const prev_deref = self.deref_idents;
+                        const prev_ctx_vals = self.ctx_value_idents;
+                        const prev_scopes = self.scope_vars;
+                        var w_deref: std.ArrayList([]const u8) = .empty;
+                        var w_ctx_vals: std.ArrayList([]const u8) = .empty;
+                        var w_scopes: std.ArrayList(ScopeVar) = .empty;
+                        for (caps) |cap| {
+                            if (cap.by_ptr) {
+                                w_deref.append(self.alloc, cap.name) catch {};
+                            } else {
+                                w_ctx_vals.append(self.alloc, cap.name) catch {};
+                            }
+                            w_scopes.append(self.alloc, .{
+                                .name = cap.name,
+                                .ty = cap.ty,
+                                .is_mut = cap.by_ptr,
+                            }) catch {};
+                        }
+                        self.deref_idents = w_deref;
+                        self.ctx_value_idents = w_ctx_vals;
+                        self.scope_vars = w_scopes;
+                        defer {
+                            self.deref_idents = prev_deref;
+                            self.ctx_value_idents = prev_ctx_vals;
+                            self.scope_vars = prev_scopes;
+                        }
+
+                        try self.emitStmtsWithRest(br.stmts, br.tail);
+                        if (br.tail) |t| try self.emitTailStmt(t);
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("}\n");
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("};\n");
+                    }
+
+                    for (1..fk.branches.len) |bi| {
+                        const caps = if (bi < branch_caps.len) branch_caps[bi] else &.{};
+                        try self.writeIndent();
+                        try self.w.print("const __thr_{d}_{d} = std.Thread.spawn(.{{}}, __ForkWorker_{d}_{d}.run, .{{__ForkWorker_{d}_{d}{{ ", .{
+                            fork_id,
+                            bi,
+                            fork_id,
+                            bi,
+                            fork_id,
+                            bi,
+                        });
+                        for (caps, 0..) |cap, ci| {
+                            if (ci > 0) try self.w.writeAll(", ");
+                            try self.w.writeByte('.');
+                            try self.emitIdent(cap.name);
+                            try self.w.writeAll(" = ");
+                            if (cap.by_ptr) try self.w.writeByte('&');
+                            if (self.isDerefIdent(cap.name)) {
+                                try self.w.writeAll("(__ctx.");
+                                try self.emitIdent(cap.name);
+                                try self.w.writeAll(".*)");
+                            } else if (self.isCtxValueIdent(cap.name)) {
+                                try self.w.writeAll("__ctx.");
+                                try self.emitIdent(cap.name);
+                            } else {
+                                try self.emitIdent(cap.name);
+                            }
+                        }
+                        try self.w.writeAll(" }}) catch @panic(\"parallel fork: thread spawn failed\");\n");
+                    }
+
+                    // Branch 0 executes concurrently on the caller thread before joining workers.
+                    {
+                        const br0 = &fk.branches[0];
+                        const bmark = self.pushScopeVars();
+                        defer self.popScopeVars(bmark);
+                        try self.writeIndent();
+                        try self.w.writeAll("{\n");
+                        self.indent += 1;
+                        try self.emitStmtsWithRest(br0.stmts, br0.tail);
+                        if (br0.tail) |t| try self.emitTailStmt(t);
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("}\n");
+                    }
+
+                    for (1..fk.branches.len) |bi| {
+                        try self.writeIndent();
+                        try self.w.print("__thr_{d}_{d}.join();\n", .{ fork_id, bi });
+                    }
+                    self.indent -= 1;
+                    try self.writeIndent();
+                    try self.w.writeByte('}');
                 }
-                self.indent -= 1;
-                try self.writeIndent();
-                try self.w.writeByte('}');
             },
             .todo_expr => |td| {
                 try self.w.writeAll("@panic(");
@@ -1459,10 +2031,36 @@ const Emitter = struct {
     fn emitBinary(self: *Emitter, full_expr: *const ast.Expr, b: anytype) Io.Writer.Error!void {
         switch (b.op) {
             .pipe => {
+                const pipe = self.flattenCollectionPipeline(full_expr);
+                if (pipe.map_stages.len >= 2 or pipe.fold_arg != null) {
+                    try self.emitCollectionPipeline(full_expr, pipe, true);
+                    return;
+                }
+                // Fused `opt_or_res |> map(f) |> unwrap_or(default)` without intermediate allocation.
+                if (b.right.* == .call and b.right.call.callee.* == .ident and
+                    std.mem.eql(u8, self.sourceOf(b.right.call.callee.ident), "unwrap_or") and
+                    b.right.call.args.len == 1 and b.left.* == .binary and b.left.binary.op == .pipe and
+                    b.left.binary.right.* == .call and b.left.binary.right.call.callee.* == .ident and
+                    std.mem.eql(u8, self.sourceOf(b.left.binary.right.call.callee.ident), "map") and
+                    b.left.binary.right.call.args.len == 1)
+                {
+                    const inner_base = b.left.binary.left;
+                    const inner_ty = self.checked.exprType(inner_base);
+                    if (inner_ty != null and (inner_ty.?.* == .option or inner_ty.?.* == .result)) {
+                        try self.emitFusedMapUnwrapOr(
+                            full_expr,
+                            inner_base,
+                            inner_ty.?,
+                            b.left.binary.right.call.args[0].value,
+                            b.right.call.args[0].value,
+                        );
+                        return;
+                    }
+                }
                 if (b.right.* == .call) {
-                    try self.emitCall(b.right.call.callee, b.right.call.args, b.left);
+                    try self.emitCall(b.right, b.right.call.callee, b.right.call.args, b.left);
                 } else {
-                    try self.emitCall(b.right, &.{}, b.left);
+                    try self.emitCall(null, b.right, &.{}, b.left);
                 }
             },
             .concat => {
@@ -1659,6 +2257,7 @@ const Emitter = struct {
 
     fn emitCall(
         self: *Emitter,
+        call_expr: ?*const ast.Expr,
         callee: *const ast.Expr,
         args: []const ast.CallArg,
         piped_recv: ?*const ast.Expr,
@@ -1687,125 +2286,76 @@ const Emitter = struct {
         if (callee.* == .ident and std.mem.eql(u8, self.sourceOf(callee.ident), "map_in_place") and
             piped_recv != null and args.len == 1 and args[0].value.* == .lambda)
         {
-            const lam = args[0].value.lambda;
-            const elem_param = if (lam.params.len > 0) self.sourceOf(lam.params[0].name) else "__elem";
-            const recv_ty = self.checked.exprType(piped_recv.?);
-            var tile_width: ?usize = null;
-            if (recv_ty) |rt| {
-                const ridx_opt: ?usize = switch (rt.*) {
-                    .collection => |c| c.elem_record,
-                    .path_borrow => |pb| switch (pb.base.*) {
-                        .collection => |c| c.elem_record,
-                        .record => |ri| ri,
-                        else => null,
-                    },
-                    else => null,
-                };
-                if (ridx_opt) |ridx| {
-                    if (ridx < self.checked.records.len) {
-                        if (self.checked.records[ridx].collection_layout) |cl| {
-                            switch (cl) {
-                                .aosoa => |w| tile_width = w,
-                                else => {},
-                            }
-                        }
+            const pipe = CollectionPipeline{
+                .base = piped_recv.?,
+                .map_stages = self.alloc.dupe(*const ast.Expr, &.{args[0].value}) catch &.{args[0].value},
+                .fold_arg = null,
+                .fold_init = null,
+            };
+            try self.emitCollectionPipeline(call_expr, pipe, call_expr != null);
+            return;
+        }
+
+        // 1c. Option/Result categorical combinators (`map`, `and_then`, `unwrap_or`, `ok_or`)
+        if (callee.* == .ident) {
+            const cname = self.sourceOf(callee.ident);
+            if ((std.mem.eql(u8, cname, "map") or std.mem.eql(u8, cname, "and_then") or
+                std.mem.eql(u8, cname, "unwrap_or") or std.mem.eql(u8, cname, "ok_or")) and
+                ((piped_recv != null and args.len == 1) or (piped_recv == null and args.len == 2)))
+            {
+                const recv_expr = piped_recv orelse args[0].value;
+                const comb_val = if (piped_recv != null) args[0].value else args[1].value;
+                if (self.checked.exprType(recv_expr)) |rty| {
+                    if (rty.* == .option or rty.* == .result) {
+                        try self.emitOptionResultCombinator(call_expr, cname, recv_expr, rty, comb_val);
+                        return;
                     }
                 }
             }
-            const id = self.nextLabel();
-            if (tile_width) |tw| {
-                try self.w.writeAll("{\n");
-                self.indent += 1;
-                try self.writeIndent();
-                try self.w.print("// @layout(aosoa({d})): L1-cache tiled in-place SIMD/cache pass (tile_width = {d})\n", .{ tw, tw });
-                try self.writeIndent();
-                try self.w.print("const __col_{d} = ", .{id});
-                try self.emitExpr(piped_recv.?);
-                try self.w.writeAll(";\n");
-                try self.writeIndent();
-                try self.w.print("var __tile_{d}: usize = 0;\n", .{id});
-                try self.writeIndent();
-                try self.w.print("while (__tile_{d} + {d} <= __col_{d}.len) : (__tile_{d} += {d}) {{\n", .{ id, tw, id, id, tw });
-                self.indent += 1;
-                try self.writeIndent();
-                try self.w.print("var __lane_{d}: usize = 0;\n", .{id});
-                try self.writeIndent();
-                try self.w.print("while (__lane_{d} < {d}) : (__lane_{d} += 1) {{\n", .{ id, tw, id });
-                self.indent += 1;
-                try self.writeIndent();
-                try self.w.writeAll("const ");
-                try self.emitIdent(elem_param);
-                try self.w.print(" = &__col_{d}[__tile_{d} + __lane_{d}];\n", .{ id, id, id });
-                if (!self.blockMentionsIdent(&lam.body, elem_param)) {
-                    try self.writeIndent();
-                    try self.w.writeAll("_ = ");
-                    try self.emitIdent(elem_param);
-                    try self.w.writeAll(";\n");
-                }
-                try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
-                if (lam.body.tail) |t| try self.emitTailStmt(t);
-                self.indent -= 1;
-                try self.writeIndent();
-                try self.w.writeAll("}\n");
-                self.indent -= 1;
-                try self.writeIndent();
-                try self.w.writeAll("}\n");
-                try self.writeIndent();
-                try self.w.print("while (__tile_{d} < __col_{d}.len) : (__tile_{d} += 1) {{\n", .{ id, id, id });
-                self.indent += 1;
-                try self.writeIndent();
-                try self.w.writeAll("const ");
-                try self.emitIdent(elem_param);
-                try self.w.print(" = &__col_{d}[__tile_{d}];\n", .{ id, id });
-                if (!self.blockMentionsIdent(&lam.body, elem_param)) {
-                    try self.writeIndent();
-                    try self.w.writeAll("_ = ");
-                    try self.emitIdent(elem_param);
-                    try self.w.writeAll(";\n");
-                }
-                try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
-                if (lam.body.tail) |t| try self.emitTailStmt(t);
-                self.indent -= 1;
-                try self.writeIndent();
-                try self.w.writeAll("}\n");
-                self.indent -= 1;
-                try self.writeIndent();
-                try self.w.writeByte('}');
+            if ((std.mem.eql(u8, cname, "min") or std.mem.eql(u8, cname, "max")) and piped_recv == null and args.len == 2) {
+                try self.w.print("@{s}(", .{cname});
+                try self.emitExpr(args[0].value);
+                try self.w.writeAll(", ");
+                try self.emitExpr(args[1].value);
+                try self.w.writeByte(')');
                 return;
             }
-            try self.w.writeAll("for (");
-            try self.emitExpr(piped_recv.?);
-            try self.w.writeAll(") |*");
-            try self.emitIdent(elem_param);
-            try self.w.writeAll("| {\n");
-            self.indent += 1;
-            if (!self.blockMentionsIdent(&lam.body, elem_param)) {
-                try self.writeIndent();
-                try self.w.writeAll("_ = ");
-                try self.emitIdent(elem_param);
-                try self.w.writeAll(";\n");
-            }
-            try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
-            if (lam.body.tail) |t| try self.emitTailStmt(t);
-            self.indent -= 1;
-            try self.writeIndent();
-            try self.w.writeByte('}');
-            return;
         }
 
         // 2. ADT constructor calls (`Moving(12)`, `Status.Moving(12)`, `Ok(...)`, `Err(...)`, `Some(...)`)
         if (callee.* == .upper_ident) {
             const cname = self.sourceOf(callee.upper_ident);
+            const call_ty = if (call_expr) |ce| self.checked.exprType(ce) else null;
             if (std.mem.eql(u8, cname, "Some") and args.len == 1) {
-                try self.w.writeAll("@as(?, ");
-                try self.emitExpr(args[0].value);
-                try self.w.writeByte(')');
+                if (call_ty != null and call_ty.?.* == .option and call_ty.?.option.* != .err) {
+                    try self.w.writeAll("@as(?");
+                    try self.emitTy(call_ty.?.option);
+                    try self.w.writeAll(", ");
+                    try self.emitCoercedExpr(args[0].value, call_ty.?.option);
+                    try self.w.writeByte(')');
+                } else {
+                    try self.w.writeAll("@as(?@TypeOf(");
+                    try self.emitExpr(args[0].value);
+                    try self.w.writeAll("), ");
+                    try self.emitExpr(args[0].value);
+                    try self.w.writeByte(')');
+                }
                 return;
             }
-            if (std.mem.eql(u8, cname, "Ok") or std.mem.eql(u8, cname, "Err")) {
-                try self.w.print(".{{ .{s} = ", .{cname});
-                if (args.len > 0) try self.emitExpr(args[0].value) else try self.w.writeAll("{}");
-                try self.w.writeAll(" }");
+            if ((std.mem.eql(u8, cname, "Ok") or std.mem.eql(u8, cname, "Err")) and args.len == 1) {
+                if (call_ty != null and call_ty.?.* == .result and
+                    call_ty.?.result.ok.* != .err and call_ty.?.result.err.* != .err)
+                {
+                    try self.emitTy(call_ty.?);
+                    try self.w.print("{{ .{s} = ", .{cname});
+                    const payload_ty = if (std.mem.eql(u8, cname, "Ok")) call_ty.?.result.ok else call_ty.?.result.err;
+                    try self.emitCoercedExpr(args[0].value, payload_ty);
+                    try self.w.writeAll(" }");
+                } else {
+                    try self.w.print(".{{ .{s} = ", .{cname});
+                    if (args.len > 0) try self.emitExpr(args[0].value) else try self.w.writeAll("{}");
+                    try self.w.writeAll(" }");
+                }
                 return;
             }
             if (self.findCheckedVariant(null, cname)) |found| {
@@ -1822,14 +2372,60 @@ const Emitter = struct {
             }
         }
 
-        // 3. Regular user / extern function call (with pointer auto-borrow for `~>.{...}` / `View`)
+        // 3. Regular user / extern function call (including generic comptime type args) or local closure invocation.
         const cf: ?*const sema.CheckedFunction = if (callee.* == .ident) self.findCheckedFn(self.sourceOf(callee.ident)) else null;
+        if (cf == null) {
+            const callee_ty = self.checked.exprType(callee);
+            const is_fn_val = (callee_ty != null and callee_ty.?.* == .fn_ty) or
+                (callee.* == .ident and self.lookupScopeVar(self.sourceOf(callee.ident)) != null);
+            if (is_fn_val) {
+                try self.w.writeAll("aethelCall(");
+                try self.emitExpr(callee);
+                try self.w.writeAll(", .{ ");
+                var first_c = true;
+                if (piped_recv) |pr| {
+                    first_c = false;
+                    const p0: ?*const sema.Ty = if (callee_ty != null and callee_ty.?.* == .fn_ty and callee_ty.?.fn_ty.params.len > 0)
+                        callee_ty.?.fn_ty.params[0]
+                    else
+                        null;
+                    try self.emitCallArg(pr, p0);
+                }
+                const r_off: usize = if (piped_recv != null) 1 else 0;
+                for (args, 0..) |arg, ai| {
+                    if (!first_c) try self.w.writeAll(", ");
+                    first_c = false;
+                    const pidx = ai + r_off;
+                    const pt: ?*const sema.Ty = if (callee_ty != null and callee_ty.?.* == .fn_ty and pidx < callee_ty.?.fn_ty.params.len)
+                        callee_ty.?.fn_ty.params[pidx]
+                    else
+                        null;
+                    try self.emitCallArg(arg.value, pt);
+                }
+                try self.w.writeAll(" })");
+                return;
+            }
+        }
+
         try self.emitExpr(callee);
         try self.w.writeByte('(');
 
         const total_offset: usize = if (piped_recv != null) 1 else 0;
         var emitted_any = false;
+        if (cf != null and cf.?.type_params.len > 0) {
+            const targs = if (call_expr) |ce| self.checked.callTypeArgs(ce) else null;
+            for (cf.?.type_params, 0..) |tp, ti| {
+                if (emitted_any) try self.w.writeAll(", ");
+                emitted_any = true;
+                if (targs != null and ti < targs.?.len) {
+                    try self.emitTy(targs.?[ti]);
+                } else {
+                    try self.w.print("__T_{s}", .{tp});
+                }
+            }
+        }
         if (piped_recv) |pr| {
+            if (emitted_any) try self.w.writeAll(", ");
             emitted_any = true;
             const param_ty: ?*const sema.Ty = if (cf != null and cf.?.param_types.len > 0) cf.?.param_types[0] else null;
             try self.emitCallArg(pr, param_ty);
@@ -1862,6 +2458,64 @@ const Emitter = struct {
         try self.emitExpr(val);
     }
 
+    fn emitPackCompactPayload(
+        self: *Emitter,
+        val_expr: *const ast.Expr,
+        ft: *const sema.Ty,
+        max_pay_bits: u16,
+    ) Io.Writer.Error!void {
+        if (ft.* == .bool) {
+            try self.w.print("@as(u{d}, @intFromBool(", .{max_pay_bits});
+            try self.emitExpr(val_expr);
+            try self.w.writeAll("))");
+            return;
+        }
+        const it = ft.isInteger() orelse {
+            try self.w.print("@as(u{d}, @intCast(", .{max_pay_bits});
+            try self.emitExpr(val_expr);
+            try self.w.writeAll("))");
+            return;
+        };
+        if (it.signed) {
+            try self.w.print("@as(u{d}, @as(u{d}, @bitCast(", .{ max_pay_bits, it.bits });
+            try self.emitCoercedExpr(val_expr, ft);
+            try self.w.writeAll(")))");
+        } else if (it.bits < max_pay_bits) {
+            try self.w.print("@as(u{d}, ", .{max_pay_bits});
+            try self.emitCoercedExpr(val_expr, ft);
+            try self.w.writeByte(')');
+        } else {
+            try self.emitCoercedExpr(val_expr, ft);
+        }
+    }
+
+    fn emitUnpackCompactPayload(
+        self: *Emitter,
+        adt_id: usize,
+        ft: *const sema.Ty,
+        max_pay_bits: u16,
+    ) Io.Writer.Error!void {
+        if (ft.* == .bool) {
+            try self.w.print("((__adt_{d}.payload & 1) != 0)", .{adt_id});
+            return;
+        }
+        const it = ft.isInteger() orelse {
+            try self.w.print("__adt_{d}.payload", .{adt_id});
+            return;
+        };
+        if (it.signed) {
+            if (it.bits < max_pay_bits) {
+                try self.w.print("@as(i{d}, @bitCast(@as(u{d}, @truncate(__adt_{d}.payload))))", .{ it.bits, it.bits, adt_id });
+            } else {
+                try self.w.print("@as(i{d}, @bitCast(__adt_{d}.payload))", .{ it.bits, adt_id });
+            }
+        } else if (it.bits < max_pay_bits) {
+            try self.w.print("@as(u{d}, @truncate(__adt_{d}.payload))", .{ it.bits, adt_id });
+        } else {
+            try self.w.print("__adt_{d}.payload", .{adt_id});
+        }
+    }
+
     fn emitADTConstruct(self: *Emitter, aidx: usize, vidx: usize, args: []const ast.CallArg) Io.Writer.Error!void {
         const adt_def = &self.checked.adts[aidx];
         const variant = adt_def.variants[vidx];
@@ -1869,6 +2523,19 @@ const Emitter = struct {
             try self.emitIdent(adt_def.name);
             try self.w.writeByte('.');
             try self.emitIdent(variant.name);
+            return;
+        }
+        if (isCompactPackedADT(adt_def)) {
+            try self.emitIdent(adt_def.name);
+            try self.w.writeAll("{ .tag = .");
+            try self.emitIdent(variant.name);
+            try self.w.writeAll(", .payload = ");
+            if (variant.field_types.len == 1 and args.len > 0) {
+                try self.emitPackCompactPayload(args[0].value, variant.field_types[0], adt_def.adt_layout.max_payload_bits);
+            } else {
+                try self.w.writeByte('0');
+            }
+            try self.w.writeAll(" }");
             return;
         }
         try self.emitIdent(adt_def.name);
@@ -1899,6 +2566,8 @@ const Emitter = struct {
     }
 
     fn emitBlockExpr(self: *Emitter, blk: *const ast.Block) Io.Writer.Error!void {
+        const bsv_mark = self.pushScopeVars();
+        defer self.popScopeVars(bsv_mark);
         const is_void = if (blk.tail) |t| self.isVoidExpr(t) else true;
         if (is_void) {
             try self.w.writeAll("{\n");
@@ -2046,58 +2715,115 @@ const Emitter = struct {
 
         if (self.canUseZigSwitch(ce)) {
             const sub_ty = self.checked.exprType(ce.subjects[0]);
-            const is_adt_union = if (sub_ty != null and sub_ty.?.* == .adt)
+            const compact_adt: ?*const sema.CheckedADT = if (sub_ty != null and sub_ty.?.* == .adt and
+                isCompactPackedADT(&self.checked.adts[sub_ty.?.adt]))
+                &self.checked.adts[sub_ty.?.adt]
+            else
+                null;
+            const is_adt_union = if (compact_adt == null and sub_ty != null and sub_ty.?.* == .adt)
                 !isPureEnumADT(&self.checked.adts[sub_ty.?.adt])
             else
                 false;
 
-            try self.w.writeAll("switch (");
-            try self.emitExpr(ce.subjects[0]);
-            try self.w.writeAll(") {\n");
+            var compact_lbl: usize = 0;
+            if (compact_adt != null) {
+                compact_lbl = self.nextLabel();
+                if (res_void) {
+                    try self.w.writeAll("{\n");
+                } else {
+                    try self.w.print("blk_{d}: {{\n", .{compact_lbl});
+                }
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("const __adt_{d} = ", .{compact_lbl});
+                try self.emitExpr(ce.subjects[0]);
+                try self.w.writeAll(";\n");
+                try self.writeIndent();
+                if (!res_void) {
+                    try self.w.print("break :blk_{d} switch (__adt_{d}.tag) {{\n", .{ compact_lbl, compact_lbl });
+                } else {
+                    try self.w.print("switch (__adt_{d}.tag) {{\n", .{compact_lbl});
+                }
+            } else {
+                try self.w.writeAll("switch (");
+                try self.emitExpr(ce.subjects[0]);
+                try self.w.writeAll(") {\n");
+            }
             self.indent += 1;
             var emitted_else = false;
             for (ce.arms) |arm| {
                 try self.writeIndent();
                 const pat0 = arm.alternatives[0][0];
                 var bind_ident: ?[]const u8 = null;
+                var compact_var_ft: ?*const sema.Ty = null;
                 var multi_bindings: []const ast.PatternArg = &.{};
 
                 if (arm.alternatives.len == 1 and (pat0.* == .wildcard or pat0.* == .ident)) {
                     emitted_else = true;
                     try self.w.writeAll("else => ");
-                    if (pat0.* == .ident) bind_ident = self.sourceOf(pat0.ident.name);
+                    if (pat0.* == .ident) {
+                        bind_ident = self.sourceOf(pat0.ident.name);
+                        compact_var_ft = sub_ty;
+                    }
                 } else {
                     for (arm.alternatives, 0..) |row, ri| {
                         if (ri > 0) try self.w.writeAll(", ");
                         try self.emitSwitchPattern(row[0], is_adt_union);
                     }
                     try self.w.writeAll(" => ");
-                    if (pat0.* == .constructor and is_adt_union and pat0.constructor.args.len > 0) {
-                        if (pat0.constructor.args.len == 1) {
-                            const arg_p = pat0.constructor.args[0].pattern;
-                            if (arg_p.* == .ident) {
-                                const bn = self.sourceOf(arg_p.ident.name);
-                                try self.w.writeByte('|');
-                                try self.emitIdent(bn);
-                                try self.w.writeAll("| ");
+                    if (pat0.* == .constructor and pat0.constructor.args.len > 0) {
+                        if (compact_adt) |cadt| {
+                            if (pat0.constructor.args.len == 1 and pat0.constructor.args[0].pattern.* == .ident) {
+                                const bn = self.sourceOf(pat0.constructor.args[0].pattern.ident.name);
+                                const vname = if (pat0.constructor.path.len > 0)
+                                    self.sourceOf(pat0.constructor.path[pat0.constructor.path.len - 1])
+                                else
+                                    "";
+                                for (cadt.variants) |v| {
+                                    if (std.mem.eql(u8, v.name, vname) and v.field_types.len == 1) {
+                                        compact_var_ft = v.field_types[0];
+                                        break;
+                                    }
+                                }
                                 bind_ident = bn;
                             }
-                        } else {
-                            var any_bound = false;
-                            for (pat0.constructor.args) |pa| {
-                                if (pa.pattern.* == .ident) any_bound = true;
-                            }
-                            if (any_bound) {
-                                try self.w.writeAll("|__tup_cap| ");
-                                multi_bindings = pat0.constructor.args;
+                        } else if (is_adt_union) {
+                            if (pat0.constructor.args.len == 1) {
+                                const arg_p = pat0.constructor.args[0].pattern;
+                                if (arg_p.* == .ident) {
+                                    const bn = self.sourceOf(arg_p.ident.name);
+                                    try self.w.writeByte('|');
+                                    try self.emitIdent(bn);
+                                    try self.w.writeAll("| ");
+                                    bind_ident = bn;
+                                }
+                            } else {
+                                var any_bound = false;
+                                for (pat0.constructor.args) |pa| {
+                                    if (pa.pattern.* == .ident) any_bound = true;
+                                }
+                                if (any_bound) {
+                                    try self.w.writeAll("|__tup_cap| ");
+                                    multi_bindings = pat0.constructor.args;
+                                }
                             }
                         }
                     }
                 }
 
                 if (bind_ident != null or multi_bindings.len > 0) {
-                    const need_cap_block = (bind_ident != null and !self.exprMentionsIdent(arm.body, bind_ident.?)) or multi_bindings.len > 0;
+                    const need_cap_block = (compact_adt != null and bind_ident != null) or
+                        (bind_ident != null and !self.exprMentionsIdent(arm.body, bind_ident.?)) or
+                        multi_bindings.len > 0;
                     if (!need_cap_block and bind_ident != null) {
+                        const arm_sv = self.pushScopeVars();
+                        defer self.popScopeVars(arm_sv);
+                        if (is_adt_union and pat0.* == .constructor) {
+                            // Capture binding already bound in Zig arm.
+                            self.bindScopeVar(bind_ident.?, null, false);
+                        } else if (sub_ty) |st| {
+                            self.bindScopeVar(bind_ident.?, st, false);
+                        }
                         if (res_void) {
                             if (self.isVoidExpr(arm.body)) {
                                 try self.emitExpr(arm.body);
@@ -2115,9 +2841,41 @@ const Emitter = struct {
                         continue;
                     }
                     const lbl = self.nextLabel();
-                    try self.w.print("blk_{d}: {{\n", .{lbl});
+                    const arm_sv = self.pushScopeVars();
+                    defer self.popScopeVars(arm_sv);
+                    if (res_void) {
+                        try self.w.writeAll("{\n");
+                    } else {
+                        try self.w.print("blk_{d}: {{\n", .{lbl});
+                    }
                     self.indent += 1;
-                    if (bind_ident) |bn| {
+                    if (compact_adt) |cadt| {
+                        if (bind_ident) |bn| {
+                            try self.writeIndent();
+                            try self.w.writeAll("const ");
+                            try self.emitIdent(bn);
+                            if (pat0.* == .ident) {
+                                try self.w.print(" = __adt_{d};\n", .{compact_lbl});
+                                self.bindScopeVar(bn, compact_var_ft, false);
+                            } else if (compact_var_ft) |vft| {
+                                try self.w.writeAll(": ");
+                                try self.emitTy(vft);
+                                try self.w.writeAll(" = ");
+                                try self.emitUnpackCompactPayload(compact_lbl, vft, cadt.adt_layout.max_payload_bits);
+                                try self.w.writeAll(";\n");
+                                self.bindScopeVar(bn, vft, false);
+                            } else {
+                                try self.w.print(" = __adt_{d}.payload;\n", .{compact_lbl});
+                            }
+                            if (!self.exprMentionsIdent(arm.body, bn)) {
+                                try self.writeIndent();
+                                try self.w.writeAll("_ = ");
+                                try self.emitIdent(bn);
+                                try self.w.writeAll(";\n");
+                            }
+                        }
+                    } else if (bind_ident) |bn| {
+                        self.bindScopeVar(bn, null, false);
                         if (!self.exprMentionsIdent(arm.body, bn)) {
                             try self.writeIndent();
                             try self.w.writeAll("_ = ");
@@ -2132,6 +2890,7 @@ const Emitter = struct {
                             try self.w.writeAll("const ");
                             try self.emitIdent(vn);
                             try self.w.print(" = __tup_cap[{d}];\n", .{pi});
+                            self.bindScopeVar(vn, null, false);
                             if (!self.exprMentionsIdent(arm.body, vn)) {
                                 try self.writeIndent();
                                 try self.w.writeAll("_ = ");
@@ -2150,8 +2909,6 @@ const Emitter = struct {
                             try self.emitExpr(arm.body);
                             try self.w.writeAll(";\n");
                         }
-                        try self.writeIndent();
-                        try self.w.print("break :blk_{d};\n", .{lbl});
                     } else {
                         try self.w.print("break :blk_{d} ", .{lbl});
                         if (res_ty) |rt| try self.emitCoercedExpr(arm.body, rt) else try self.emitExpr(arm.body);
@@ -2183,7 +2940,18 @@ const Emitter = struct {
             }
             self.indent -= 1;
             try self.writeIndent();
-            try self.w.writeByte('}');
+            if (compact_adt != null) {
+                if (!res_void) {
+                    try self.w.writeAll("};\n");
+                } else {
+                    try self.w.writeAll("}\n");
+                }
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+            } else {
+                try self.w.writeByte('}');
+            }
             return;
         }
 
@@ -2543,6 +3311,1390 @@ const Emitter = struct {
             },
             else => false,
         };
+    }
+
+    const ForkCapture = struct {
+        name: []const u8,
+        ty: *const sema.Ty,
+        by_ptr: bool,
+    };
+
+    const SimdFieldEntry = struct {
+        fidx: usize,
+        name: []const u8,
+        ty: *const sema.Ty,
+        read: bool,
+        written: bool,
+    };
+
+    const SimdLocalVar = struct {
+        name: []const u8,
+        ty: *const sema.Ty,
+    };
+
+    fn isSimdPrimitiveTy(ty: *const sema.Ty) ?sema.Ty {
+        return switch (ty.*) {
+            .f32 => .f32,
+            .f64 => .f64,
+            .int => |it| if (it.bits == 8 or it.bits == 16 or it.bits == 32 or it.bits == 64) ty.* else null,
+            .int_range => |ir| if (ir.synthesized.bits == 8 or ir.synthesized.bits == 16 or ir.synthesized.bits == 32 or ir.synthesized.bits == 64)
+                .{ .int = ir.synthesized }
+            else
+                null,
+            else => null,
+        };
+    }
+
+    fn eqSimdScalarTy(a: *const sema.Ty, b: *const sema.Ty) bool {
+        const pa = isSimdPrimitiveTy(a) orelse return false;
+        const pb = isSimdPrimitiveTy(b) orelse return false;
+        return switch (pa) {
+            .f32 => pb == .f32,
+            .f64 => pb == .f64,
+            .int => |ia| switch (pb) {
+                .int => |ib| ia.signed == ib.signed and ia.bits == ib.bits,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn findOrAddSimdField(
+        self: *Emitter,
+        entries: *std.ArrayList(SimdFieldEntry),
+        rec: *const sema.CheckedRecord,
+        fname: []const u8,
+    ) ?usize {
+        const fidx = findRecordFieldIdx(rec, fname) orelse return null;
+        if (fieldBinByte(rec, fidx) != null) return null;
+        const fty = rec.fields[fidx].ty;
+        if (isSimdPrimitiveTy(fty) == null) return null;
+        for (entries.items, 0..) |e, idx| {
+            if (e.fidx == fidx) return idx;
+        }
+        entries.append(self.alloc, .{
+            .fidx = fidx,
+            .name = rec.fields[fidx].name,
+            .ty = fty,
+            .read = false,
+            .written = false,
+        }) catch return null;
+        return entries.items.len - 1;
+    }
+
+    fn isValidSimdExprForTy(
+        self: *Emitter,
+        rec: *const sema.CheckedRecord,
+        elem_param: []const u8,
+        locals: []const SimdLocalVar,
+        entries: *std.ArrayList(SimdFieldEntry),
+        expr: *const ast.Expr,
+        target_ty: *const sema.Ty,
+    ) bool {
+        switch (expr.*) {
+            .int_lit => return target_ty.isInteger() != null,
+            .float_lit => return target_ty.* == .f32 or target_ty.* == .f64,
+            .ident => |sp| {
+                const name = self.sourceOf(sp);
+                if (std.mem.eql(u8, name, elem_param)) return false;
+                for (locals) |lv| {
+                    if (std.mem.eql(u8, lv.name, name)) return eqSimdScalarTy(lv.ty, target_ty);
+                }
+                const ety = self.checked.exprType(expr) orelse blk: {
+                    const sv = self.lookupScopeVar(name) orelse return false;
+                    break :blk sv.ty orelse return false;
+                };
+                return eqSimdScalarTy(ety, target_ty);
+            },
+            .field => |fld| {
+                if (fld.target.* != .ident) return false;
+                if (!std.mem.eql(u8, self.sourceOf(fld.target.ident), elem_param)) return false;
+                const fname = self.sourceOf(fld.name);
+                const idx = self.findOrAddSimdField(entries, rec, fname) orelse return false;
+                if (!eqSimdScalarTy(entries.items[idx].ty, target_ty)) return false;
+                entries.items[idx].read = true;
+                return true;
+            },
+            .unary => |u| return u.op == .neg and
+                self.isValidSimdExprForTy(rec, elem_param, locals, entries, u.operand, target_ty),
+            .binary => |b| return switch (b.op) {
+                .add, .sub, .mul, .div => self.isValidSimdExprForTy(rec, elem_param, locals, entries, b.left, target_ty) and
+                    self.isValidSimdExprForTy(rec, elem_param, locals, entries, b.right, target_ty),
+                else => false,
+            },
+            else => return false,
+        }
+    }
+
+    fn collectSimdLambda(
+        self: *Emitter,
+        rec: *const sema.CheckedRecord,
+        elem_param: []const u8,
+        body: *const ast.Block,
+    ) ?[]SimdFieldEntry {
+        if (body.tail != null or body.stmts.len == 0) return null;
+        var entries: std.ArrayList(SimdFieldEntry) = .empty;
+        var locals: std.ArrayList(SimdLocalVar) = .empty;
+        var any_field_write = false;
+
+        for (body.stmts) |st| {
+            switch (st) {
+                .let_stmt => |ls| {
+                    if (ls.pattern.* != .ident) return null;
+                    const lname = self.sourceOf(ls.pattern.ident.name);
+                    const lty = self.checked.letType(ls.span.start) orelse self.checked.exprType(ls.value) orelse return null;
+                    if (isSimdPrimitiveTy(lty) == null) return null;
+                    if (!self.isValidSimdExprForTy(rec, elem_param, locals.items, &entries, ls.value, lty)) return null;
+                    locals.append(self.alloc, .{ .name = lname, .ty = lty }) catch return null;
+                },
+                .assign_stmt => |asg| {
+                    switch (asg.op) {
+                        .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => {},
+                        else => return null,
+                    }
+                    if (asg.target.* == .field) {
+                        const fld = asg.target.field;
+                        if (fld.target.* != .ident) return null;
+                        if (!std.mem.eql(u8, self.sourceOf(fld.target.ident), elem_param)) return null;
+                        const fname = self.sourceOf(fld.name);
+                        const idx = self.findOrAddSimdField(&entries, rec, fname) orelse return null;
+                        const lhs_ty = entries.items[idx].ty;
+                        if (asg.op != .assign) entries.items[idx].read = true;
+                        entries.items[idx].written = true;
+                        any_field_write = true;
+                        if (!self.isValidSimdExprForTy(rec, elem_param, locals.items, &entries, asg.value, lhs_ty)) return null;
+                    } else if (asg.target.* == .ident) {
+                        const tname = self.sourceOf(asg.target.ident);
+                        var l_ty: ?*const sema.Ty = null;
+                        for (locals.items) |lv| {
+                            if (std.mem.eql(u8, lv.name, tname)) {
+                                l_ty = lv.ty;
+                                break;
+                            }
+                        }
+                        const lhs_ty = l_ty orelse return null;
+                        if (!self.isValidSimdExprForTy(rec, elem_param, locals.items, &entries, asg.value, lhs_ty)) return null;
+                    } else {
+                        return null;
+                    }
+                },
+                else => return null,
+            }
+        }
+        if (!any_field_write) return null;
+        return entries.toOwnedSlice(self.alloc) catch null;
+    }
+
+    fn emitSimdExpr(
+        self: *Emitter,
+        loop_id: usize,
+        tw: usize,
+        elem_param: []const u8,
+        locals: []const SimdLocalVar,
+        expr: *const ast.Expr,
+        target_ty: *const sema.Ty,
+    ) Io.Writer.Error!void {
+        switch (expr.*) {
+            .field => |fld| {
+                if (fld.target.* == .ident and std.mem.eql(u8, self.sourceOf(fld.target.ident), elem_param)) {
+                    try self.w.print("__vec_{d}_", .{loop_id});
+                    try self.emitIdent(self.sourceOf(fld.name));
+                    return;
+                }
+            },
+            .ident => |sp| {
+                const name = self.sourceOf(sp);
+                for (locals) |lv| {
+                    if (std.mem.eql(u8, lv.name, name)) {
+                        try self.w.print("__vloc_{d}_", .{loop_id});
+                        try self.emitIdent(name);
+                        return;
+                    }
+                }
+            },
+            .unary => |u| {
+                if (u.op == .neg) {
+                    try self.w.writeAll("(-(");
+                    try self.emitSimdExpr(loop_id, tw, elem_param, locals, u.operand, target_ty);
+                    try self.w.writeAll("))");
+                    return;
+                }
+            },
+            .binary => |b| {
+                if (b.op == .div and target_ty.isInteger() != null) {
+                    try self.w.writeAll("@divTrunc(");
+                    try self.emitSimdExpr(loop_id, tw, elem_param, locals, b.left, target_ty);
+                    try self.w.writeAll(", ");
+                    try self.emitSimdExpr(loop_id, tw, elem_param, locals, b.right, target_ty);
+                    try self.w.writeByte(')');
+                    return;
+                }
+                if (b.op == .add or b.op == .sub or b.op == .mul or b.op == .div) {
+                    try self.w.writeByte('(');
+                    try self.emitSimdExpr(loop_id, tw, elem_param, locals, b.left, target_ty);
+                    try self.w.print(" {s} ", .{b.op.symbol()});
+                    try self.emitSimdExpr(loop_id, tw, elem_param, locals, b.right, target_ty);
+                    try self.w.writeByte(')');
+                    return;
+                }
+            },
+            else => {},
+        }
+        try self.w.print("@as(@Vector({d}, ", .{tw});
+        try self.emitTy(target_ty);
+        try self.w.writeAll("), @splat(");
+        try self.emitCoercedExpr(expr, target_ty);
+        try self.w.writeAll("))");
+    }
+
+    fn containsName(list: []const []const u8, name: []const u8) bool {
+        for (list) |item| {
+            if (std.mem.eql(u8, item, name)) return true;
+        }
+        return false;
+    }
+
+    fn collectPatternBinders(self: *const Emitter, pat: *const ast.Pattern, locals: *std.ArrayList([]const u8)) void {
+        switch (pat.*) {
+            .ident => |id| locals.append(self.alloc, self.sourceOf(id.name)) catch {},
+            .tuple => |tp| for (tp.elems) |el| self.collectPatternBinders(el, locals),
+            .constructor => |c| for (c.args) |a| self.collectPatternBinders(a.pattern, locals),
+            .alias => |al| {
+                self.collectPatternBinders(al.inner, locals);
+                locals.append(self.alloc, self.sourceOf(al.name)) catch {};
+            },
+            .list => |lp| {
+                for (lp.elems) |el| self.collectPatternBinders(el, locals);
+                if (lp.rest) |rsp| locals.append(self.alloc, self.sourceOf(rsp)) catch {};
+            },
+            .or_pat => |op| if (op.alternatives.len > 0) self.collectPatternBinders(op.alternatives[0], locals),
+            else => {},
+        }
+    }
+
+    fn collectCapturesBlock(
+        self: *const Emitter,
+        root_blk: *const ast.Block,
+        blk: *const ast.Block,
+        locals: *std.ArrayList([]const u8),
+        caps: *std.ArrayList(ForkCapture),
+    ) void {
+        const lmark = locals.items.len;
+        defer locals.shrinkRetainingCapacity(lmark);
+        for (blk.stmts) |*st| {
+            self.collectCapturesStmt(root_blk, st, locals, caps);
+        }
+        if (blk.tail) |t| self.collectCapturesExpr(root_blk, t, locals, caps);
+    }
+
+    fn collectCapturesStmt(
+        self: *const Emitter,
+        root_blk: *const ast.Block,
+        stmt: *const ast.Stmt,
+        locals: *std.ArrayList([]const u8),
+        caps: *std.ArrayList(ForkCapture),
+    ) void {
+        switch (stmt.*) {
+            .let_stmt => |ls| {
+                self.collectCapturesExpr(root_blk, ls.value, locals, caps);
+                self.collectPatternBinders(ls.pattern, locals);
+            },
+            .use_stmt => |us| {
+                self.collectCapturesExpr(root_blk, us.expr, locals, caps);
+                for (us.patterns) |p| self.collectPatternBinders(p, locals);
+            },
+            .assign_stmt => |asg| {
+                self.collectCapturesExpr(root_blk, asg.target, locals, caps);
+                self.collectCapturesExpr(root_blk, asg.value, locals, caps);
+            },
+            .return_stmt => |rs| if (rs.value) |v| self.collectCapturesExpr(root_blk, v, locals, caps),
+            .while_stmt => |ws| {
+                self.collectCapturesExpr(root_blk, ws.cond, locals, caps);
+                self.collectCapturesBlock(root_blk, &ws.body, locals, caps);
+            },
+            .for_stmt => |fs| {
+                self.collectCapturesExpr(root_blk, fs.iter, locals, caps);
+                const lmark = locals.items.len;
+                defer locals.shrinkRetainingCapacity(lmark);
+                self.collectPatternBinders(fs.pattern, locals);
+                self.collectCapturesBlock(root_blk, &fs.body, locals, caps);
+            },
+            .expr_stmt => |es| self.collectCapturesExpr(root_blk, es.expr, locals, caps),
+        }
+    }
+
+    fn collectCapturesExpr(
+        self: *const Emitter,
+        root_blk: *const ast.Block,
+        expr: *const ast.Expr,
+        locals: *std.ArrayList([]const u8),
+        caps: *std.ArrayList(ForkCapture),
+    ) void {
+        switch (expr.*) {
+            .ident => |sp| {
+                const name = self.sourceOf(sp);
+                if (containsName(locals.items, name)) return;
+                const sv = self.lookupScopeVar(name) orelse return;
+                for (caps.items) |c| {
+                    if (std.mem.eql(u8, c.name, name)) return;
+                }
+                const ty = sv.ty orelse self.checked.exprType(expr) orelse return;
+                const is_ptr_or_slice = isPointerType(ty) or ty.* == .slice or ty.* == .collection or
+                    (ty.* == .view and (ty.view.target.* == .slice or ty.view.target.* == .collection)) or
+                    (ty.* == .path_borrow and (ty.path_borrow.base.* == .slice or ty.path_borrow.base.* == .collection));
+                const by_ptr = sv.is_mut and !is_ptr_or_slice and self.blockMutatesOrBorrowsIdent(root_blk, name);
+                caps.append(self.alloc, .{ .name = name, .ty = ty, .by_ptr = by_ptr }) catch {};
+            },
+            .unary => |u| self.collectCapturesExpr(root_blk, u.operand, locals, caps),
+            .binary => |b| {
+                self.collectCapturesExpr(root_blk, b.left, locals, caps);
+                self.collectCapturesExpr(root_blk, b.right, locals, caps);
+            },
+            .cast => |c| self.collectCapturesExpr(root_blk, c.expr, locals, caps),
+            .call => |c| {
+                self.collectCapturesExpr(root_blk, c.callee, locals, caps);
+                for (c.args) |a| self.collectCapturesExpr(root_blk, a.value, locals, caps);
+            },
+            .field => |fld| self.collectCapturesExpr(root_blk, fld.target, locals, caps),
+            .index => |ix| {
+                self.collectCapturesExpr(root_blk, ix.target, locals, caps);
+                self.collectCapturesExpr(root_blk, ix.idx, locals, caps);
+            },
+            .try_op => |t| self.collectCapturesExpr(root_blk, t.operand, locals, caps),
+            .record_lit => |rl| {
+                for (rl.fields) |rf| {
+                    if (rf.value) |v| {
+                        self.collectCapturesExpr(root_blk, v, locals, caps);
+                    } else {
+                        const name = self.sourceOf(rf.name);
+                        if (!containsName(locals.items, name)) {
+                            if (self.lookupScopeVar(name)) |sv| {
+                                var already = false;
+                                for (caps.items) |c| if (std.mem.eql(u8, c.name, name)) {
+                                    already = true;
+                                };
+                                if (!already) {
+                                    if (sv.ty) |ty| {
+                                        const is_ptr_or_slice = isPointerType(ty) or ty.* == .slice or ty.* == .collection;
+                                        const by_ptr = sv.is_mut and !is_ptr_or_slice and self.blockMutatesOrBorrowsIdent(root_blk, name);
+                                        caps.append(self.alloc, .{ .name = name, .ty = ty, .by_ptr = by_ptr }) catch {};
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            .tuple => |tp| for (tp.elems) |el| self.collectCapturesExpr(root_blk, el, locals, caps),
+            .list => |ls| for (ls.elems) |el| self.collectCapturesExpr(root_blk, el, locals, caps),
+            .block => |*blk| self.collectCapturesBlock(root_blk, blk, locals, caps),
+            .if_expr => |ie| {
+                self.collectCapturesExpr(root_blk, ie.cond, locals, caps);
+                self.collectCapturesBlock(root_blk, &ie.then_block, locals, caps);
+                if (ie.else_branch) |eb| self.collectCapturesExpr(root_blk, eb, locals, caps);
+            },
+            .case_expr => |ce| {
+                for (ce.subjects) |s| self.collectCapturesExpr(root_blk, s, locals, caps);
+                for (ce.arms) |arm| {
+                    const lmark = locals.items.len;
+                    defer locals.shrinkRetainingCapacity(lmark);
+                    if (arm.alternatives.len > 0) {
+                        for (arm.alternatives[0]) |p| self.collectPatternBinders(p, locals);
+                    }
+                    if (arm.guard) |g| self.collectCapturesExpr(root_blk, g, locals, caps);
+                    self.collectCapturesExpr(root_blk, arm.body, locals, caps);
+                }
+            },
+            .lambda => |lam| {
+                const lmark = locals.items.len;
+                defer locals.shrinkRetainingCapacity(lmark);
+                for (lam.params) |p| locals.append(self.alloc, self.sourceOf(p.name)) catch {};
+                self.collectCapturesBlock(root_blk, &lam.body, locals, caps);
+            },
+            .view_expr => |vw| {
+                self.collectCapturesExpr(root_blk, vw.target, locals, caps);
+                const lmark = locals.items.len;
+                defer locals.shrinkRetainingCapacity(lmark);
+                if (vw.binding) |bspan| locals.append(self.alloc, self.sourceOf(bspan)) catch {};
+                self.collectCapturesBlock(root_blk, &vw.body, locals, caps);
+            },
+            .fork_expr => |fk| for (fk.branches) |*br| self.collectCapturesBlock(root_blk, br, locals, caps),
+            .todo_expr => |td| if (td.message) |m| self.collectCapturesExpr(root_blk, m, locals, caps),
+            .panic_expr => |pn| if (pn.message) |m| self.collectCapturesExpr(root_blk, m, locals, caps),
+            else => {},
+        }
+    }
+
+    fn collectFreeCaptures(self: *const Emitter, br: *const ast.Block) ![]const ForkCapture {
+        var locals: std.ArrayList([]const u8) = .empty;
+        var caps: std.ArrayList(ForkCapture) = .empty;
+        self.collectCapturesBlock(br, br, &locals, &caps);
+        return try caps.toOwnedSlice(self.alloc);
+    }
+
+    fn collectFreeLambdaCaptures(self: *const Emitter, lam: anytype) ![]const ForkCapture {
+        var locals: std.ArrayList([]const u8) = .empty;
+        for (lam.params) |p| {
+            locals.append(self.alloc, self.sourceOf(p.name)) catch {};
+        }
+        var caps: std.ArrayList(ForkCapture) = .empty;
+        self.collectCapturesBlock(&lam.body, &lam.body, &locals, &caps);
+        return try caps.toOwnedSlice(self.alloc);
+    }
+
+    fn emitLambdaExpr(self: *Emitter, full_expr: *const ast.Expr, lam: anytype) Io.Writer.Error!void {
+        const fn_ty_opt = self.checked.exprType(full_expr);
+        const fn_info = if (fn_ty_opt) |ft| if (ft.* == .fn_ty) ft.fn_ty else null else null;
+        const ret_ty: ?*const sema.Ty = if (fn_info) |fi| fi.ret else null;
+        const ret_is_void = if (ret_ty) |rt| isVoidTy(rt) else (lam.ret == null and lam.body.tail == null);
+        const caps = self.collectFreeLambdaCaptures(lam) catch &.{};
+
+        if (caps.len == 0) {
+            try self.w.writeAll("(&((struct {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.w.writeAll("pub fn call(");
+        } else {
+            try self.w.writeAll("(struct {\n");
+            self.indent += 1;
+            for (caps) |cap| {
+                try self.writeIndent();
+                try self.emitIdent(cap.name);
+                try self.w.writeAll(": ");
+                if (cap.by_ptr) try self.w.writeByte('*');
+                try self.emitTy(cap.ty);
+                try self.w.writeAll(",\n");
+            }
+            try self.writeIndent();
+            try self.w.writeAll("pub fn call(__ctx: @This()");
+        }
+
+        for (lam.params, 0..) |p, pi| {
+            if (caps.len > 0 or pi > 0) try self.w.writeAll(", ");
+            try self.emitIdent(self.sourceOf(p.name));
+            try self.w.writeAll(": ");
+            if (fn_info != null and pi < fn_info.?.params.len and fn_info.?.params[pi].* != .err) {
+                if (fn_info.?.params[pi].* == .fn_ty) {
+                    try self.w.writeAll("anytype");
+                } else {
+                    try self.emitTy(fn_info.?.params[pi]);
+                }
+            } else if (p.ty) |pt| {
+                try self.emitAstType(pt);
+            } else {
+                try self.w.writeAll("usize");
+            }
+        }
+        try self.w.writeAll(") ");
+        if (ret_ty != null and ret_ty.?.* != .err) {
+            try self.emitTy(ret_ty.?);
+        } else if (lam.ret) |rt| {
+            try self.emitAstType(rt);
+        } else {
+            try self.w.writeAll("void");
+        }
+        try self.w.writeAll(" {\n");
+
+        self.indent += 1;
+        const prev_ret = self.current_fn_ret;
+        const prev_deref = self.deref_idents;
+        const prev_ctx_vals = self.ctx_value_idents;
+        const prev_scopes = self.scope_vars;
+        self.current_fn_ret = ret_ty;
+        var w_deref: std.ArrayList([]const u8) = .empty;
+        var w_ctx_vals: std.ArrayList([]const u8) = .empty;
+        var w_scopes: std.ArrayList(ScopeVar) = .empty;
+        for (caps) |cap| {
+            if (cap.by_ptr) {
+                w_deref.append(self.alloc, cap.name) catch {};
+            } else {
+                w_ctx_vals.append(self.alloc, cap.name) catch {};
+            }
+            w_scopes.append(self.alloc, .{ .name = cap.name, .ty = cap.ty, .is_mut = cap.by_ptr }) catch {};
+        }
+        for (lam.params, 0..) |p, pi| {
+            const pty: ?*const sema.Ty = if (fn_info != null and pi < fn_info.?.params.len) fn_info.?.params[pi] else null;
+            const pname = self.sourceOf(p.name);
+            w_scopes.append(self.alloc, .{
+                .name = pname,
+                .ty = pty,
+                .is_mut = p.mutable or (pty != null and isPointerType(pty.?)),
+            }) catch {};
+            if (!self.blockMentionsIdent(&lam.body, pname)) {
+                try self.writeIndent();
+                try self.w.writeAll("_ = ");
+                try self.emitIdent(pname);
+                try self.w.writeAll(";\n");
+            }
+        }
+        self.deref_idents = w_deref;
+        self.ctx_value_idents = w_ctx_vals;
+        self.scope_vars = w_scopes;
+        defer {
+            self.current_fn_ret = prev_ret;
+            self.deref_idents = prev_deref;
+            self.ctx_value_idents = prev_ctx_vals;
+            self.scope_vars = prev_scopes;
+        }
+
+        try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
+        if (lam.body.tail) |t| {
+            if (ret_is_void) {
+                try self.emitTailStmt(t);
+            } else {
+                try self.writeIndent();
+                try self.w.writeAll("return ");
+                if (ret_ty != null and ret_ty.?.* != .err) {
+                    try self.emitCoercedExpr(t, ret_ty.?);
+                } else {
+                    try self.emitExpr(t);
+                }
+                try self.w.writeAll(";\n");
+            }
+        }
+
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.w.writeAll("}\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        if (caps.len == 0) {
+            try self.w.writeAll("}).call))");
+        } else {
+            try self.w.writeAll("}){ ");
+            for (caps, 0..) |cap, ci| {
+                if (ci > 0) try self.w.writeAll(", ");
+                try self.w.writeByte('.');
+                try self.emitIdent(cap.name);
+                try self.w.writeAll(" = ");
+                if (cap.by_ptr) try self.w.writeByte('&');
+                if (self.isDerefIdent_slice(prev_deref.items, cap.name)) {
+                    try self.w.writeAll("(__ctx.");
+                    try self.emitIdent(cap.name);
+                    try self.w.writeAll(".*)");
+                } else if (self.isDerefIdent_slice(prev_ctx_vals.items, cap.name)) {
+                    try self.w.writeAll("__ctx.");
+                    try self.emitIdent(cap.name);
+                } else {
+                    try self.emitIdent(cap.name);
+                }
+            }
+            try self.w.writeAll(" }");
+        }
+    }
+
+    fn isDerefIdent_slice(self: *const Emitter, list: []const []const u8, name: []const u8) bool {
+        _ = self;
+        for (list) |item| if (std.mem.eql(u8, item, name)) return true;
+        return false;
+    }
+
+    const CollectionPipeline = struct {
+        base: *const ast.Expr,
+        map_stages: []const *const ast.Expr,
+        fold_arg: ?*const ast.Expr,
+        fold_init: ?*const ast.Expr,
+    };
+
+    fn flattenCollectionPipeline(self: *const Emitter, expr: *const ast.Expr) CollectionPipeline {
+        var cur = expr;
+        var fold_arg: ?*const ast.Expr = null;
+        var fold_init: ?*const ast.Expr = null;
+        var stages: std.ArrayList(*const ast.Expr) = .empty;
+
+        if (cur.* == .binary and cur.binary.op == .pipe and cur.binary.right.* == .call) {
+            const c = cur.binary.right.call;
+            if (c.callee.* == .ident and std.mem.eql(u8, self.sourceOf(c.callee.ident), "fold") and c.args.len == 2) {
+                const l_ty = self.checked.exprType(cur.binary.left);
+                if (l_ty != null and (l_ty.?.* == .collection or l_ty.?.* == .slice or l_ty.?.* == .view or l_ty.?.* == .path_borrow)) {
+                    fold_init = c.args[0].value;
+                    fold_arg = c.args[1].value;
+                    cur = cur.binary.left;
+                }
+            }
+        }
+
+        while (cur.* == .binary and cur.binary.op == .pipe and cur.binary.right.* == .call) {
+            const c = cur.binary.right.call;
+            if (c.callee.* == .ident and std.mem.eql(u8, self.sourceOf(c.callee.ident), "map_in_place") and
+                c.args.len == 1 and c.args[0].value.* == .lambda)
+            {
+                stages.append(self.alloc, c.args[0].value) catch break;
+                cur = cur.binary.left;
+            } else {
+                break;
+            }
+        }
+
+        std.mem.reverse(*const ast.Expr, stages.items);
+        return .{
+            .base = cur,
+            .map_stages = stages.toOwnedSlice(self.alloc) catch &.{},
+            .fold_arg = fold_arg,
+            .fold_init = fold_init,
+        };
+    }
+
+    fn collectSimdMultiLambda(
+        self: *Emitter,
+        rec: *const sema.CheckedRecord,
+        stage_lambdas: []const *const ast.Expr,
+    ) ?[]SimdFieldEntry {
+        if (stage_lambdas.len == 0) return null;
+        var entries: std.ArrayList(SimdFieldEntry) = .empty;
+        for (stage_lambdas) |lam_expr| {
+            const lam = lam_expr.lambda;
+            const elem_param = if (lam.params.len > 0) self.sourceOf(lam.params[0].name) else "__elem";
+            if (lam.body.tail != null or lam.body.stmts.len == 0) return null;
+            var locals: std.ArrayList(SimdLocalVar) = .empty;
+            var any_write = false;
+            for (lam.body.stmts) |st| {
+                switch (st) {
+                    .let_stmt => |ls| {
+                        if (ls.pattern.* != .ident) return null;
+                        const lname = self.sourceOf(ls.pattern.ident.name);
+                        const lty = self.checked.letType(ls.span.start) orelse self.checked.exprType(ls.value) orelse return null;
+                        if (isSimdPrimitiveTy(lty) == null) return null;
+                        if (!self.isValidSimdExprForTy(rec, elem_param, locals.items, &entries, ls.value, lty)) return null;
+                        locals.append(self.alloc, .{ .name = lname, .ty = lty }) catch return null;
+                    },
+                    .assign_stmt => |asg| {
+                        switch (asg.op) {
+                            .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => {},
+                            else => return null,
+                        }
+                        if (asg.target.* == .field) {
+                            const fld = asg.target.field;
+                            if (fld.target.* != .ident) return null;
+                            if (!std.mem.eql(u8, self.sourceOf(fld.target.ident), elem_param)) return null;
+                            const fname = self.sourceOf(fld.name);
+                            const idx = self.findOrAddSimdField(&entries, rec, fname) orelse return null;
+                            const lhs_ty = entries.items[idx].ty;
+                            if (asg.op != .assign) entries.items[idx].read = true;
+                            entries.items[idx].written = true;
+                            any_write = true;
+                            if (!self.isValidSimdExprForTy(rec, elem_param, locals.items, &entries, asg.value, lhs_ty)) return null;
+                        } else if (asg.target.* == .ident) {
+                            const tname = self.sourceOf(asg.target.ident);
+                            var l_ty: ?*const sema.Ty = null;
+                            for (locals.items) |lv| {
+                                if (std.mem.eql(u8, lv.name, tname)) {
+                                    l_ty = lv.ty;
+                                    break;
+                                }
+                            }
+                            const lhs_ty = l_ty orelse return null;
+                            if (!self.isValidSimdExprForTy(rec, elem_param, locals.items, &entries, asg.value, lhs_ty)) return null;
+                        } else {
+                            return null;
+                        }
+                    },
+                    else => return null,
+                }
+            }
+            if (!any_write) return null;
+        }
+        return entries.toOwnedSlice(self.alloc) catch null;
+    }
+
+    fn emitCollectionPipeline(
+        self: *Emitter,
+        full_expr: ?*const ast.Expr,
+        pipe: CollectionPipeline,
+        need_value: bool,
+    ) Io.Writer.Error!void {
+        const recv_ty = self.checked.exprType(pipe.base);
+        var tile_width: ?usize = null;
+        var elem_ridx_opt: ?usize = null;
+        if (recv_ty) |rt| {
+            const ridx_opt: ?usize = switch (rt.*) {
+                .collection => |c| c.elem_record,
+                .slice => |s| if (s.elem.* == .record) s.elem.record else null,
+                .view => |v| switch (v.target.*) {
+                    .collection => |c| c.elem_record,
+                    .slice => |s| if (s.elem.* == .record) s.elem.record else null,
+                    .record => |ri| ri,
+                    else => null,
+                },
+                .path_borrow => |pb| switch (pb.base.*) {
+                    .collection => |c| c.elem_record,
+                    .slice => |s| if (s.elem.* == .record) s.elem.record else null,
+                    .record => |ri| ri,
+                    else => null,
+                },
+                else => null,
+            };
+            elem_ridx_opt = ridx_opt;
+            if (ridx_opt) |ridx| {
+                if (ridx < self.checked.records.len) {
+                    if (self.checked.records[ridx].collection_layout) |cl| {
+                        switch (cl) {
+                            .aosoa => |w| tile_width = w,
+                            else => {},
+                        }
+                    }
+                }
+            }
+        }
+        const elem_ptr_ty: ?*const sema.Ty = if (elem_ridx_opt) |ri| blk: {
+            const rec_ty = self.alloc.create(sema.Ty) catch break :blk null;
+            rec_ty.* = .{ .record = ri };
+            const ptr_ty = self.alloc.create(sema.Ty) catch break :blk null;
+            ptr_ty.* = .{ .view = .{ .mode = .exclusive, .target = rec_ty, .target_record = ri } };
+            break :blk ptr_ty;
+        } else null;
+
+        const id = self.nextLabel();
+        const is_fold = pipe.fold_arg != null;
+        const returns_val = is_fold or need_value;
+        const fold_res_ty: ?*const sema.Ty = if (is_fold and full_expr != null) self.checked.exprType(full_expr.?) else null;
+
+        if (returns_val) {
+            try self.w.print("blk_{d}: {{\n", .{id});
+        } else {
+            try self.w.writeAll("{\n");
+        }
+        self.indent += 1;
+
+        if (pipe.map_stages.len >= 2 or is_fold) {
+            try self.writeIndent();
+            try self.w.print("// Categorical fusion: {d} map_in_place stage(s){s} fused into 1 pass\n", .{
+                pipe.map_stages.len,
+                if (is_fold) " + fold deforestation" else "",
+            });
+        }
+
+        try self.writeIndent();
+        try self.w.print("const __col_{d} = ", .{id});
+        try self.emitExpr(pipe.base);
+        try self.w.writeAll(";\n");
+
+        if (is_fold) {
+            try self.writeIndent();
+            try self.w.print("var __acc_{d}", .{id});
+            if (fold_res_ty != null and fold_res_ty.?.* != .err) {
+                try self.w.writeAll(": ");
+                try self.emitTy(fold_res_ty.?);
+            }
+            try self.w.writeAll(" = ");
+            if (fold_res_ty != null and fold_res_ty.?.* != .err) {
+                try self.emitCoercedExpr(pipe.fold_init.?, fold_res_ty.?);
+            } else {
+                try self.emitExpr(pipe.fold_init.?);
+            }
+            try self.w.writeAll(";\n");
+        }
+
+        if (tile_width) |tw| {
+            const simd_fields_opt: ?[]SimdFieldEntry = if (tw >= 2 and elem_ridx_opt != null and pipe.map_stages.len > 0)
+                self.collectSimdMultiLambda(&self.checked.records[elem_ridx_opt.?], pipe.map_stages)
+            else
+                null;
+
+            if (pipe.map_stages.len == 1 and simd_fields_opt != null) {
+                try self.writeIndent();
+                try self.w.print("// @layout(aosoa({d})): L1-cache tiled 64B-aligned @Vector({d}, T) SIMD pass\n", .{ tw, tw });
+            } else if (pipe.map_stages.len >= 1) {
+                try self.writeIndent();
+                try self.w.print("// @layout(aosoa({d})): L1-cache tiled loop (tile_width = {d})\n", .{ tw, tw });
+            }
+
+            try self.writeIndent();
+            try self.w.print("var __tile_{d}: usize = 0;\n", .{id});
+            try self.writeIndent();
+            try self.w.print("while (__tile_{d} + {d} <= __col_{d}.len) : (__tile_{d} += {d}) {{\n", .{ id, tw, id, id, tw });
+            self.indent += 1;
+
+            if (simd_fields_opt) |simd_fields| {
+                for (simd_fields) |sf| {
+                    try self.writeIndent();
+                    try self.w.writeAll(if (sf.written) "var " else "const ");
+                    try self.w.print("__vec_{d}_", .{id});
+                    try self.emitIdent(sf.name);
+                    try self.w.print(": @Vector({d}, ", .{tw});
+                    try self.emitTy(sf.ty);
+                    if (sf.read) {
+                        const ld_lbl = self.nextLabel();
+                        try self.w.print(") = blk_{d}: {{\n", .{ld_lbl});
+                        self.indent += 1;
+                        try self.writeIndent();
+                        try self.w.print("var __buf_{d}: [{d}]", .{ ld_lbl, tw });
+                        try self.emitTy(sf.ty);
+                        try self.w.writeAll(" align(64) = undefined;\n");
+                        try self.writeIndent();
+                        try self.w.print("inline for (0..{d}) |__li| __buf_{d}[__li] = __col_{d}[__tile_{d} + __li].", .{ tw, ld_lbl, id, id });
+                        try self.emitIdent(sf.name);
+                        try self.w.writeAll(";\n");
+                        try self.writeIndent();
+                        try self.w.print("break :blk_{d} __buf_{d};\n", .{ ld_lbl, ld_lbl });
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("};\n");
+                    } else {
+                        try self.w.writeAll(") = undefined;\n");
+                    }
+                }
+
+                for (pipe.map_stages, 0..) |lam_expr, stage_idx| {
+                    const lam = lam_expr.lambda;
+                    const elem_param = if (lam.params.len > 0) self.sourceOf(lam.params[0].name) else "__elem";
+                    var simd_locals: std.ArrayList(SimdLocalVar) = .empty;
+                    for (lam.body.stmts, 0..) |st, si| {
+                        switch (st) {
+                            .let_stmt => |ls| {
+                                const lname = self.sourceOf(ls.pattern.ident.name);
+                                const lty = self.checked.letType(ls.span.start) orelse self.checked.exprType(ls.value).?;
+                                const is_mut_loc = ls.mutable or ls.pattern.ident.mutable;
+                                try self.writeIndent();
+                                try self.w.writeAll(if (is_mut_loc) "var " else "const ");
+                                try self.w.print("__vloc_{d}_{d}_", .{ id, stage_idx });
+                                try self.emitIdent(lname);
+                                try self.w.print(": @Vector({d}, ", .{tw});
+                                try self.emitTy(lty);
+                                try self.w.writeAll(") = ");
+                                try self.emitSimdStageExpr(id, stage_idx, tw, elem_param, simd_locals.items, ls.value, lty);
+                                try self.w.writeAll(";\n");
+                                if (is_mut_loc and !self.stmtsMutateOrBorrowIdent(lam.body.stmts[si + 1 ..], null, lname)) {
+                                    try self.writeIndent();
+                                    try self.w.print("_ = &__vloc_{d}_{d}_", .{ id, stage_idx });
+                                    try self.emitIdent(lname);
+                                    try self.w.writeAll(";\n");
+                                } else if (!is_mut_loc and !self.stmtsMentionIdent(lam.body.stmts[si + 1 ..], null, lname)) {
+                                    try self.writeIndent();
+                                    try self.w.print("_ = __vloc_{d}_{d}_", .{ id, stage_idx });
+                                    try self.emitIdent(lname);
+                                    try self.w.writeAll(";\n");
+                                }
+                                simd_locals.append(self.alloc, .{ .name = lname, .ty = lty }) catch {};
+                            },
+                            .assign_stmt => |asg| {
+                                var lhs_ty: *const sema.Ty = undefined;
+                                try self.writeIndent();
+                                if (asg.target.* == .field) {
+                                    const fname = self.sourceOf(asg.target.field.name);
+                                    const fi = findRecordFieldIdx(&self.checked.records[elem_ridx_opt.?], fname).?;
+                                    lhs_ty = self.checked.records[elem_ridx_opt.?].fields[fi].ty;
+                                    if (asg.op == .div_assign and lhs_ty.isInteger() != null) {
+                                        try self.w.print("__vec_{d}_", .{id});
+                                        try self.emitIdent(fname);
+                                        try self.w.print(" = @divTrunc(__vec_{d}_", .{id});
+                                        try self.emitIdent(fname);
+                                        try self.w.writeAll(", ");
+                                        try self.emitSimdStageExpr(id, stage_idx, tw, elem_param, simd_locals.items, asg.value, lhs_ty);
+                                        try self.w.writeAll(");\n");
+                                        continue;
+                                    }
+                                    try self.w.print("__vec_{d}_", .{id});
+                                    try self.emitIdent(fname);
+                                } else {
+                                    const lname = self.sourceOf(asg.target.ident);
+                                    for (simd_locals.items) |lv| {
+                                        if (std.mem.eql(u8, lv.name, lname)) {
+                                            lhs_ty = lv.ty;
+                                            break;
+                                        }
+                                    }
+                                    if (asg.op == .div_assign and lhs_ty.isInteger() != null) {
+                                        try self.w.print("__vloc_{d}_{d}_", .{ id, stage_idx });
+                                        try self.emitIdent(lname);
+                                        try self.w.print(" = @divTrunc(__vloc_{d}_{d}_", .{ id, stage_idx });
+                                        try self.emitIdent(lname);
+                                        try self.w.writeAll(", ");
+                                        try self.emitSimdStageExpr(id, stage_idx, tw, elem_param, simd_locals.items, asg.value, lhs_ty);
+                                        try self.w.writeAll(");\n");
+                                        continue;
+                                    }
+                                    try self.w.print("__vloc_{d}_{d}_", .{ id, stage_idx });
+                                    try self.emitIdent(lname);
+                                }
+                                try self.w.print(" {s} ", .{asg.op.symbol()});
+                                try self.emitSimdStageExpr(id, stage_idx, tw, elem_param, simd_locals.items, asg.value, lhs_ty);
+                                try self.w.writeAll(";\n");
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
+                try self.writeIndent();
+                try self.w.print("inline for (0..{d}) |__li| {{\n", .{tw});
+                self.indent += 1;
+                for (simd_fields) |sf| {
+                    if (!sf.written) continue;
+                    try self.writeIndent();
+                    try self.w.print("__col_{d}[__tile_{d} + __li].", .{ id, id });
+                    try self.emitIdent(sf.name);
+                    try self.w.print(" = __vec_{d}_", .{id});
+                    try self.emitIdent(sf.name);
+                    try self.w.writeAll("[__li];\n");
+                }
+                if (is_fold) {
+                    try self.writeIndent();
+                    try self.w.print("__acc_{d} = aethelCall(", .{id});
+                    try self.emitExpr(pipe.fold_arg.?);
+                    try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d} + __li] }});\n", .{ id, id, id });
+                }
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+            } else {
+                try self.writeIndent();
+                try self.w.print("var __lane_{d}: usize = 0;\n", .{id});
+                try self.writeIndent();
+                try self.w.print("while (__lane_{d} < {d}) : (__lane_{d} += 1) {{\n", .{ id, tw, id });
+                self.indent += 1;
+                for (pipe.map_stages) |lam_expr| {
+                    const lam = lam_expr.lambda;
+                    const elem_param = if (lam.params.len > 0) self.sourceOf(lam.params[0].name) else "__elem";
+                    try self.writeIndent();
+                    try self.w.writeAll("{\n");
+                    self.indent += 1;
+                    const lsv = self.pushScopeVars();
+                    defer self.popScopeVars(lsv);
+                    self.bindScopeVar(elem_param, elem_ptr_ty, true);
+                    try self.writeIndent();
+                    try self.w.writeAll("const ");
+                    try self.emitIdent(elem_param);
+                    try self.w.print(" = &__col_{d}[__tile_{d} + __lane_{d}];\n", .{ id, id, id });
+                    if (!self.blockMentionsIdent(&lam.body, elem_param)) {
+                        try self.writeIndent();
+                        try self.w.writeAll("_ = ");
+                        try self.emitIdent(elem_param);
+                        try self.w.writeAll(";\n");
+                    }
+                    try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
+                    if (lam.body.tail) |t| try self.emitTailStmt(t);
+                    self.indent -= 1;
+                    try self.writeIndent();
+                    try self.w.writeAll("}\n");
+                }
+                if (is_fold) {
+                    try self.writeIndent();
+                    try self.w.print("__acc_{d} = aethelCall(", .{id});
+                    try self.emitExpr(pipe.fold_arg.?);
+                    try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d} + __lane_{d}] }});\n", .{ id, id, id, id });
+                }
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+            }
+
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+            try self.writeIndent();
+            try self.w.print("while (__tile_{d} < __col_{d}.len) : (__tile_{d} += 1) {{\n", .{ id, id, id });
+            self.indent += 1;
+            for (pipe.map_stages) |lam_expr| {
+                const lam = lam_expr.lambda;
+                const elem_param = if (lam.params.len > 0) self.sourceOf(lam.params[0].name) else "__elem";
+                try self.writeIndent();
+                try self.w.writeAll("{\n");
+                self.indent += 1;
+                const tsv = self.pushScopeVars();
+                defer self.popScopeVars(tsv);
+                self.bindScopeVar(elem_param, elem_ptr_ty, true);
+                try self.writeIndent();
+                try self.w.writeAll("const ");
+                try self.emitIdent(elem_param);
+                try self.w.print(" = &__col_{d}[__tile_{d}];\n", .{ id, id });
+                if (!self.blockMentionsIdent(&lam.body, elem_param)) {
+                    try self.writeIndent();
+                    try self.w.writeAll("_ = ");
+                    try self.emitIdent(elem_param);
+                    try self.w.writeAll(";\n");
+                }
+                try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
+                if (lam.body.tail) |t| try self.emitTailStmt(t);
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+            }
+            if (is_fold) {
+                try self.writeIndent();
+                try self.w.print("__acc_{d} = aethelCall(", .{id});
+                try self.emitExpr(pipe.fold_arg.?);
+                try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d}] }});\n", .{ id, id, id });
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+        } else {
+            try self.writeIndent();
+            try self.w.print("var __idx_{d}: usize = 0;\n", .{id});
+            try self.writeIndent();
+            try self.w.print("while (__idx_{d} < __col_{d}.len) : (__idx_{d} += 1) {{\n", .{ id, id, id });
+            self.indent += 1;
+            for (pipe.map_stages) |lam_expr| {
+                const lam = lam_expr.lambda;
+                const elem_param = if (lam.params.len > 0) self.sourceOf(lam.params[0].name) else "__elem";
+                try self.writeIndent();
+                try self.w.writeAll("{\n");
+                self.indent += 1;
+                const msv = self.pushScopeVars();
+                defer self.popScopeVars(msv);
+                self.bindScopeVar(elem_param, elem_ptr_ty, true);
+                try self.writeIndent();
+                try self.w.writeAll("const ");
+                try self.emitIdent(elem_param);
+                try self.w.print(" = &__col_{d}[__idx_{d}];\n", .{ id, id });
+                if (!self.blockMentionsIdent(&lam.body, elem_param)) {
+                    try self.writeIndent();
+                    try self.w.writeAll("_ = ");
+                    try self.emitIdent(elem_param);
+                    try self.w.writeAll(";\n");
+                }
+                try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
+                if (lam.body.tail) |t| try self.emitTailStmt(t);
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+            }
+            if (is_fold) {
+                try self.writeIndent();
+                try self.w.print("__acc_{d} = aethelCall(", .{id});
+                try self.emitExpr(pipe.fold_arg.?);
+                try self.w.print(", .{{ __acc_{d}, __col_{d}[__idx_{d}] }});\n", .{ id, id, id });
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+        }
+
+        if (is_fold) {
+            try self.writeIndent();
+            try self.w.print("break :blk_{d} __acc_{d};\n", .{ id, id });
+        } else if (returns_val) {
+            try self.writeIndent();
+            try self.w.print("break :blk_{d} __col_{d};\n", .{ id, id });
+        }
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.w.writeByte('}');
+    }
+
+    fn emitSimdStageExpr(
+        self: *Emitter,
+        loop_id: usize,
+        stage_idx: usize,
+        tw: usize,
+        elem_param: []const u8,
+        locals: []const SimdLocalVar,
+        expr: *const ast.Expr,
+        target_ty: *const sema.Ty,
+    ) Io.Writer.Error!void {
+        switch (expr.*) {
+            .field => |fld| {
+                if (fld.target.* == .ident and std.mem.eql(u8, self.sourceOf(fld.target.ident), elem_param)) {
+                    try self.w.print("__vec_{d}_", .{loop_id});
+                    try self.emitIdent(self.sourceOf(fld.name));
+                    return;
+                }
+            },
+            .ident => |sp| {
+                const name = self.sourceOf(sp);
+                for (locals) |lv| {
+                    if (std.mem.eql(u8, lv.name, name)) {
+                        try self.w.print("__vloc_{d}_{d}_", .{ loop_id, stage_idx });
+                        try self.emitIdent(name);
+                        return;
+                    }
+                }
+            },
+            .unary => |u| {
+                if (u.op == .neg) {
+                    try self.w.writeAll("(-(");
+                    try self.emitSimdStageExpr(loop_id, stage_idx, tw, elem_param, locals, u.operand, target_ty);
+                    try self.w.writeAll("))");
+                    return;
+                }
+            },
+            .binary => |b| {
+                if (b.op == .div and target_ty.isInteger() != null) {
+                    try self.w.writeAll("@divTrunc(");
+                    try self.emitSimdStageExpr(loop_id, stage_idx, tw, elem_param, locals, b.left, target_ty);
+                    try self.w.writeAll(", ");
+                    try self.emitSimdStageExpr(loop_id, stage_idx, tw, elem_param, locals, b.right, target_ty);
+                    try self.w.writeByte(')');
+                    return;
+                }
+                if (b.op == .add or b.op == .sub or b.op == .mul or b.op == .div) {
+                    try self.w.writeByte('(');
+                    try self.emitSimdStageExpr(loop_id, stage_idx, tw, elem_param, locals, b.left, target_ty);
+                    try self.w.print(" {s} ", .{b.op.symbol()});
+                    try self.emitSimdStageExpr(loop_id, stage_idx, tw, elem_param, locals, b.right, target_ty);
+                    try self.w.writeByte(')');
+                    return;
+                }
+            },
+            else => {},
+        }
+        try self.w.print("@as(@Vector({d}, ", .{tw});
+        try self.emitTy(target_ty);
+        try self.w.writeAll("), @splat(");
+        try self.emitCoercedExpr(expr, target_ty);
+        try self.w.writeAll("))");
+    }
+
+    fn emitOptionResultCombinator(
+        self: *Emitter,
+        call_expr: ?*const ast.Expr,
+        cname: []const u8,
+        recv_expr: *const ast.Expr,
+        recv_ty: *const sema.Ty,
+        arg_val: *const ast.Expr,
+    ) Io.Writer.Error!void {
+        const res_ty: ?*const sema.Ty = if (call_expr) |ce| self.checked.exprType(ce) else null;
+        const lbl = self.nextLabel();
+        if (recv_ty.* == .option) {
+            const inner_ty = recv_ty.option;
+            if (std.mem.eql(u8, cname, "unwrap_or")) {
+                try self.w.writeByte('(');
+                try self.emitExpr(recv_expr);
+                try self.w.writeAll(" orelse ");
+                try self.emitCoercedExpr(arg_val, inner_ty);
+                try self.w.writeByte(')');
+                return;
+            }
+            if (std.mem.eql(u8, cname, "map")) {
+                const out_inner: ?*const sema.Ty = if (res_ty != null and res_ty.?.* == .option) res_ty.?.option else null;
+                try self.w.print("blk_{d}: {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.writeAll("if (");
+                try self.emitExpr(recv_expr);
+                try self.w.print(") |__val_{d}| {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("break :blk_{d} @as(?", .{lbl});
+                if (out_inner != null and out_inner.?.* != .err) {
+                    try self.emitTy(out_inner.?);
+                } else {
+                    try self.w.print("@TypeOf(aethelCall(", .{});
+                    try self.emitExpr(arg_val);
+                    try self.w.print(", .{{ __val_{d} }}))", .{lbl});
+                }
+                try self.w.writeAll(", aethelCall(");
+                try self.emitExpr(arg_val);
+                try self.w.print(", .{{ __val_{d} }}));\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("} else {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("break :blk_{d} null;\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+                return;
+            }
+            if (std.mem.eql(u8, cname, "and_then")) {
+                try self.w.print("blk_{d}: {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.writeAll("if (");
+                try self.emitExpr(recv_expr);
+                try self.w.print(") |__val_{d}| {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("break :blk_{d} aethelCall(", .{lbl});
+                try self.emitExpr(arg_val);
+                try self.w.print(", .{{ __val_{d} }});\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("} else {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("break :blk_{d} null;\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+                return;
+            }
+            if (std.mem.eql(u8, cname, "ok_or")) {
+                const err_ty: ?*const sema.Ty = if (res_ty != null and res_ty.?.* == .result) res_ty.?.result.err else self.checked.exprType(arg_val);
+                try self.w.print("blk_{d}: {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.writeAll("if (");
+                try self.emitExpr(recv_expr);
+                try self.w.print(") |__val_{d}| {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("break :blk_{d} ", .{lbl});
+                if (res_ty != null and res_ty.?.* == .result) try self.emitTy(res_ty.?);
+                try self.w.print("{{ .Ok = __val_{d} }};\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("} else {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print("break :blk_{d} ", .{lbl});
+                if (res_ty != null and res_ty.?.* == .result) try self.emitTy(res_ty.?);
+                try self.w.writeAll("{ .Err = ");
+                if (err_ty != null and err_ty.?.* != .err) {
+                    try self.emitCoercedExpr(arg_val, err_ty.?);
+                } else {
+                    try self.emitExpr(arg_val);
+                }
+                try self.w.writeAll(" };\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+                return;
+            }
+        }
+        if (recv_ty.* == .result) {
+            const ok_ty = recv_ty.result.ok;
+            if (std.mem.eql(u8, cname, "unwrap_or")) {
+                try self.w.print("blk_{d}: {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.writeAll("switch (");
+                try self.emitExpr(recv_expr);
+                try self.w.writeAll(") {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print(".Ok => |__val_{d}| break :blk_{d} __val_{d},\n", .{ lbl, lbl, lbl });
+                try self.writeIndent();
+                try self.w.print(".Err => break :blk_{d} ", .{lbl});
+                try self.emitCoercedExpr(arg_val, ok_ty);
+                try self.w.writeAll(",\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+                return;
+            }
+            if (std.mem.eql(u8, cname, "map")) {
+                try self.w.print("blk_{d}: {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.writeAll("switch (");
+                try self.emitExpr(recv_expr);
+                try self.w.writeAll(") {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print(".Ok => |__val_{d}| break :blk_{d} ", .{ lbl, lbl });
+                if (res_ty != null and res_ty.?.* == .result) try self.emitTy(res_ty.?);
+                try self.w.writeAll("{ .Ok = aethelCall(");
+                try self.emitExpr(arg_val);
+                try self.w.print(", .{{ __val_{d} }}) }},\n", .{lbl});
+                try self.writeIndent();
+                try self.w.print(".Err => |__err_{d}| break :blk_{d} ", .{ lbl, lbl });
+                if (res_ty != null and res_ty.?.* == .result) try self.emitTy(res_ty.?);
+                try self.w.print("{{ .Err = __err_{d} }},\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+                return;
+            }
+            if (std.mem.eql(u8, cname, "and_then")) {
+                try self.w.print("blk_{d}: {{\n", .{lbl});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.writeAll("switch (");
+                try self.emitExpr(recv_expr);
+                try self.w.writeAll(") {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.w.print(".Ok => |__val_{d}| break :blk_{d} aethelCall(", .{ lbl, lbl });
+                try self.emitExpr(arg_val);
+                try self.w.print(", .{{ __val_{d} }}),\n", .{lbl});
+                try self.writeIndent();
+                try self.w.print(".Err => |__err_{d}| break :blk_{d} ", .{ lbl, lbl });
+                if (res_ty != null and res_ty.?.* == .result) try self.emitTy(res_ty.?);
+                try self.w.print("{{ .Err = __err_{d} }},\n", .{lbl});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeByte('}');
+                return;
+            }
+        }
+    }
+
+    fn emitFusedMapUnwrapOr(
+        self: *Emitter,
+        full_expr: *const ast.Expr,
+        base_expr: *const ast.Expr,
+        base_ty: *const sema.Ty,
+        map_fn: *const ast.Expr,
+        default_expr: *const ast.Expr,
+    ) Io.Writer.Error!void {
+        const lbl = self.nextLabel();
+        const out_ty = self.checked.exprType(full_expr);
+        try self.w.print("blk_{d}: {{\n", .{lbl});
+        self.indent += 1;
+        try self.writeIndent();
+        if (base_ty.* == .option) {
+            try self.w.writeAll("// Categorical fusion: Option.map |> unwrap_or\n");
+            try self.writeIndent();
+            try self.w.writeAll("if (");
+            try self.emitExpr(base_expr);
+            try self.w.print(") |__val_{d}| {{\n", .{lbl});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.w.print("break :blk_{d} aethelCall(", .{lbl});
+            try self.emitExpr(map_fn);
+            try self.w.print(", .{{ __val_{d} }});\n", .{lbl});
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("} else {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.w.print("break :blk_{d} ", .{lbl});
+            if (out_ty != null and out_ty.?.* != .err) {
+                try self.emitCoercedExpr(default_expr, out_ty.?);
+            } else {
+                try self.emitExpr(default_expr);
+            }
+            try self.w.writeAll(";\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+        } else {
+            try self.w.writeAll("// Categorical fusion: Result.map |> unwrap_or\n");
+            try self.writeIndent();
+            try self.w.writeAll("switch (");
+            try self.emitExpr(base_expr);
+            try self.w.writeAll(") {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.w.print(".Ok => |__val_{d}| break :blk_{d} aethelCall(", .{ lbl, lbl });
+            try self.emitExpr(map_fn);
+            try self.w.print(", .{{ __val_{d} }}),\n", .{lbl});
+            try self.writeIndent();
+            try self.w.print(".Err => break :blk_{d} ", .{lbl});
+            if (out_ty != null and out_ty.?.* != .err) {
+                try self.emitCoercedExpr(default_expr, out_ty.?);
+            } else {
+                try self.emitExpr(default_expr);
+            }
+            try self.w.writeAll(",\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+        }
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.w.writeByte('}');
     }
 };
 

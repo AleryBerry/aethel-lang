@@ -127,3 +127,139 @@ test "5. codegen: extern rust C-ABI, inclusive/exclusive for loops, and string c
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "if (__i_1 <= __end_1)") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "aethelConcat(\"hi \", name)") != null);
 }
+
+test "6. codegen: half-open slices, runtime index casts, and returned Views" {
+    const zig_src = try compileToZig(
+        \\type Spaceship { x: i32, y: i32 }
+        \\fn borrow_ship(s: Spaceship ~>.{x}) -> View(Spaceship, Exclusive) {
+        \\  s
+        \\}
+        \\fn slice_and_view(mut arr: [mut u32], mid: u32, mut ship: Spaceship) -> u32 {
+        \\  view exclusive left = arr[0..mid] {
+        \\    left[0] = 42u32
+        \\  }
+        \\  let v = borrow_ship(ship)
+        \\  v.x = 10
+        \\  arr[0]
+        \\}
+    );
+    defer std.testing.allocator.free(zig_src);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "fn borrow_ship(s: *Spaceship) *Spaceship") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "arr[0..@as(usize, @intCast(mid))]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "const v: *Spaceship = borrow_ship(&ship);") != null);
+}
+
+test "7. codegen: FFD packed bins, CompactADT, @layout(auto) SIMD AoSoA, and @parallel std.Thread" {
+    const zig_src = try compileToZig(
+        \\type PackedTelemetry {
+        \\  ok: bool,
+        \\  mode: Int(0..=7),
+        \\  armed: bool,
+        \\  code: u8,
+        \\}
+        \\type CompactStatus {
+        \\  Idle,
+        \\  Moving(u4),
+        \\  Poisoned(u4),
+        \\  Dead,
+        \\}
+        \\@layout(auto)
+        \\type Particle {
+        \\  cold_id: u32,
+        \\  x: f32,
+        \\  vx: f32,
+        \\}
+        \\fn read_status(s: CompactStatus) -> u8 {
+        \\  case s {
+        \\    Idle -> 0
+        \\    Moving(spd) -> spd as u8
+        \\    Poisoned(dmg) -> dmg as u8
+        \\    Dead -> 99
+        \\  }
+        \\}
+        \\fn run_stage_b(dt: f32) -> u8 {
+        \\  let mut tel = PackedTelemetry { ok: true, mode: 3, armed: false, code: 7 }
+        \\  tel.armed = true
+        \\  tel.mode = 5
+        \\  let mut swarm: Collection(Particle) = [
+        \\    Particle { cold_id: 1u32, x: 0.0f32, vx: 1.0f32 },
+        \\    Particle { cold_id: 2u32, x: 0.0f32, vx: 2.0f32 },
+        \\  ]
+        \\  swarm |> map_in_place(fn(p) {
+        \\    p.x += p.vx * dt
+        \\  })
+        \\  let mut sum_a: u8 = 0
+        \\  let mut sum_b: u8 = 0
+        \\  @parallel fork {
+        \\    { sum_b = tel.code +% (tel.mode as u8) }
+        \\    { sum_a = read_status(Moving(4)) +% tel.code }
+        \\  } join
+        \\  sum_a +% sum_b
+        \\}
+    );
+    defer std.testing.allocator.free(zig_src);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "__bin_1: packed struct(u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "if (@sizeOf(PackedTelemetry) > 2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, ".__bin_1.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "const CompactStatus = packed struct(u8)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "pub const Tag = enum(u2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "if (@sizeOf(CompactStatus) != 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, ".tag) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "align(64)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "@Vector(8, f32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "@splat(dt)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "std.Thread.spawn(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, ".join();") != null);
+}
+
+test "8. codegen: LNL once closures, generics, fused SIMD+fold pipelines, combinator fusion, and ?" {
+    const zig_src = try compileToZig(
+        \\@layout(auto)
+        \\type Signal {
+        \\  tag: u32,
+        \\  x: f32,
+        \\  vx: f32,
+        \\}
+        \\fn identity(x: a) -> a { x }
+        \\fn apply_twice(x: a, f: fn(a) -> a) -> a {
+        \\  f(f(x))
+        \\}
+        \\fn try_opt_step(o: Option(i32)) -> Option(i32) {
+        \\  let v = o?
+        \\  Some(v +% 5i32)
+        \\}
+        \\fn try_res_step(r: Result(i32, u32)) -> Result(i32, u32) {
+        \\  let v = r?
+        \\  Ok(v +% 3i32)
+        \\}
+        \\fn run_stage_c(fleet: View(Collection(Signal), Exclusive), buf: Collection(i32), dt: f32) -> i32 {
+        \\  let f_once = once fn() -> i32 { buf[0] }
+        \\  let one = f_once()
+        \\  let offset: i32 = 10i32
+        \\  let boosted = apply_twice(identity(1i32), fn(n: i32) -> i32 { n +% offset })
+        \\  let total = fleet
+        \\    |> map_in_place(fn(s) { s.x += s.vx * dt })
+        \\    |> map_in_place(fn(s) { s.x += 1.0f32 })
+        \\    |> fold(0.0f32, fn(acc, s) { acc + s.x })
+        \\  let _ = total
+        \\  let from_opt = try_opt_step(Some(4i32)) |> map(fn(x) { x +% 1i32 }) |> unwrap_or(0i32)
+        \\  let from_res = try_res_step(Some(5i32) |> ok_or(1u32)) |> map(fn(x) { x +% 2i32 }) |> unwrap_or(0i32)
+        \\  one +% boosted +% from_opt +% from_res
+        \\}
+    );
+    defer std.testing.allocator.free(zig_src);
+
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "fn AethelResult(comptime T: type, comptime E: type) type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "fn aethelCall(f: anytype, args: anytype)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "fn identity(comptime __T_a: type, x: __T_a) __T_a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "fn apply_twice(comptime __T_a: type, x: __T_a, f: anytype) __T_a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "aethelCall(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "orelse return null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "return .{ .Err = __err_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "// Categorical fusion: 2 map_in_place stage(s) + fold deforestation fused into 1 pass") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "@Vector(8, f32)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "// Categorical fusion: Option.map |> unwrap_or") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "// Categorical fusion: Result.map |> unwrap_or") != null);
+}

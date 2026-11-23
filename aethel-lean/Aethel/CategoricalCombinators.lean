@@ -259,4 +259,30 @@ theorem tryMapFieldInPlace_fusion {ε : Type} {owner : OwnerId}
       rw [hUpd2 i hi, hUpd12 i hi]
     · rw [hFrame2 loc hIn, hFrame1 loc hIn, hFrame12 loc hIn]
 
+def resUnwrapOr {ε α : Type} (r : Except ε α) (d : α) : α :=
+  match r with
+  | .ok a => a
+  | .error _ => d
+
+theorem optMap_id {α : Type} (o : Option α) : Option.map id o = o := by
+  cases o <;> rfl
+
+theorem optMap_comp {α β γ : Type} (f : α → β) (g : β → γ) (o : Option α) :
+    Option.map g (Option.map f o) = Option.map (g ∘ f) o := by
+  cases o <;> rfl
+
+theorem optMap_unwrapOr {α β : Type} (f : α → β) (o : Option α) (d : β) :
+    (Option.map f o).getD d = match o with | some a => f a | none => d := by
+  cases o <;> rfl
+
+theorem resMap_unwrapOr {ε α β : Type} (f : α → β) (r : Except ε α) (d : β) :
+    resUnwrapOr (resMap f r) d = match r with | .ok a => f a | .error _ => d := by
+  cases r <;> rfl
+
+theorem optToResult_andThen_natural {ε α β : Type} (err : ε)
+    (o : Option α) (k : α → Option β) :
+    resAndThen (optionToResult err o) (fun x => optionToResult err (k x)) =
+      optionToResult err (optAndThen o k) := by
+  cases o <;> rfl
+
 end Aethel.CategoricalCombinators

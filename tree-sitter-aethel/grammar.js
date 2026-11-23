@@ -41,6 +41,7 @@ module.exports = grammar({
 
   conflicts: ($) => [
     [$.remote_type_identifier, $.type_var],
+    [$.field_access, $.qualified_constructor],
   ],
 
   rules: {
@@ -84,7 +85,7 @@ module.exports = grammar({
         optional($.visibility_modifier),
         "import",
         field("module", $.module),
-        optional(seq(".", $.unqualified_imports)),
+        optional($.unqualified_imports),
         optional(seq("as", field("alias", choice($.identifier, $.type_identifier)))),
       ),
 
@@ -93,7 +94,7 @@ module.exports = grammar({
 
     unqualified_imports: ($) =>
       seq(
-        "{",
+        ".{",
         sepBy(",", $.unqualified_import),
         optional(","),
         "}",
@@ -455,7 +456,8 @@ module.exports = grammar({
           "name",
           choice(
             $.constructor_name,
-            seq(field("module", $.type_identifier), ".", $.constructor_name),
+            seq(field("module", choice($.identifier, $.type_identifier)), ".", $.constructor_name),
+            seq(field("module", $.identifier), ".", $.type_identifier, ".", $.constructor_name),
           ),
         ),
         optional(
@@ -623,12 +625,18 @@ module.exports = grammar({
     try_expression: ($) =>
       prec(PREC.POSTFIX, seq(field("value", $._expression), "?")),
 
-    // Record literal: `Player { pos: 100, delta: -15 }`
+    qualified_constructor: ($) =>
+      prec.left(
+        PREC.POSTFIX,
+        seq(field("module", $._expression), ".", field("name", $.constructor_name)),
+      ),
+
+    // Record literal: `Player { pos: 100, delta: -15 }` or `v2.Vec2 { x: 1, y: 2 }`
     record: ($) =>
       prec(
         PREC.POSTFIX,
         seq(
-          field("name", $.constructor_name),
+          field("name", choice($.constructor_name, $.qualified_constructor)),
           "{",
           sepBy(",", $.record_field_init),
           optional(","),

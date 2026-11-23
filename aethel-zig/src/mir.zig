@@ -50,6 +50,7 @@ pub fn emitMir(checked: *const sema.CheckedModule, writer: *Io.Writer) Io.Writer
     }
 
     for (checked.functions) |fun| {
+        if (fun.has_extern_abi) continue;
         try writer.print("fn {s}\n", .{fun.name});
         for (fun.writes) |w| {
             try writer.print("  effect_write {d}\n", .{w.field_idx});

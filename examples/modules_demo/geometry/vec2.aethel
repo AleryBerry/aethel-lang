@@ -1,0 +1,15 @@
+// Nested submodule demonstrating relative/root imports and public record export (Stage E)
+import math.{clamp}
+
+pub type Vec2 {
+  x: i32,
+  y: i32,
+}
+
+pub fn dot(a: Vec2, b: Vec2) -> i32 {
+  a.x *% b.x +% a.y *% b.y
+}
+
+pub fn clamped_sum(v: Vec2, lo: i32, hi: i32) -> i32 {
+  clamp(v.x +% v.y, lo, hi)
+}

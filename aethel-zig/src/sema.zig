@@ -8,6 +8,13 @@ const law_verifier = @import("law_verifier.zig");
 pub const IntType = int_range.IntType;
 pub const IntRange = int_range.IntRange;
 
+pub const ModuleSliceInfo = struct {
+    module_id: usize,
+    module_key: []const u8,
+    start: usize,
+    end: usize,
+};
+
 pub const SemaDiagnostic = struct {
     span: ast.Span,
     kind: Kind,
@@ -32,6 +39,8 @@ pub const SemaDiagnostic = struct {
         invalid_layout,
         affine_capture,
         termination_error,
+        non_exhaustive_match,
+        visibility_error,
     };
 };
 
@@ -351,6 +360,11 @@ pub const CheckedModule = struct {
     let_types: std.AutoHashMapUnmanaged(usize, *const Ty),
     const_types: std.StringHashMapUnmanaged(*const Ty),
     call_type_args: std.AutoHashMapUnmanaged(*const ast.Expr, []const *const Ty),
+    decl_canonical_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty,
+    resolved_fn_calls: std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = .empty,
+    resolved_idents: std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = .empty,
+    resolved_records: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty,
+    alias_types: std.StringHashMapUnmanaged(*const Ty) = .empty,
 
     pub fn deinit(self: *CheckedModule) void {
         self.arena.deinit();
@@ -375,6 +389,26 @@ pub const CheckedModule = struct {
     pub fn callTypeArgs(self: *const CheckedModule, expr: *const ast.Expr) ?[]const *const Ty {
         return self.call_type_args.get(expr);
     }
+
+    pub fn declCanonicalName(self: *const CheckedModule, decl_start: usize) ?[]const u8 {
+        return self.decl_canonical_names.get(decl_start);
+    }
+
+    pub fn resolvedCallName(self: *const CheckedModule, callee: *const ast.Expr) ?[]const u8 {
+        return self.resolved_fn_calls.get(callee);
+    }
+
+    pub fn resolvedIdentName(self: *const CheckedModule, expr: *const ast.Expr) ?[]const u8 {
+        return self.resolved_idents.get(expr);
+    }
+
+    pub fn resolvedRecordIdx(self: *const CheckedModule, expr: *const ast.Expr) ?usize {
+        return self.resolved_records.get(expr);
+    }
+
+    pub fn aliasType(self: *const CheckedModule, canonical_name: []const u8) ?*const Ty {
+        return self.alias_types.get(canonical_name);
+    }
 };
 
 const ParamFieldEffect = struct {
@@ -391,6 +425,9 @@ const CallLink = struct {
 
 const FnSig = struct {
     name: []const u8,
+    local_name: []const u8,
+    module_id: usize = 0,
+    is_pub: bool = true,
     span: ast.Span,
     type_params: []const []const u8 = &.{},
     params: []const *const Ty,
@@ -407,8 +444,39 @@ const FnSig = struct {
 
 const ConstEntry = struct {
     name: []const u8,
+    local_name: []const u8,
+    module_id: usize = 0,
+    is_pub: bool = true,
     ty: *const Ty,
     range: ?IntRange,
+};
+
+const OpaqueDef = struct {
+    name: []const u8,
+    local_name: []const u8,
+    module_id: usize = 0,
+    is_pub: bool = true,
+};
+
+const TypeAliasEntry = struct {
+    name: []const u8,
+    local_name: []const u8,
+    module_id: usize = 0,
+    is_pub: bool = true,
+    ty: *const Ty,
+};
+
+const ModuleAliasImport = struct {
+    importer_mod: usize,
+    alias: []const u8,
+    target_mod: usize,
+};
+
+const MemberImport = struct {
+    importer_mod: usize,
+    member_name: []const u8,
+    target_mod: usize,
+    span: ast.Span,
 };
 
 const Binding = struct {
@@ -466,10 +534,21 @@ const Analyzer = struct {
 
     record_defs: std.ArrayList(RecordDef),
     adt_defs: std.ArrayList(ADTDef),
-    opaque_names: std.ArrayList([]const u8),
+    opaque_defs: std.ArrayList(OpaqueDef),
+    type_alias_entries: std.ArrayList(TypeAliasEntry),
     type_aliases: std.StringHashMapUnmanaged(*const Ty),
     fn_sigs: std.ArrayList(FnSig),
     const_map: std.StringHashMapUnmanaged(ConstEntry),
+    const_list: std.ArrayList(ConstEntry) = .empty,
+    module_slices: []const ModuleSliceInfo = &.{},
+    entry_module_id: usize = 0,
+    current_module_id: usize = 0,
+    alias_imports: std.ArrayList(ModuleAliasImport) = .empty,
+    member_imports: std.ArrayList(MemberImport) = .empty,
+    decl_canonical_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty,
+    resolved_fn_calls: std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = .empty,
+    resolved_idents: std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = .empty,
+    resolved_records: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty,
 
     scopes: std.ArrayList(Binding),
     scope_marks: std.ArrayList(usize),
@@ -504,6 +583,9 @@ const Analyzer = struct {
 
     const RecordDef = struct {
         name: []const u8,
+        local_name: []const u8,
+        module_id: usize = 0,
+        is_pub: bool = true,
         span: ast.Span,
         fields: []CheckedField,
         conflicts: std.ArrayList(layout.ConflictPair),
@@ -517,6 +599,9 @@ const Analyzer = struct {
 
     const ADTDef = struct {
         name: []const u8,
+        local_name: []const u8,
+        module_id: usize = 0,
+        is_pub: bool = true,
         span: ast.Span,
         variants: []VariantInfo,
         max_payload_bits: u16,
@@ -542,9 +627,130 @@ const Analyzer = struct {
         return ptr;
     }
 
+    fn moduleIdOfSpan(self: *const Analyzer, span: ast.Span) usize {
+        if (self.module_slices.len == 0) return 0;
+        for (self.module_slices) |sl| {
+            if (span.start >= sl.start and span.start < sl.end) return sl.module_id;
+        }
+        return self.entry_module_id;
+    }
+
+    fn canonicalName(self: *Analyzer, mod_id: usize, local_name: []const u8, no_mangle: bool) std.mem.Allocator.Error![]const u8 {
+        if (no_mangle or self.module_slices.len <= 1 or mod_id == self.entry_module_id) {
+            return local_name;
+        }
+        var mkey: []const u8 = "";
+        for (self.module_slices) |sl| {
+            if (sl.module_id == mod_id) {
+                mkey = sl.module_key;
+                break;
+            }
+        }
+        if (mkey.len == 0) return local_name;
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(self.alloc, "mod__");
+        for (mkey) |ch| {
+            if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9')) {
+                try buf.append(self.alloc, ch);
+            } else {
+                try buf.append(self.alloc, '_');
+            }
+        }
+        try buf.appendSlice(self.alloc, "__");
+        try buf.appendSlice(self.alloc, local_name);
+        return try buf.toOwnedSlice(self.alloc);
+    }
+
+    fn resolveImportedModule(self: *const Analyzer, from_mod: usize, qualifier: []const u8) ?usize {
+        for (self.alias_imports.items) |ai| {
+            if (ai.importer_mod == from_mod and std.mem.eql(u8, ai.alias, qualifier)) {
+                return ai.target_mod;
+            }
+        }
+        return null;
+    }
+
+    fn memberImportTarget(self: *const Analyzer, from_mod: usize, member: []const u8) ?usize {
+        for (self.member_imports.items) |mi| {
+            if (mi.importer_mod == from_mod and std.mem.eql(u8, mi.member_name, member)) {
+                return mi.target_mod;
+            }
+        }
+        return null;
+    }
+
+    fn registerImports(self: *Analyzer) std.mem.Allocator.Error!void {
+        if (self.module_slices.len == 0) return;
+        for (self.module.decls) |decl| {
+            if (decl.kind != .import_decl) continue;
+            const imp = decl.kind.import_decl;
+            if (imp.path.len == 0) continue;
+            const from_mod = self.moduleIdOfSpan(decl.span);
+
+            var key_buf: std.ArrayList(u8) = .empty;
+            for (imp.path, 0..) |seg, i| {
+                if (i > 0) try key_buf.append(self.alloc, '/');
+                try key_buf.appendSlice(self.alloc, seg.slice(self.source));
+            }
+            const imp_key = try key_buf.toOwnedSlice(self.alloc);
+
+            var target_mod_opt: ?usize = null;
+            for (self.module_slices) |sl| {
+                if (std.mem.eql(u8, sl.module_key, imp_key)) {
+                    target_mod_opt = sl.module_id;
+                    break;
+                }
+            }
+            if (target_mod_opt == null) {
+                // Relative lookup inside subdirectory if importing sibling file.
+                var from_key: []const u8 = "";
+                for (self.module_slices) |sl| {
+                    if (sl.module_id == from_mod) {
+                        from_key = sl.module_key;
+                        break;
+                    }
+                }
+                if (std.fs.path.dirname(from_key)) |fdir| {
+                    const rel_key = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ fdir, imp_key });
+                    for (self.module_slices) |sl| {
+                        if (std.mem.eql(u8, sl.module_key, rel_key)) {
+                            target_mod_opt = sl.module_id;
+                            break;
+                        }
+                    }
+                }
+            }
+            const target_mod = target_mod_opt orelse continue;
+            const alias_name = if (imp.alias) |a|
+                a.slice(self.source)
+            else
+                imp.path[imp.path.len - 1].slice(self.source);
+            try self.alias_imports.append(self.alloc, .{
+                .importer_mod = from_mod,
+                .alias = alias_name,
+                .target_mod = target_mod,
+            });
+            for (imp.members) |m| {
+                try self.member_imports.append(self.alloc, .{
+                    .importer_mod = from_mod,
+                    .member_name = m.slice(self.source),
+                    .target_mod = target_mod,
+                    .span = m,
+                });
+            }
+        }
+    }
+
     fn findRecordIndex(self: *const Analyzer, name: []const u8) ?usize {
         for (self.record_defs.items, 0..) |r, idx| {
             if (std.mem.eql(u8, r.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findRecordInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?usize {
+        for (self.record_defs.items, 0..) |r, idx| {
+            if (r.module_id == mod_id and std.mem.eql(u8, r.local_name, local_name)) return idx;
         }
         return null;
     }
@@ -556,9 +762,30 @@ const Analyzer = struct {
         return null;
     }
 
+    fn findADTInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?usize {
+        for (self.adt_defs.items, 0..) |a, idx| {
+            if (a.module_id == mod_id and std.mem.eql(u8, a.local_name, local_name)) return idx;
+        }
+        return null;
+    }
+
     fn findOpaqueIndex(self: *const Analyzer, name: []const u8) ?usize {
-        for (self.opaque_names.items, 0..) |n, idx| {
-            if (std.mem.eql(u8, n, name)) return idx;
+        for (self.opaque_defs.items, 0..) |n, idx| {
+            if (std.mem.eql(u8, n.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findOpaqueInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?usize {
+        for (self.opaque_defs.items, 0..) |o, idx| {
+            if (o.module_id == mod_id and std.mem.eql(u8, o.local_name, local_name)) return idx;
+        }
+        return null;
+    }
+
+    fn findTypeAliasInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?*const TypeAliasEntry {
+        for (self.type_alias_entries.items) |*ta| {
+            if (ta.module_id == mod_id and std.mem.eql(u8, ta.local_name, local_name)) return ta;
         }
         return null;
     }
@@ -566,6 +793,56 @@ const Analyzer = struct {
     fn findFnIndex(self: *const Analyzer, name: []const u8) ?usize {
         for (self.fn_sigs.items, 0..) |f, idx| {
             if (std.mem.eql(u8, f.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findFnInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?usize {
+        for (self.fn_sigs.items, 0..) |f, idx| {
+            if (f.module_id == mod_id and std.mem.eql(u8, f.local_name, local_name)) return idx;
+        }
+        return null;
+    }
+
+    fn findConstInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?*const ConstEntry {
+        for (self.const_list.items) |*c| {
+            if (c.module_id == mod_id and std.mem.eql(u8, c.local_name, local_name)) return c;
+        }
+        return null;
+    }
+
+    fn resolveVisibleFnIndex(self: *Analyzer, local_name: []const u8, err_span: ?ast.Span) ?usize {
+        if (self.findFnInModule(self.current_module_id, local_name)) |fidx| return fidx;
+        if (self.memberImportTarget(self.current_module_id, local_name)) |target_mod| {
+            if (self.findFnInModule(target_mod, local_name)) |fidx| {
+                if (!self.fn_sigs.items[fidx].is_pub and target_mod != self.current_module_id) {
+                    if (err_span) |sp| self.addError(.visibility_error, sp, "cannot access private function from imported module");
+                }
+                return fidx;
+            }
+        }
+        if (self.module_slices.len == 0) return self.findFnIndex(local_name);
+        return null;
+    }
+
+    fn resolveQualifiedFnIndex(self: *Analyzer, qualifier: []const u8, fn_name: []const u8, err_span: ?ast.Span) ?usize {
+        const target_mod = self.resolveImportedModule(self.current_module_id, qualifier) orelse return null;
+        const fidx = self.findFnInModule(target_mod, fn_name) orelse return null;
+        if (!self.fn_sigs.items[fidx].is_pub and target_mod != self.current_module_id) {
+            if (err_span) |sp| self.addError(.visibility_error, sp, "function is private in imported module");
+        }
+        return fidx;
+    }
+
+    fn resolveCalleeFnIndex(self: *Analyzer, callee: *const ast.Expr, report_visibility: bool) ?usize {
+        if (callee.* == .ident) {
+            return self.resolveVisibleFnIndex(callee.ident.slice(self.source), if (report_visibility) callee.ident else null);
+        }
+        if (callee.* == .field and callee.field.target.* == .ident) {
+            const qual = callee.field.target.ident.slice(self.source);
+            if (self.lookupVar(qual) == null) {
+                return self.resolveQualifiedFnIndex(qual, callee.field.name.slice(self.source), if (report_visibility) callee.field.name else null);
+            }
         }
         return null;
     }
@@ -611,24 +888,39 @@ const Analyzer = struct {
 
     fn registerTypeNames(self: *Analyzer) std.mem.Allocator.Error!void {
         for (self.module.decls) |decl| {
+            const mod_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
                 .type_decl => |td| {
-                    const name = td.name.slice(self.source);
-                    if (self.findRecordIndex(name) != null or
-                        self.findADTIndex(name) != null or
-                        self.findOpaqueIndex(name) != null or
-                        self.type_aliases.contains(name))
+                    const local_name = td.name.slice(self.source);
+                    if (self.findRecordInModule(mod_id, local_name) != null or
+                        self.findADTInModule(mod_id, local_name) != null or
+                        self.findOpaqueInModule(mod_id, local_name) != null or
+                        self.findTypeAliasInModule(mod_id, local_name) != null)
                     {
                         self.addError(.duplicate_decl, td.name, "duplicate type declaration");
                         continue;
                     }
+                    const cname = try self.canonicalName(mod_id, local_name, false);
+                    try self.decl_canonical_names.put(self.alloc, decl.span.start, cname);
                     switch (td.body) {
                         .empty => {
-                            try self.opaque_names.append(self.alloc, name);
+                            try self.opaque_defs.append(self.alloc, .{
+                                .name = cname,
+                                .local_name = local_name,
+                                .module_id = mod_id,
+                                .is_pub = decl.is_pub,
+                            });
                         },
                         .alias => {
                             const err_ty = try self.allocTy(.err);
-                            try self.type_aliases.put(self.alloc, name, err_ty);
+                            try self.type_aliases.put(self.alloc, cname, err_ty);
+                            try self.type_alias_entries.append(self.alloc, .{
+                                .name = cname,
+                                .local_name = local_name,
+                                .module_id = mod_id,
+                                .is_pub = decl.is_pub,
+                                .ty = err_ty,
+                            });
                         },
                         .record => |fields| {
                             var col_lay: ?layout.CollectionLayout = null;
@@ -646,7 +938,10 @@ const Analyzer = struct {
                             const hslice = try self.alloc.alloc(bool, fields.len);
                             @memset(hslice, false);
                             try self.record_defs.append(self.alloc, .{
-                                .name = name,
+                                .name = cname,
+                                .local_name = local_name,
+                                .module_id = mod_id,
+                                .is_pub = decl.is_pub,
                                 .span = decl.span,
                                 .fields = fslice,
                                 .conflicts = .empty,
@@ -659,7 +954,10 @@ const Analyzer = struct {
                         .variants => |variants| {
                             const vslice = try self.alloc.alloc(VariantInfo, variants.len);
                             try self.adt_defs.append(self.alloc, .{
-                                .name = name,
+                                .name = cname,
+                                .local_name = local_name,
+                                .module_id = mod_id,
+                                .is_pub = decl.is_pub,
                                 .span = decl.span,
                                 .variants = vslice,
                                 .max_payload_bits = 0,
@@ -885,18 +1183,34 @@ const Analyzer = struct {
     }
 
     fn resolveAllTypeSignatures(self: *Analyzer) std.mem.Allocator.Error!void {
-        // Resolve aliases, record fields, and ADT variants.
+        // Resolve type aliases first so records/functions can reference aliases in any order.
         for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
+            if (decl.kind == .type_decl and decl.kind.type_decl.body == .alias) {
+                const td = decl.kind.type_decl;
+                const local_name = td.name.slice(self.source);
+                const resolved = try self.resolveType(td.body.alias);
+                const cname = self.decl_canonical_names.get(decl.span.start) orelse local_name;
+                try self.type_aliases.put(self.alloc, cname, resolved);
+                for (self.type_alias_entries.items) |*ta| {
+                    if (ta.module_id == self.current_module_id and std.mem.eql(u8, ta.local_name, local_name)) {
+                        ta.ty = resolved;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Resolve record fields and ADT variants.
+        for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
                 .type_decl => |td| {
                     const name = td.name.slice(self.source);
                     switch (td.body) {
-                        .alias => |ty_ast| {
-                            const resolved = try self.resolveType(ty_ast);
-                            try self.type_aliases.put(self.alloc, name, resolved);
-                        },
+                        .alias => {},
                         .record => |fields| {
-                            if (self.findRecordIndex(name)) |ridx| {
+                            if (self.findRecordInModule(self.current_module_id, name)) |ridx| {
                                 for (fields, 0..) |rf, fi| {
                                     const fty = try self.resolveType(rf.ty);
                                     const info = self.typeBitInfo(fty);
@@ -911,7 +1225,7 @@ const Analyzer = struct {
                             }
                         },
                         .variants => |variants| {
-                            if (self.findADTIndex(name)) |aidx| {
+                            if (self.findADTInModule(self.current_module_id, name)) |aidx| {
                                 var max_pay: u16 = 0;
                                 for (variants, 0..) |v, vi| {
                                     const fts = try self.alloc.alloc(*const Ty, v.fields.len);
@@ -942,13 +1256,16 @@ const Analyzer = struct {
 
         // Resolve function & extern signatures.
         for (self.module.decls, 0..) |decl, decl_idx| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
                 .fn_decl => |fd| {
-                    const name = fd.name.slice(self.source);
-                    if (self.findFnIndex(name) != null) {
+                    const local_name = fd.name.slice(self.source);
+                    if (self.findFnInModule(self.current_module_id, local_name) != null) {
                         self.addError(.duplicate_decl, fd.name, "duplicate function declaration");
                         continue;
                     }
+                    const cname = try self.canonicalName(self.current_module_id, local_name, false);
+                    try self.decl_canonical_names.put(self.alloc, decl.span.start, cname);
                     const ptypes = try self.alloc.alloc(*const Ty, fd.params.len);
                     const pauths = try self.alloc.alloc(?[]const usize, fd.params.len);
                     var target_rec: ?usize = null;
@@ -963,7 +1280,10 @@ const Analyzer = struct {
                     for (ptypes) |pt| try self.collectTypeVars(pt, &tparams);
                     try self.collectTypeVars(rty, &tparams);
                     try self.fn_sigs.append(self.alloc, .{
-                        .name = name,
+                        .name = cname,
+                        .local_name = local_name,
+                        .module_id = self.current_module_id,
+                        .is_pub = decl.is_pub,
                         .span = fd.name,
                         .type_params = try tparams.toOwnedSlice(self.alloc),
                         .params = ptypes,
@@ -993,6 +1313,9 @@ const Analyzer = struct {
                         self.validateRustFFIType(ef.span, rty);
                         try self.fn_sigs.append(self.alloc, .{
                             .name = name,
+                            .local_name = name,
+                            .module_id = self.current_module_id,
+                            .is_pub = decl.is_pub or ef.is_pub,
                             .span = ef.name,
                             .params = ptypes,
                             .param_auths = pauths,
@@ -1010,6 +1333,7 @@ const Analyzer = struct {
 
     fn validateRustFFIType(self: *Analyzer, span: ast.Span, ty: *const Ty) void {
         switch (ty.*) {
+            .bool, .f32, .f64, .unit, .opaque_ty, .err => {},
             .slice => |sl| {
                 const ok = switch (sl.elem.*) {
                     .int => |it| it.bits == 8 or it.bits == 16 or it.bits == 32 or it.bits == 64,
@@ -1028,7 +1352,17 @@ const Analyzer = struct {
             .int_range => {
                 self.addError(.invalid_ffi_type, span, "Rust FFI boundary requires explicit fixed-width scalar instead of symbolic Int range");
             },
-            else => {},
+            .view => |v| {
+                if (v.target.* == .opaque_ty) return;
+                if (v.target.* == .slice) {
+                    self.validateRustFFIType(span, v.target);
+                    return;
+                }
+                self.addError(.invalid_ffi_type, span, "Rust FFI view must wrap an opaque RustOwn handle or C-ABI slice");
+            },
+            else => {
+                self.addError(.invalid_ffi_type, span, "unsupported composite type across Rust C-ABI FFI boundary; use scalars, slices, or opaque handles");
+            },
         }
     }
 
@@ -1187,27 +1521,99 @@ const Analyzer = struct {
                     } });
                 }
 
-                if (self.findRecordIndex(head_name)) |ridx| {
+                if (n.path.len >= 2) {
+                    const mod_alias = n.path[0].slice(self.source);
+                    const tname = n.path[n.path.len - 1].slice(self.source);
+                    if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                        if (self.findRecordInModule(target_mod, tname)) |ridx| {
+                            if (!self.record_defs.items[ridx].is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, n.span, "cannot use private record type from imported module");
+                            }
+                            return try self.allocTy(.{ .record = ridx });
+                        }
+                        if (self.findADTInModule(target_mod, tname)) |aidx| {
+                            if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, n.span, "cannot use private type from imported module");
+                            }
+                            return try self.allocTy(.{ .adt = aidx });
+                        }
+                        if (self.findOpaqueInModule(target_mod, tname)) |oidx| {
+                            if (!self.opaque_defs.items[oidx].is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, n.span, "cannot use private opaque type from imported module");
+                            }
+                            return try self.allocTy(.{ .opaque_ty = oidx });
+                        }
+                        if (self.findTypeAliasInModule(target_mod, tname)) |ta| {
+                            if (!ta.is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, n.span, "cannot use private type alias from imported module");
+                            }
+                            return ta.ty;
+                        }
+                        self.addError(.unknown_type, n.span, "unknown type name in imported module");
+                        return try self.allocTy(.err);
+                    }
+                    return try self.allocTy(.{ .type_var = head_name });
+                }
+
+                if (self.findRecordInModule(self.current_module_id, head_name)) |ridx| {
                     return try self.allocTy(.{ .record = ridx });
                 }
-                if (self.findADTIndex(head_name)) |aidx| {
+                if (self.findADTInModule(self.current_module_id, head_name)) |aidx| {
                     return try self.allocTy(.{ .adt = aidx });
                 }
-                if (self.findOpaqueIndex(head_name)) |oidx| {
+                if (self.findOpaqueInModule(self.current_module_id, head_name)) |oidx| {
                     return try self.allocTy(.{ .opaque_ty = oidx });
                 }
-                if (self.type_aliases.get(head_name)) |aliased| {
-                    return aliased;
+                if (self.findTypeAliasInModule(self.current_module_id, head_name)) |ta| {
+                    return ta.ty;
                 }
-                // External or unresolved generic module path like `m.Vec2`: treat gracefully only if qualified, else report unknown type.
-                if (n.path.len == 1) {
-                    self.addError(.unknown_type, n.span, "unknown type name");
-                    return try self.allocTy(.err);
+                if (self.memberImportTarget(self.current_module_id, head_name)) |target_mod| {
+                    if (self.findRecordInModule(target_mod, head_name)) |ridx| {
+                        if (!self.record_defs.items[ridx].is_pub and target_mod != self.current_module_id) {
+                            self.addError(.visibility_error, n.span, "cannot import private record type");
+                        }
+                        return try self.allocTy(.{ .record = ridx });
+                    }
+                    if (self.findADTInModule(target_mod, head_name)) |aidx| {
+                        if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
+                            self.addError(.visibility_error, n.span, "cannot import private type");
+                        }
+                        return try self.allocTy(.{ .adt = aidx });
+                    }
+                    if (self.findOpaqueInModule(target_mod, head_name)) |oidx| {
+                        if (!self.opaque_defs.items[oidx].is_pub and target_mod != self.current_module_id) {
+                            self.addError(.visibility_error, n.span, "cannot import private opaque type");
+                        }
+                        return try self.allocTy(.{ .opaque_ty = oidx });
+                    }
+                    if (self.findTypeAliasInModule(target_mod, head_name)) |ta| {
+                        if (!ta.is_pub and target_mod != self.current_module_id) {
+                            self.addError(.visibility_error, n.span, "cannot import private type alias");
+                        }
+                        return ta.ty;
+                    }
                 }
-                return try self.allocTy(.{ .type_var = head_name });
+                if (self.module_slices.len == 0) {
+                    if (self.findRecordIndex(head_name)) |ridx| {
+                        return try self.allocTy(.{ .record = ridx });
+                    }
+                    if (self.findADTIndex(head_name)) |aidx| {
+                        return try self.allocTy(.{ .adt = aidx });
+                    }
+                    if (self.findOpaqueIndex(head_name)) |oidx| {
+                        return try self.allocTy(.{ .opaque_ty = oidx });
+                    }
+                    if (self.type_aliases.get(head_name)) |aliased| {
+                        return aliased;
+                    }
+                }
+                // Unknown unqualified type name.
+                self.addError(.unknown_type, n.span, "unknown type name");
+                return try self.allocTy(.err);
             },
             .type_var => |tv| {
                 const name = tv.name.slice(self.source);
+                if (self.findTypeAliasInModule(self.current_module_id, name)) |ta| return ta.ty;
                 if (self.type_aliases.get(name)) |aliased| return aliased;
                 return try self.allocTy(.{ .type_var = name });
             },
@@ -1288,12 +1694,15 @@ const Analyzer = struct {
 
     fn checkConstsAndFunctions(self: *Analyzer) std.mem.Allocator.Error!void {
         for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
                 .const_decl => |cd| {
                     try self.pushScope();
                     defer self.popScope();
 
-                    const cname = cd.name.slice(self.source);
+                    const local_name = cd.name.slice(self.source);
+                    const cname = try self.canonicalName(self.current_module_id, local_name, false);
+                    try self.decl_canonical_names.put(self.alloc, decl.span.start, cname);
                     const expected: ?*const Ty = if (cd.ty) |t| try self.resolveType(t) else null;
                     const res = try self.checkExpr(cd.value, expected);
                     const final_ty = expected orelse try self.finalizeInferredType(cd.value.getSpan(), res);
@@ -1301,17 +1710,47 @@ const Analyzer = struct {
                         try self.checkAssignmentValue(decl.span, exp, res);
                     }
                     try self.const_types.put(self.alloc, cname, final_ty);
-                    try self.const_map.put(self.alloc, cname, .{
+                    const ce = ConstEntry{
                         .name = cname,
+                        .local_name = local_name,
+                        .module_id = self.current_module_id,
+                        .is_pub = decl.is_pub,
                         .ty = final_ty,
                         .range = res.range,
-                    });
+                    };
+                    try self.const_map.put(self.alloc, cname, ce);
+                    try self.const_list.append(self.alloc, ce);
+                },
+                .extern_decl => |ex| {
+                    for (ex.fns) |ef| {
+                        const ename = ef.name.slice(self.source);
+                        if (self.findFnIndex(ename)) |fidx| {
+                            const fsig = self.fn_sigs.items[fidx];
+                            try self.checked_functions.append(self.alloc, .{
+                                .name = fsig.name,
+                                .span = ef.span,
+                                .type_params = fsig.type_params,
+                                .param_types = fsig.params,
+                                .ret_type = fsig.ret,
+                                .reads = &.{},
+                                .writes = &.{},
+                                .preserves = &.{},
+                                .target_record = null,
+                                .has_extern_abi = true,
+                                .perm_trace = &.{},
+                                .disjoint_certs = &.{},
+                                .decreases_certs = &.{},
+                                .returned_origin = null,
+                            });
+                        }
+                    }
                 },
                 else => {},
             }
         }
 
         for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
                 .fn_decl => {
                     try self.checkFunction(decl.span, decl.kind);
@@ -1323,8 +1762,9 @@ const Analyzer = struct {
 
     fn checkFunction(self: *Analyzer, span: ast.Span, fd: ast.Decl.Kind) std.mem.Allocator.Error!void {
         const f = fd.fn_decl;
-        const fname = f.name.slice(self.source);
-        const fsig_idx = self.findFnIndex(fname) orelse return;
+        const local_name = f.name.slice(self.source);
+        const fsig_idx = self.findFnInModule(self.current_module_id, local_name) orelse self.findFnIndex(local_name) orelse return;
+        const fname = self.fn_sigs.items[fsig_idx].name;
         var fsig = &self.fn_sigs.items[fsig_idx];
 
         try self.pushScope();
@@ -1773,6 +2213,21 @@ const Analyzer = struct {
                 }
             },
             .constructor => |ctor| {
+                const vname = if (ctor.path.len > 0) ctor.path[ctor.path.len - 1].slice(self.source) else "";
+                if (ty.* == .option) {
+                    if (std.mem.eql(u8, vname, "Some") and ctor.args.len >= 1) {
+                        try self.bindPattern(ctor.args[0].pattern, ty.option, ty.option.rangeOf(), default_mut);
+                    }
+                    return;
+                }
+                if (ty.* == .result) {
+                    if (std.mem.eql(u8, vname, "Ok") and ctor.args.len >= 1) {
+                        try self.bindPattern(ctor.args[0].pattern, ty.result.ok, ty.result.ok.rangeOf(), default_mut);
+                    } else if (std.mem.eql(u8, vname, "Err") and ctor.args.len >= 1) {
+                        try self.bindPattern(ctor.args[0].pattern, ty.result.err, ty.result.err.rangeOf(), default_mut);
+                    }
+                    return;
+                }
                 const opt_var = self.lookupConstructorVariant(ctor.path, ty);
                 for (ctor.args, 0..) |arg, ai| {
                     const arg_ty: *const Ty = if (opt_var) |vi| blk: {
@@ -2253,6 +2708,9 @@ const Analyzer = struct {
                     if (target.view.mode == .exclusive and vv.mode == .shared) {
                         self.addError(.borrow_conflict, span, "cannot coerce shared View to Exclusive View");
                     }
+                    if (target.view.target.* == .slice and vv.target.* == .slice) {
+                        break :blk target.view.target.slice.elem.eql(vv.target.slice.elem.*);
+                    }
                     break :blk target.view.target.eql(vv.target.*);
                 },
                 .path_borrow => |pb| blk: {
@@ -2261,9 +2719,23 @@ const Analyzer = struct {
                     }
                     break :blk target.view.target.eql(pb.base.*);
                 },
+                .slice => |sl| blk: {
+                    if (target.view.target.* != .slice) break :blk false;
+                    if (target.view.mode == .exclusive and !sl.mutable) {
+                        self.addError(.mutability_error, span, "cannot coerce immutable slice to Exclusive View");
+                    }
+                    break :blk target.view.target.slice.elem.eql(sl.elem.*);
+                },
                 else => target.view.target.eql(val.ty.*),
             };
             if (inner_ok) return;
+        }
+        if (target.* == .slice and val.ty.* == .slice) {
+            if (target.slice.mutable and !val.ty.slice.mutable) {
+                self.addError(.mutability_error, span, "cannot pass immutable slice where mutable '[mut T]' is expected");
+                return;
+            }
+            if (target.slice.elem.eql(val.ty.slice.elem.*)) return;
         }
         if (target.* == .option and val.ty.* == .option) {
             if (val.ty.option.* == .err or target.option.* == .err or target.option.eql(val.ty.option.*)) return;
@@ -2367,12 +2839,40 @@ const Analyzer = struct {
                     // Implicit affine consumption if value is non-copyable (and not explicitly borrowed via call/field).
                     return .{ .ty = vb.ty, .range = vb.range };
                 }
-                if (self.const_map.get(name)) |ce| {
+                if (self.findConstInModule(self.current_module_id, name)) |ce| {
+                    try self.resolved_idents.put(self.alloc, expr, ce.name);
                     return .{ .ty = ce.ty, .range = ce.range };
                 }
-                if (self.findFnIndex(name)) |fidx| {
+                if (self.findFnInModule(self.current_module_id, name)) |fidx| {
                     const fs = self.fn_sigs.items[fidx];
+                    try self.resolved_idents.put(self.alloc, expr, fs.name);
                     return .{ .ty = try self.allocTy(.{ .fn_ty = .{ .params = fs.params, .ret = fs.ret } }), .range = null };
+                }
+                if (self.memberImportTarget(self.current_module_id, name)) |target_mod| {
+                    if (self.findConstInModule(target_mod, name)) |ce| {
+                        if (!ce.is_pub and target_mod != self.current_module_id) {
+                            self.addError(.visibility_error, sp, "cannot access private constant from imported module");
+                        }
+                        try self.resolved_idents.put(self.alloc, expr, ce.name);
+                        return .{ .ty = ce.ty, .range = ce.range };
+                    }
+                    if (self.findFnInModule(target_mod, name)) |fidx| {
+                        const fs = self.fn_sigs.items[fidx];
+                        if (!fs.is_pub and target_mod != self.current_module_id) {
+                            self.addError(.visibility_error, sp, "cannot access private function from imported module");
+                        }
+                        try self.resolved_idents.put(self.alloc, expr, fs.name);
+                        return .{ .ty = try self.allocTy(.{ .fn_ty = .{ .params = fs.params, .ret = fs.ret } }), .range = null };
+                    }
+                }
+                if (self.module_slices.len == 0) {
+                    if (self.const_map.get(name)) |ce| {
+                        return .{ .ty = ce.ty, .range = ce.range };
+                    }
+                    if (self.findFnIndex(name)) |fidx| {
+                        const fs = self.fn_sigs.items[fidx];
+                        return .{ .ty = try self.allocTy(.{ .fn_ty = .{ .params = fs.params, .ret = fs.ret } }), .range = null };
+                    }
                 }
                 // Check ADT zero-arg constructors if referenced unqualified.
                 if (self.lookupADTVariantType(name)) |aty| {
@@ -2389,8 +2889,18 @@ const Analyzer = struct {
                 if (self.lookupADTVariantType(name)) |aty| {
                     return .{ .ty = aty, .range = null };
                 }
-                if (self.findADTIndex(name)) |aidx| {
+                if (self.findADTInModule(self.current_module_id, name)) |aidx| {
                     return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                }
+                if (self.memberImportTarget(self.current_module_id, name)) |target_mod| {
+                    if (self.findADTInModule(target_mod, name)) |aidx| {
+                        return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                    }
+                }
+                if (self.module_slices.len == 0) {
+                    if (self.findADTIndex(name)) |aidx| {
+                        return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                    }
                 }
                 return .{ .ty = expected orelse try self.allocTy(.{ .type_var = name }), .range = null };
             },
@@ -2477,6 +2987,68 @@ const Analyzer = struct {
                 return try self.checkCall(expr, call_expr.span, call_expr.callee, call_expr.args, null, null, expected);
             },
             .field => |fld| {
+                const fname = fld.name.slice(self.source);
+                // Module-qualified member access: `math.SCALE`, `math.clamp`, `v2.Status.Idle`, `v2.Idle`.
+                if (fld.target.* == .ident and self.lookupVar(fld.target.ident.slice(self.source)) == null) {
+                    const mod_alias = fld.target.ident.slice(self.source);
+                    if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                        if (self.findConstInModule(target_mod, fname)) |ce| {
+                            if (!ce.is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, fld.name, "constant is private in imported module");
+                            }
+                            try self.resolved_idents.put(self.alloc, expr, ce.name);
+                            return .{ .ty = ce.ty, .range = ce.range };
+                        }
+                        if (self.findFnInModule(target_mod, fname)) |fidx| {
+                            const fs = self.fn_sigs.items[fidx];
+                            if (!fs.is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, fld.name, "function is private in imported module");
+                            }
+                            try self.resolved_idents.put(self.alloc, expr, fs.name);
+                            return .{ .ty = try self.allocTy(.{ .fn_ty = .{ .params = fs.params, .ret = fs.ret } }), .range = null };
+                        }
+                        if (self.findADTInModule(target_mod, fname)) |aidx| {
+                            if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, fld.name, "type is private in imported module");
+                            }
+                            return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                        }
+                        for (self.adt_defs.items, 0..) |adt_def, aidx| {
+                            if (adt_def.module_id != target_mod) continue;
+                            for (adt_def.variants) |v| {
+                                if (std.mem.eql(u8, v.name, fname)) {
+                                    if (!adt_def.is_pub and target_mod != self.current_module_id) {
+                                        self.addError(.visibility_error, fld.name, "type variant is private in imported module");
+                                    }
+                                    return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                                }
+                            }
+                        }
+                        self.addError(.unknown_ident, fld.name, "unknown symbol in imported module");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
+                }
+                if (fld.target.* == .field and fld.target.field.target.* == .ident and
+                    self.lookupVar(fld.target.field.target.ident.slice(self.source)) == null)
+                {
+                    const mod_alias = fld.target.field.target.ident.slice(self.source);
+                    const adt_name = fld.target.field.name.slice(self.source);
+                    if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                        if (self.findADTInModule(target_mod, adt_name)) |aidx| {
+                            if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, fld.target.field.name, "ADT type is private in imported module");
+                            }
+                            return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                        }
+                    }
+                }
+                if (fld.target.* == .upper_ident) {
+                    const adt_name = fld.target.upper_ident.slice(self.source);
+                    if (self.resolveVisibleADTIndex(adt_name, fld.target.upper_ident)) |aidx| {
+                        return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                    }
+                }
+
                 var base: ExprResult = undefined;
                 var idx_key: ?AccessIndex = null;
                 var resolved: ResolvedRoot = .{};
@@ -2496,7 +3068,6 @@ const Analyzer = struct {
                     resolved = self.resolveAccessRoot(fld.target);
                     idx_key = resolved.view_index_key;
                 }
-                const fname = fld.name.slice(self.source);
                 if (std.mem.eql(u8, fname, "len")) {
                     const is_len_container = switch (base.ty.*) {
                         .slice, .collection, .string => true,
@@ -2604,8 +3175,27 @@ const Analyzer = struct {
                 };
             },
             .record_lit => |rl| {
-                const name = if (rl.path.len > 0) rl.path[rl.path.len - 1].slice(self.source) else "";
-                if (self.findRecordIndex(name)) |ridx| {
+                const resolved_ridx: ?usize = blk: {
+                    if (rl.path.len >= 2) {
+                        const mod_alias = rl.path[0].slice(self.source);
+                        const tname = rl.path[rl.path.len - 1].slice(self.source);
+                        if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                            if (self.findRecordInModule(target_mod, tname)) |ri| {
+                                if (!self.record_defs.items[ri].is_pub and target_mod != self.current_module_id) {
+                                    self.addError(.visibility_error, rl.span, "cannot construct private record from imported module");
+                                }
+                                break :blk ri;
+                            }
+                        }
+                    }
+                    if (rl.path.len > 0) {
+                        const name = rl.path[rl.path.len - 1].slice(self.source);
+                        break :blk self.resolveVisibleRecordIndex(name, rl.path[0]);
+                    }
+                    break :blk null;
+                };
+                if (resolved_ridx) |ridx| {
+                    try self.resolved_records.put(self.alloc, expr, ridx);
                     const rdef = self.record_defs.items[ridx];
                     for (rl.fields) |rf_init| {
                         const fnm = rf_init.name.slice(self.source);
@@ -2621,6 +3211,7 @@ const Analyzer = struct {
                     }
                     return .{ .ty = try self.allocTy(.{ .record = ridx }), .range = null };
                 }
+                self.addError(.unknown_type, rl.span, "unknown record type in literal");
                 for (rl.fields) |rf_init| {
                     if (rf_init.value) |v| _ = try self.checkExpr(v, null);
                 }
@@ -2779,8 +3370,11 @@ const Analyzer = struct {
                     }
                     if (ai == 0) {
                         out = br;
-                    } else if (out.range != null and br.range != null) {
-                        out.range = out.range.?.join(br.range.?);
+                    } else {
+                        out.ty = try self.mergeCaseArmTy(out.ty, br.ty);
+                        if (out.range != null and br.range != null) {
+                            out.range = out.range.?.join(br.range.?);
+                        }
                     }
                 }
                 for (0..joined_perms.len) |vi| self.active_views.items[vi].perm = joined_perms[vi];
@@ -2792,6 +3386,7 @@ const Analyzer = struct {
                         }
                     }
                 }
+                try self.checkCaseExhaustiveness(ce.span, sub_types, ce.arms);
                 return out;
             },
             .lambda => |lam| {
@@ -3078,12 +3673,345 @@ const Analyzer = struct {
         }
     }
 
+    fn resolveVisibleRecordIndex(self: *Analyzer, local_name: []const u8, err_span: ast.Span) ?usize {
+        if (self.findRecordInModule(self.current_module_id, local_name)) |ri| return ri;
+        if (self.memberImportTarget(self.current_module_id, local_name)) |target_mod| {
+            if (self.findRecordInModule(target_mod, local_name)) |ri| {
+                if (!self.record_defs.items[ri].is_pub and target_mod != self.current_module_id) {
+                    self.addError(.visibility_error, err_span, "cannot access private record from imported module");
+                }
+                return ri;
+            }
+        }
+        if (self.module_slices.len == 0) return self.findRecordIndex(local_name);
+        return null;
+    }
+
+    fn resolveVisibleADTIndex(self: *Analyzer, local_name: []const u8, err_span: ast.Span) ?usize {
+        if (self.findADTInModule(self.current_module_id, local_name)) |ai| return ai;
+        if (self.memberImportTarget(self.current_module_id, local_name)) |target_mod| {
+            if (self.findADTInModule(target_mod, local_name)) |ai| {
+                if (!self.adt_defs.items[ai].is_pub and target_mod != self.current_module_id) {
+                    self.addError(.visibility_error, err_span, "cannot access private ADT from imported module");
+                }
+                return ai;
+            }
+        }
+        if (self.module_slices.len == 0) return self.findADTIndex(local_name);
+        return null;
+    }
+
+    fn mergeCaseArmTy(self: *Analyzer, acc: *const Ty, nxt: *const Ty) std.mem.Allocator.Error!*const Ty {
+        if (acc.* == .err) return nxt;
+        if (acc.* == .option and nxt.* == .option) {
+            if (acc.option.* == .err and nxt.option.* != .err) return nxt;
+        }
+        if (acc.* == .result and nxt.* == .result) {
+            const ok_ty = if (acc.result.ok.* == .err) nxt.result.ok else acc.result.ok;
+            const err_ty = if (acc.result.err.* == .err) nxt.result.err else acc.result.err;
+            return try self.allocTy(.{ .result = .{ .ok = ok_ty, .err = err_ty } });
+        }
+        return acc;
+    }
+
+    const CaseIntInterval = struct {
+        lo: i128,
+        hi: i128,
+    };
+
+    fn patIsCatchAll(pat: *const ast.Pattern) bool {
+        return switch (pat.*) {
+            .wildcard, .ident => true,
+            .alias => |al| patIsCatchAll(al.inner),
+            .or_pat => |op| blk: {
+                for (op.alternatives) |alt| {
+                    if (patIsCatchAll(alt)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => |tp| blk: {
+                for (tp.elems) |el| {
+                    if (!patIsCatchAll(el)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    fn flattenPat(self: *Analyzer, pat: *const ast.Pattern, out: *std.ArrayList(*const ast.Pattern)) std.mem.Allocator.Error!void {
+        switch (pat.*) {
+            .alias => |al| try self.flattenPat(al.inner, out),
+            .or_pat => |op| {
+                for (op.alternatives) |alt| {
+                    try self.flattenPat(alt, out);
+                }
+            },
+            else => try out.append(self.alloc, pat),
+        }
+    }
+
+    fn evalPatInt(source: [:0]const u8, pat: *const ast.Pattern) ?i128 {
+        if (pat.* != .literal) return null;
+        const lit = pat.literal;
+        if (lit.tok.tag != .int_literal) return null;
+        const parsed = int_range.parseIntLiteral(lit.tok.loc.slice(source)) orelse return null;
+        if (!lit.negative) {
+            if (parsed.value > @as(u128, @intCast(std.math.maxInt(i128)))) return null;
+            return @intCast(parsed.value);
+        }
+        if (parsed.value == @as(u128, 1) << 127) return std.math.minInt(i128);
+        if (parsed.value > @as(u128, @intCast(std.math.maxInt(i128)))) return null;
+        return -@as(i128, @intCast(parsed.value));
+    }
+
+    fn checkCaseExhaustiveness(
+        self: *Analyzer,
+        span: ast.Span,
+        sub_types: []const *const Ty,
+        arms: []const ast.CaseArm,
+    ) std.mem.Allocator.Error!void {
+        if (sub_types.len == 0) return;
+
+        if (sub_types.len > 1) {
+            var has_catch_all = false;
+            for (arms) |arm| {
+                if (arm.guard != null) continue;
+                for (arm.alternatives) |row| {
+                    var row_all = row.len == sub_types.len;
+                    if (row_all) {
+                        for (row) |p| {
+                            if (!patIsCatchAll(p)) {
+                                row_all = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (row_all) {
+                        has_catch_all = true;
+                        break;
+                    }
+                }
+                if (has_catch_all) break;
+            }
+            if (!has_catch_all) {
+                self.addError(.non_exhaustive_match, span, "non-exhaustive multi-subject case expression: add a wildcard '_' arm");
+            }
+            return;
+        }
+
+        const st = sub_types[0];
+        if (st.* == .err) return;
+
+        var flat_pats: std.ArrayList(*const ast.Pattern) = .empty;
+        for (arms) |arm| {
+            if (arm.guard != null) continue;
+            for (arm.alternatives) |row| {
+                if (row.len == 0) continue;
+                if (patIsCatchAll(row[0])) return;
+                try self.flattenPat(row[0], &flat_pats);
+            }
+        }
+        for (flat_pats.items) |fp| {
+            if (patIsCatchAll(fp)) return;
+        }
+
+        switch (st.*) {
+            .bool => {
+                var seen_true = false;
+                var seen_false = false;
+                for (flat_pats.items) |fp| {
+                    if (fp.* == .literal) {
+                        if (fp.literal.tok.tag == .kw_true) seen_true = true;
+                        if (fp.literal.tok.tag == .kw_false) seen_false = true;
+                    }
+                }
+                if (!seen_true or !seen_false) {
+                    const missing: []const u8 = if (!seen_true and !seen_false)
+                        "true, false"
+                    else if (!seen_true)
+                        "true"
+                    else
+                        "false";
+                    const msg = try std.fmt.allocPrint(self.alloc, "non-exhaustive case on bool: missing pattern(s): {s}", .{missing});
+                    self.addError(.non_exhaustive_match, span, msg);
+                }
+            },
+            .option => {
+                var seen_some = false;
+                var seen_none = false;
+                for (flat_pats.items) |fp| {
+                    if (fp.* == .constructor) {
+                        const c = fp.constructor;
+                        const vn = if (c.path.len > 0) c.path[c.path.len - 1].slice(self.source) else "";
+                        if (std.mem.eql(u8, vn, "None")) {
+                            seen_none = true;
+                        } else if (std.mem.eql(u8, vn, "Some")) {
+                            if (c.args.len == 0 or patIsCatchAll(c.args[0].pattern)) {
+                                seen_some = true;
+                            }
+                        }
+                    }
+                }
+                if (!seen_some or !seen_none) {
+                    const missing: []const u8 = if (!seen_some and !seen_none)
+                        "Some(_), None"
+                    else if (!seen_some)
+                        "Some(_)"
+                    else
+                        "None";
+                    const msg = try std.fmt.allocPrint(self.alloc, "non-exhaustive case on Option: missing pattern(s): {s}", .{missing});
+                    self.addError(.non_exhaustive_match, span, msg);
+                }
+            },
+            .result => {
+                var seen_ok = false;
+                var seen_err = false;
+                for (flat_pats.items) |fp| {
+                    if (fp.* == .constructor) {
+                        const c = fp.constructor;
+                        const vn = if (c.path.len > 0) c.path[c.path.len - 1].slice(self.source) else "";
+                        if (std.mem.eql(u8, vn, "Ok")) {
+                            if (c.args.len == 0 or patIsCatchAll(c.args[0].pattern)) seen_ok = true;
+                        } else if (std.mem.eql(u8, vn, "Err")) {
+                            if (c.args.len == 0 or patIsCatchAll(c.args[0].pattern)) seen_err = true;
+                        }
+                    }
+                }
+                if (!seen_ok or !seen_err) {
+                    const missing: []const u8 = if (!seen_ok and !seen_err)
+                        "Ok(_), Err(_)"
+                    else if (!seen_ok)
+                        "Ok(_)"
+                    else
+                        "Err(_)";
+                    const msg = try std.fmt.allocPrint(self.alloc, "non-exhaustive case on Result: missing pattern(s): {s}", .{missing});
+                    self.addError(.non_exhaustive_match, span, msg);
+                }
+            },
+            .adt => |aidx| {
+                const adt_def = self.adt_defs.items[aidx];
+                const covered = try self.alloc.alloc(bool, adt_def.variants.len);
+                @memset(covered, false);
+                for (flat_pats.items) |fp| {
+                    if (fp.* == .constructor) {
+                        const c = fp.constructor;
+                        const vn = if (c.path.len > 0) c.path[c.path.len - 1].slice(self.source) else "";
+                        var args_ok = true;
+                        for (c.args) |pa| {
+                            if (!patIsCatchAll(pa.pattern)) {
+                                args_ok = false;
+                                break;
+                            }
+                        }
+                        if (args_ok) {
+                            for (adt_def.variants, 0..) |v, vi| {
+                                if (std.mem.eql(u8, v.name, vn)) covered[vi] = true;
+                            }
+                        }
+                    }
+                }
+                var missing_buf: std.ArrayList(u8) = .empty;
+                for (adt_def.variants, 0..) |v, vi| {
+                    if (!covered[vi]) {
+                        if (missing_buf.items.len > 0) try missing_buf.appendSlice(self.alloc, ", ");
+                        try missing_buf.appendSlice(self.alloc, v.name);
+                    }
+                }
+                if (missing_buf.items.len > 0) {
+                    const msg = try std.fmt.allocPrint(self.alloc, "non-exhaustive case on {s}: missing variant(s): {s}", .{ adt_def.local_name, missing_buf.items });
+                    self.addError(.non_exhaustive_match, span, msg);
+                }
+            },
+            .int, .int_range => {
+                const dom_opt = st.rangeOf();
+                if (dom_opt != null and dom_opt.? == .bounded) {
+                    const dom = dom_opt.?.bounded;
+                    var intervals: std.ArrayList(CaseIntInterval) = .empty;
+                    for (flat_pats.items) |fp| {
+                        switch (fp.*) {
+                            .literal => {
+                                if (evalPatInt(self.source, fp)) |v| {
+                                    try intervals.append(self.alloc, .{ .lo = v, .hi = v });
+                                }
+                            },
+                            .range => |rg| {
+                                const lo_v = evalPatInt(self.source, rg.lo) orelse continue;
+                                const raw_hi = evalPatInt(self.source, rg.hi) orelse continue;
+                                const hi_v = if (rg.inclusive)
+                                    raw_hi
+                                else if (raw_hi > std.math.minInt(i128))
+                                    raw_hi - 1
+                                else
+                                    continue;
+                                if (lo_v <= hi_v) {
+                                    try intervals.append(self.alloc, .{ .lo = lo_v, .hi = hi_v });
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    std.mem.sort(CaseIntInterval, intervals.items, {}, struct {
+                        fn lessThan(_: void, a: CaseIntInterval, b: CaseIntInterval) bool {
+                            if (a.lo != b.lo) return a.lo < b.lo;
+                            return a.hi < b.hi;
+                        }
+                    }.lessThan);
+                    var cur: i128 = dom.lo;
+                    var all_covered = false;
+                    for (intervals.items) |iv| {
+                        if (iv.hi < cur) continue;
+                        if (iv.lo > cur) break;
+                        if (iv.hi >= dom.hi) {
+                            all_covered = true;
+                            break;
+                        }
+                        cur = iv.hi + 1;
+                    }
+                    if (!all_covered) {
+                        const msg = try std.fmt.allocPrint(self.alloc, "non-exhaustive case on integer range {d}..={d}: missing value {d}", .{ dom.lo, dom.hi, cur });
+                        self.addError(.non_exhaustive_match, span, msg);
+                    }
+                } else {
+                    self.addError(.non_exhaustive_match, span, "non-exhaustive case on integer type: add a wildcard '_' arm");
+                }
+            },
+            else => {
+                self.addError(.non_exhaustive_match, span, "non-exhaustive case expression: add a wildcard '_' arm");
+            },
+        }
+    }
+
     fn lookupConstructorVariant(self: *const Analyzer, path: []const ast.Span, expected_ty: *const Ty) ?VariantInfo {
         if (path.len == 0) return null;
         const vname = path[path.len - 1].slice(self.source);
-        if (path.len >= 2) {
+        if (path.len >= 3) {
+            const mod_alias = path[0].slice(self.source);
             const adt_name = path[path.len - 2].slice(self.source);
-            if (self.findADTIndex(adt_name)) |aidx| {
+            if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                if (self.findADTInModule(target_mod, adt_name)) |aidx| {
+                    for (self.adt_defs.items[aidx].variants) |v| {
+                        if (std.mem.eql(u8, v.name, vname)) return v;
+                    }
+                }
+            }
+        }
+        if (path.len >= 2) {
+            const qname = path[path.len - 2].slice(self.source);
+            if (self.resolveImportedModule(self.current_module_id, qname)) |target_mod| {
+                for (self.adt_defs.items) |adt_def| {
+                    if (adt_def.module_id != target_mod) continue;
+                    for (adt_def.variants) |v| {
+                        if (std.mem.eql(u8, v.name, vname)) return v;
+                    }
+                }
+            }
+            if (self.findADTInModule(self.current_module_id, qname)) |aidx| {
+                for (self.adt_defs.items[aidx].variants) |v| {
+                    if (std.mem.eql(u8, v.name, vname)) return v;
+                }
+            }
+            if (self.findADTIndex(qname)) |aidx| {
                 for (self.adt_defs.items[aidx].variants) |v| {
                     if (std.mem.eql(u8, v.name, vname)) return v;
                 }
@@ -3095,6 +4023,9 @@ const Analyzer = struct {
             }
         }
         for (self.adt_defs.items) |adt_def| {
+            if (self.module_slices.len > 0 and adt_def.module_id != self.current_module_id) {
+                if (!adt_def.is_pub) continue;
+            }
             for (adt_def.variants) |v| {
                 if (std.mem.eql(u8, v.name, vname)) return v;
             }
@@ -3121,9 +4052,29 @@ const Analyzer = struct {
 
     fn lookupADTVariantType(self: *Analyzer, variant_name: []const u8) ?*const Ty {
         for (self.adt_defs.items, 0..) |adt_def, aidx| {
+            if (adt_def.module_id != self.current_module_id) continue;
             for (adt_def.variants) |v| {
                 if (std.mem.eql(u8, v.name, variant_name)) {
                     return self.allocTy(.{ .adt = aidx }) catch null;
+                }
+            }
+        }
+        if (self.memberImportTarget(self.current_module_id, variant_name)) |target_mod| {
+            for (self.adt_defs.items, 0..) |adt_def, aidx| {
+                if (adt_def.module_id != target_mod) continue;
+                for (adt_def.variants) |v| {
+                    if (std.mem.eql(u8, v.name, variant_name)) {
+                        return self.allocTy(.{ .adt = aidx }) catch null;
+                    }
+                }
+            }
+        }
+        if (self.module_slices.len == 0) {
+            for (self.adt_defs.items, 0..) |adt_def, aidx| {
+                for (adt_def.variants) |v| {
+                    if (std.mem.eql(u8, v.name, variant_name)) {
+                        return self.allocTy(.{ .adt = aidx }) catch null;
+                    }
                 }
             }
         }
@@ -3607,123 +4558,128 @@ const Analyzer = struct {
                 } else r0 orelse r1;
                 return .{ .ty = res_ty, .range = rng };
             }
-            if (self.findFnIndex(cname)) |fidx| {
-                const fsig = self.fn_sigs.items[fidx];
-                const recv_offset: usize = if (piped_recv != null) 1 else 0;
-                var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
-                if (piped_recv) |pr| {
-                    if (fsig.params.len > 0) {
-                        if (fsig.type_params.len > 0) {
-                            if (!try self.unifyType(fsig.params[0], pr.ty, &subst)) {
-                                self.addError(.type_mismatch, span, "generic receiver type mismatch");
-                            }
-                        } else {
-                            try self.checkAssignmentValue(span, fsig.params[0], pr);
+        }
+
+        if (self.resolveCalleeFnIndex(callee, true)) |fidx| {
+            const fsig = self.fn_sigs.items[fidx];
+            try self.resolved_fn_calls.put(self.alloc, callee, fsig.name);
+            const recv_offset: usize = if (piped_recv != null) 1 else 0;
+            var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+            if (piped_recv) |pr| {
+                if (fsig.params.len > 0) {
+                    if (fsig.type_params.len > 0) {
+                        if (!try self.unifyType(fsig.params[0], pr.ty, &subst)) {
+                            self.addError(.type_mismatch, span, "generic receiver type mismatch");
                         }
+                    } else {
+                        try self.checkAssignmentValue(span, fsig.params[0], pr);
                     }
                 }
-                for (args, 0..) |arg, ai| {
-                    const param_idx = ai + recv_offset;
-                    const expected_p = if (param_idx < fsig.params.len) fsig.params[param_idx] else null;
-                    if (fsig.type_params.len > 0 and expected_p != null) {
-                        const ep_sub = try self.substituteType(expected_p.?, &subst);
-                        const has_free = containsUnresolvedTypeVar(ep_sub, &subst);
-                        const ar = try self.checkExpr(arg.value, if (has_free) null else ep_sub);
-                        const final_ar_ty = if (has_free)
-                            try self.finalizeInferredType(arg.value.getSpan(), ar)
-                        else
-                            ar.ty;
-                        if (!ep_sub.isCopyable() and arg.value.* == .ident) {
+            }
+            for (args, 0..) |arg, ai| {
+                const param_idx = ai + recv_offset;
+                const expected_p = if (param_idx < fsig.params.len) fsig.params[param_idx] else null;
+                if (fsig.type_params.len > 0 and expected_p != null) {
+                    const ep_sub = try self.substituteType(expected_p.?, &subst);
+                    const has_free = containsUnresolvedTypeVar(ep_sub, &subst);
+                    const ar = try self.checkExpr(arg.value, if (has_free) null else ep_sub);
+                    const final_ar_ty = if (has_free)
+                        try self.finalizeInferredType(arg.value.getSpan(), ar)
+                    else
+                        ar.ty;
+                    if (!ep_sub.isCopyable() and arg.value.* == .ident) {
+                        const vname = arg.value.ident.slice(self.source);
+                        if (self.lookupVar(vname)) |vb| {
+                            if (ep_sub.* != .view and ep_sub.* != .slice and ep_sub.* != .path_borrow) {
+                                vb.moved = true;
+                            }
+                        }
+                    }
+                    if (!try self.unifyType(expected_p.?, final_ar_ty, &subst)) {
+                        self.addError(.type_mismatch, arg.span, "argument does not match generic function type parameter");
+                    }
+                } else {
+                    const ar = try self.checkExpr(arg.value, expected_p);
+                    if (expected_p) |ep| {
+                        if (!ep.isCopyable() and arg.value.* == .ident) {
                             const vname = arg.value.ident.slice(self.source);
                             if (self.lookupVar(vname)) |vb| {
-                                if (ep_sub.* != .view and ep_sub.* != .slice and ep_sub.* != .path_borrow) {
+                                if (ep.* != .view and ep.* != .slice and ep.* != .path_borrow) {
                                     vb.moved = true;
                                 }
                             }
                         }
-                        if (!try self.unifyType(expected_p.?, final_ar_ty, &subst)) {
-                            self.addError(.type_mismatch, arg.span, "argument does not match generic function type parameter");
-                        }
-                    } else {
-                        const ar = try self.checkExpr(arg.value, expected_p);
-                        if (expected_p) |ep| {
-                            if (!ep.isCopyable() and arg.value.* == .ident) {
-                                const vname = arg.value.ident.slice(self.source);
-                                if (self.lookupVar(vname)) |vb| {
-                                    if (ep.* != .view and ep.* != .slice and ep.* != .path_borrow) {
-                                        vb.moved = true;
-                                    }
-                                }
-                            }
-                            try self.checkAssignmentValue(arg.span, ep, ar);
-                        }
+                        try self.checkAssignmentValue(arg.span, ep, ar);
                     }
                 }
-                if (fsig.type_params.len > 0) {
-                    const concrete = try self.alloc.alloc(*const Ty, fsig.type_params.len);
-                    for (fsig.type_params, 0..) |tp, ti| {
-                        concrete[ti] = subst.get(tp) orelse try self.allocTy(.{ .type_var = tp });
-                    }
-                    try self.call_type_args.put(self.alloc, call_expr, concrete);
-                }
-                // Propagate transitive callee reads/writes onto actual arguments (InterprocBorrow.lean).
-                for (fsig.param_writes.items) |pw| {
-                    const actual_expr: ?*const ast.Expr = if (piped_recv != null and pw.param_idx == 0)
-                        piped_recv_expr
-                    else if (pw.param_idx >= recv_offset and (pw.param_idx - recv_offset) < args.len)
-                        args[pw.param_idx - recv_offset].value
-                    else
-                        null;
-                    if (actual_expr) |ae| {
-                        try self.propagateArgEffect(ae, pw.record_idx, pw.field_idx, true, span);
-                    }
-                }
-                for (fsig.param_reads.items) |pr| {
-                    const actual_expr: ?*const ast.Expr = if (piped_recv != null and pr.param_idx == 0)
-                        piped_recv_expr
-                    else if (pr.param_idx >= recv_offset and (pr.param_idx - recv_offset) < args.len)
-                        args[pr.param_idx - recv_offset].value
-                    else
-                        null;
-                    if (actual_expr) |ae| {
-                        try self.propagateArgEffect(ae, pr.record_idx, pr.field_idx, false, span);
-                    }
-                }
-                // Also track non-record slice/view arguments inside fork/view checks when callee takes mutable/shared view or slice.
-                for (fsig.params, 0..) |ep, pidx| {
-                    const ae: ?*const ast.Expr = if (piped_recv != null and pidx == 0)
-                        piped_recv_expr
-                    else if (pidx >= recv_offset and (pidx - recv_offset) < args.len)
-                        args[pidx - recv_offset].value
-                    else
-                        null;
-                    if (ae) |actual| {
-                        if (recordOfType(ep) == null) {
-                            const is_slice_mut = ep.* == .slice and ep.slice.mutable;
-                            const is_view_mut = ep.* == .view and ep.view.mode == .exclusive;
-                            const is_slice_ro = ep.* == .slice and !ep.slice.mutable;
-                            const is_view_ro = ep.* == .view and ep.view.mode == .shared;
-                            if (is_slice_mut or is_view_mut or is_slice_ro or is_view_ro) {
-                                const resolved = self.resolveAccessRoot(actual);
-                                if (resolved.root_name) |rn| {
-                                    const idx_key: ?AccessIndex = resolved.view_index_key orelse if (actual.* == .index)
-                                        self.extractAccessIndex(actual.index.idx)
-                                    else
-                                        null;
-                                    try self.recordAccess(rn, null, null, is_slice_mut or is_view_mut, span, idx_key, resolved.through_view_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                if (piped_recv == null and self.current_fn_name != null and self.current_fn_decreases != null and std.mem.eql(u8, cname, self.current_fn_name.?)) {
-                    const arg_exprs = try self.alloc.alloc(*const ast.Expr, args.len);
-                    for (args, 0..) |a, ai| arg_exprs[ai] = a.value;
-                    try self.verifyRecursiveDecreasesCall(span, arg_exprs);
-                }
-                const final_ret = if (fsig.type_params.len > 0) try self.substituteType(fsig.ret, &subst) else fsig.ret;
-                return .{ .ty = final_ret, .range = final_ret.rangeOf() };
             }
+            if (fsig.type_params.len > 0) {
+                const concrete = try self.alloc.alloc(*const Ty, fsig.type_params.len);
+                for (fsig.type_params, 0..) |tp, ti| {
+                    concrete[ti] = subst.get(tp) orelse try self.allocTy(.{ .type_var = tp });
+                }
+                try self.call_type_args.put(self.alloc, call_expr, concrete);
+            }
+            if (fsig.is_extern) {
+                try self.checkRustFFISliceAliasing(span, fsig.params, piped_recv_expr, args);
+            }
+            // Propagate transitive callee reads/writes onto actual arguments (InterprocBorrow.lean).
+            for (fsig.param_writes.items) |pw| {
+                const actual_expr: ?*const ast.Expr = if (piped_recv != null and pw.param_idx == 0)
+                    piped_recv_expr
+                else if (pw.param_idx >= recv_offset and (pw.param_idx - recv_offset) < args.len)
+                    args[pw.param_idx - recv_offset].value
+                else
+                    null;
+                if (actual_expr) |ae| {
+                    try self.propagateArgEffect(ae, pw.record_idx, pw.field_idx, true, span);
+                }
+            }
+            for (fsig.param_reads.items) |pr| {
+                const actual_expr: ?*const ast.Expr = if (piped_recv != null and pr.param_idx == 0)
+                    piped_recv_expr
+                else if (pr.param_idx >= recv_offset and (pr.param_idx - recv_offset) < args.len)
+                    args[pr.param_idx - recv_offset].value
+                else
+                    null;
+                if (actual_expr) |ae| {
+                    try self.propagateArgEffect(ae, pr.record_idx, pr.field_idx, false, span);
+                }
+            }
+            // Also track non-record slice/view arguments inside fork/view checks when callee takes mutable/shared view or slice.
+            for (fsig.params, 0..) |ep, pidx| {
+                const ae: ?*const ast.Expr = if (piped_recv != null and pidx == 0)
+                    piped_recv_expr
+                else if (pidx >= recv_offset and (pidx - recv_offset) < args.len)
+                    args[pidx - recv_offset].value
+                else
+                    null;
+                if (ae) |actual| {
+                    if (recordOfType(ep) == null) {
+                        const is_slice_mut = ep.* == .slice and ep.slice.mutable;
+                        const is_view_mut = ep.* == .view and ep.view.mode == .exclusive;
+                        const is_slice_ro = ep.* == .slice and !ep.slice.mutable;
+                        const is_view_ro = ep.* == .view and ep.view.mode == .shared;
+                        if (is_slice_mut or is_view_mut or is_slice_ro or is_view_ro) {
+                            const resolved = self.resolveAccessRoot(actual);
+                            if (resolved.root_name) |rn| {
+                                const idx_key: ?AccessIndex = resolved.view_index_key orelse if (actual.* == .index)
+                                    self.extractAccessIndex(actual.index.idx)
+                                else
+                                    null;
+                                try self.recordAccess(rn, null, null, is_slice_mut or is_view_mut, span, idx_key, resolved.through_view_id);
+                            }
+                        }
+                    }
+                }
+            }
+            if (piped_recv == null and self.current_fn_name != null and self.current_fn_decreases != null and std.mem.eql(u8, fsig.name, self.current_fn_name.?)) {
+                const arg_exprs = try self.alloc.alloc(*const ast.Expr, args.len);
+                for (args, 0..) |a, ai| arg_exprs[ai] = a.value;
+                try self.verifyRecursiveDecreasesCall(span, arg_exprs);
+            }
+            const final_ret = if (fsig.type_params.len > 0) try self.substituteType(fsig.ret, &subst) else fsig.ret;
+            return .{ .ty = final_ret, .range = final_ret.rangeOf() };
         }
 
         if (callee.* == .upper_ident) {
@@ -3752,6 +4708,7 @@ const Analyzer = struct {
                 return .{ .ty = try self.allocTy(.{ .result = .{ .ok = exp_ok orelse try self.allocTy(.err), .err = err_ty } }), .range = null };
             }
             for (self.adt_defs.items, 0..) |adt_def, aidx| {
+                if (self.module_slices.len > 0 and adt_def.module_id != self.current_module_id and !adt_def.is_pub) continue;
                 for (adt_def.variants) |v| {
                     if (std.mem.eql(u8, v.name, cname)) {
                         for (args, 0..) |arg, ai| {
@@ -3765,11 +4722,55 @@ const Analyzer = struct {
             }
         }
 
-        // Handle qualified constructors `Status.Moving(...)` or local closures / function values.
+        // Handle qualified constructors `Status.Moving(...)`, `v2.Status.Moving(...)`, `v2.Moving(...)`.
+        if (callee.* == .field and callee.field.target.* == .field and callee.field.target.field.target.* == .ident) {
+            const mod_alias = callee.field.target.field.target.ident.slice(self.source);
+            const adt_name = callee.field.target.field.name.slice(self.source);
+            const var_name = callee.field.name.slice(self.source);
+            if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                if (self.findADTInModule(target_mod, adt_name)) |aidx| {
+                    if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
+                        self.addError(.visibility_error, callee.field.target.field.name, "ADT type is private in imported module");
+                    }
+                    for (self.adt_defs.items[aidx].variants) |v| {
+                        if (std.mem.eql(u8, v.name, var_name)) {
+                            for (args, 0..) |arg, ai| {
+                                const exp_ft: ?*const Ty = if (ai < v.field_types.len) v.field_types[ai] else null;
+                                const ar = try self.checkExpr(arg.value, exp_ft);
+                                if (exp_ft) |ft| try self.checkAssignmentValue(arg.span, ft, ar);
+                            }
+                            return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                        }
+                    }
+                }
+            }
+        }
+        if (callee.* == .field and callee.field.target.* == .ident and self.lookupVar(callee.field.target.ident.slice(self.source)) == null) {
+            const mod_alias = callee.field.target.ident.slice(self.source);
+            const var_name = callee.field.name.slice(self.source);
+            if (self.resolveImportedModule(self.current_module_id, mod_alias)) |target_mod| {
+                for (self.adt_defs.items, 0..) |adt_def, aidx| {
+                    if (adt_def.module_id != target_mod) continue;
+                    for (adt_def.variants) |v| {
+                        if (std.mem.eql(u8, v.name, var_name)) {
+                            if (!adt_def.is_pub and target_mod != self.current_module_id) {
+                                self.addError(.visibility_error, callee.field.name, "ADT variant is private in imported module");
+                            }
+                            for (args, 0..) |arg, ai| {
+                                const exp_ft: ?*const Ty = if (ai < v.field_types.len) v.field_types[ai] else null;
+                                const ar = try self.checkExpr(arg.value, exp_ft);
+                                if (exp_ft) |ft| try self.checkAssignmentValue(arg.span, ft, ar);
+                            }
+                            return .{ .ty = try self.allocTy(.{ .adt = aidx }), .range = null };
+                        }
+                    }
+                }
+            }
+        }
         if (callee.* == .field and callee.field.target.* == .upper_ident) {
             const adt_name = callee.field.target.upper_ident.slice(self.source);
             const var_name = callee.field.name.slice(self.source);
-            if (self.findADTIndex(adt_name)) |aidx| {
+            if (self.resolveVisibleADTIndex(adt_name, callee.field.target.upper_ident)) |aidx| {
                 for (self.adt_defs.items[aidx].variants) |v| {
                     if (std.mem.eql(u8, v.name, var_name)) {
                         for (args, 0..) |arg, ai| {
@@ -4213,6 +5214,104 @@ const Analyzer = struct {
         }
     }
 
+    fn checkRustFFISliceAliasing(
+        self: *Analyzer,
+        span: ast.Span,
+        param_types: []const *const Ty,
+        piped_recv_expr: ?*const ast.Expr,
+        args: []const ast.CallArg,
+    ) std.mem.Allocator.Error!void {
+        const SliceArg = struct {
+            is_mut: bool,
+            root: ?[]const u8,
+            field_idx: ?usize,
+            idx_key: ?AccessIndex,
+        };
+        var items_buf: [16]SliceArg = undefined;
+        var items_len: usize = 0;
+        const recv_offset: usize = if (piped_recv_expr != null) 1 else 0;
+
+        for (param_types, 0..) |pt, pidx| {
+            const is_slice = pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice);
+            if (!is_slice) continue;
+            const is_mut = switch (pt.*) {
+                .slice => |s| s.mutable,
+                .view => |v| v.mode == .exclusive and v.target.slice.mutable,
+                else => false,
+            };
+            const actual: *const ast.Expr = if (piped_recv_expr != null and pidx == 0)
+                piped_recv_expr.?
+            else if (pidx >= recv_offset and (pidx - recv_offset) < args.len)
+                args[pidx - recv_offset].value
+            else
+                continue;
+
+            var resolved: ResolvedRoot = .{};
+            var field_idx: ?usize = null;
+            var idx_key: ?AccessIndex = null;
+
+            if (actual.* == .index) {
+                if (actual.index.target.* == .field) {
+                    const fld = actual.index.target.field;
+                    resolved = self.resolveAccessRoot(fld.target);
+                    if (resolved.root_name) |rn| {
+                        if (self.lookupVar(rn)) |vb| {
+                            if (recordOfType(vb.ty)) |ri| {
+                                field_idx = self.findRecordField(ri, fld.name.slice(self.source));
+                            }
+                        }
+                    }
+                } else {
+                    resolved = self.resolveAccessRoot(actual.index.target);
+                }
+                idx_key = resolved.view_index_key orelse self.extractAccessIndex(actual.index.idx);
+            } else if (actual.* == .field) {
+                resolved = self.resolveAccessRoot(actual.field.target);
+                if (resolved.root_name) |rn| {
+                    if (self.lookupVar(rn)) |vb| {
+                        if (recordOfType(vb.ty)) |ri| {
+                            field_idx = self.findRecordField(ri, actual.field.name.slice(self.source));
+                        }
+                    }
+                }
+                idx_key = resolved.view_index_key;
+            } else {
+                resolved = self.resolveAccessRoot(actual);
+                idx_key = resolved.view_index_key;
+            }
+
+            if (items_len < items_buf.len) {
+                items_buf[items_len] = .{
+                    .is_mut = is_mut,
+                    .root = resolved.root_name,
+                    .field_idx = field_idx,
+                    .idx_key = idx_key,
+                };
+                items_len += 1;
+            }
+        }
+
+        const slice_args = items_buf[0..items_len];
+        var i: usize = 0;
+        while (i < slice_args.len) : (i += 1) {
+            var j: usize = i + 1;
+            while (j < slice_args.len) : (j += 1) {
+                const a = slice_args[i];
+                const b = slice_args[j];
+                if (!a.is_mut and !b.is_mut) continue;
+                if (a.root == null or b.root == null) continue;
+                if (!std.mem.eql(u8, a.root.?, b.root.?)) continue;
+                if (a.field_idx != null and b.field_idx != null and a.field_idx.? != b.field_idx.?) {
+                    continue;
+                }
+                if (a.idx_key != null and b.idx_key != null and self.accessIndicesDisjoint(a.idx_key.?, b.idx_key.?, true)) {
+                    continue;
+                }
+                self.addError(.borrow_conflict, span, "Rust FFI call passes overlapping mutable slice aliases (violates Rust &mut aliasing rules)");
+            }
+        }
+    }
+
     fn verifyReturnedViewOrigin(self: *Analyzer, span: ast.Span, expr: *const ast.Expr, req_mode: ast.BorrowMode) std.mem.Allocator.Error!void {
         const rn = self.extractRootIdent(expr) orelse {
             self.addError(.borrow_conflict, span, "returned View must be rooted in a caller-borrowed parameter");
@@ -4249,8 +5348,8 @@ const Analyzer = struct {
         vty: anytype,
         span: ast.Span,
     ) std.mem.Allocator.Error!void {
-        if (val_expr.* == .call and val_expr.call.callee.* == .ident) {
-            if (self.findFnIndex(val_expr.call.callee.ident.slice(self.source))) |fidx| {
+        if (val_expr.* == .call) {
+            if (self.resolveCalleeFnIndex(val_expr.call.callee, false)) |fidx| {
                 const fsig = self.fn_sigs.items[fidx];
                 if (fsig.returned_origin) |orig_idx| {
                     if (orig_idx < val_expr.call.args.len) {
@@ -4397,9 +5496,10 @@ const Analyzer = struct {
 
     fn computeTransitiveCallEffects(self: *Analyzer) std.mem.Allocator.Error!void {
         for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
             if (decl.kind != .fn_decl) continue;
             const fd = decl.kind.fn_decl;
-            const fidx = self.findFnIndex(fd.name.slice(self.source)) orelse continue;
+            const fidx = self.findFnInModule(self.current_module_id, fd.name.slice(self.source)) orelse self.findFnIndex(fd.name.slice(self.source)) orelse continue;
 
             var aliases: std.ArrayList(PreAlias) = .empty;
             for (fd.params, 0..) |p, pi| {
@@ -4587,16 +5687,14 @@ const Analyzer = struct {
             },
             .cast => |c| try self.collectPreEffectsExpr(fidx, c.expr, aliases),
             .call => |c| {
-                if (c.callee.* == .ident) {
-                    if (self.findFnIndex(c.callee.ident.slice(self.source))) |callee_idx| {
-                        for (c.args, 0..) |arg, ai| {
-                            if (self.resolvePreExprAlias(arg.value, aliases.items)) |pa| {
-                                try self.fn_sigs.items[fidx].call_links.append(self.alloc, .{
-                                    .caller_param = pa.param_idx,
-                                    .callee_idx = callee_idx,
-                                    .callee_param = ai,
-                                });
-                            }
+                if (self.resolveCalleeFnIndex(c.callee, false)) |callee_idx| {
+                    for (c.args, 0..) |arg, ai| {
+                        if (self.resolvePreExprAlias(arg.value, aliases.items)) |pa| {
+                            try self.fn_sigs.items[fidx].call_links.append(self.alloc, .{
+                                .caller_param = pa.param_idx,
+                                .callee_idx = callee_idx,
+                                .callee_param = ai,
+                            });
                         }
                     }
                 }
@@ -5051,8 +6149,9 @@ const Analyzer = struct {
         for (self.module.decls) |decl| {
             if (decl.kind == .fn_decl) {
                 const fd = decl.kind.fn_decl;
+                const cname = self.decl_canonical_names.get(decl.span.start) orelse fd.name.slice(self.source);
                 try list.append(self.alloc, .{
-                    .name = fd.name.slice(self.source),
+                    .name = cname,
                     .params = fd.params,
                     .body = fd.body,
                 });
@@ -5170,6 +6269,7 @@ const Analyzer = struct {
         const rec_infos = try self.collectRecordAstInfos();
 
         for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
             if (decl.kind != .law_decl) continue;
             const ld = decl.kind.law_decl;
             const lname = ld.name.slice(self.source);
@@ -5200,6 +6300,7 @@ const Analyzer = struct {
                 .alloc = self.alloc,
                 .source = self.source,
                 .fns = fn_asts,
+                .resolved_calls = &self.resolved_fn_calls,
             };
             for (sym_bindings) |sb| _ = sym_ctx.bindVar(sb.name, sb.non_negative);
 
@@ -5310,7 +6411,7 @@ const Analyzer = struct {
                             continue;
                         }
 
-                        switch (law_verifier.runTier1Clause(self.alloc, self.source, fn_asts, rec_infos, param_domains, guards_ast.items, goal_expr, is_never)) {
+                        switch (law_verifier.runTier1ClauseResolved(self.alloc, self.source, fn_asts, rec_infos, &self.resolved_fn_calls, param_domains, guards_ast.items, goal_expr, is_never)) {
                             .proved_exhaustive => |states| {
                                 tier1_ok = true;
                                 tier1_max_states = @max(tier1_max_states, states);
@@ -5415,8 +6516,18 @@ const Analyzer = struct {
 };
 
 /// Run full semantic analysis (type/interval/borrow/layout/FFI/law verification)
-/// on a parsed `ast.Ast`.
+/// on a single parsed `ast.Ast`.
 pub fn analyze(allocator: std.mem.Allocator, tree: *const ast.Ast) std.mem.Allocator.Error!CheckedModule {
+    return analyzeWithModules(allocator, tree, &.{}, 0);
+}
+
+/// Run full semantic analysis across a multi-file program loaded via `module_loader`.
+pub fn analyzeWithModules(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    modules: []const ModuleSliceInfo,
+    entry_module_id: usize,
+) std.mem.Allocator.Error!CheckedModule {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const alloc = arena.allocator();
@@ -5429,10 +6540,14 @@ pub fn analyze(allocator: std.mem.Allocator, tree: *const ast.Ast) std.mem.Alloc
         .diagnostics = &diagnostics,
         .record_defs = .empty,
         .adt_defs = .empty,
-        .opaque_names = .empty,
+        .opaque_defs = .empty,
+        .type_alias_entries = .empty,
         .type_aliases = .empty,
         .fn_sigs = .empty,
         .const_map = .empty,
+        .module_slices = modules,
+        .entry_module_id = entry_module_id,
+        .current_module_id = entry_module_id,
         .scopes = .empty,
         .scope_marks = .empty,
         .active_views = .empty,
@@ -5451,6 +6566,7 @@ pub fn analyze(allocator: std.mem.Allocator, tree: *const ast.Ast) std.mem.Alloc
         .current_fn_ret = null,
     };
 
+    try az.registerImports();
     try az.registerTypeNames();
     try az.resolveAllTypeSignatures();
     try az.computeTransitiveCallEffects();
@@ -5492,5 +6608,10 @@ pub fn analyze(allocator: std.mem.Allocator, tree: *const ast.Ast) std.mem.Alloc
         .let_types = az.let_types,
         .const_types = az.const_types,
         .call_type_args = az.call_type_args,
+        .decl_canonical_names = az.decl_canonical_names,
+        .resolved_fn_calls = az.resolved_fn_calls,
+        .resolved_idents = az.resolved_idents,
+        .resolved_records = az.resolved_records,
+        .alias_types = az.type_aliases,
     };
 }

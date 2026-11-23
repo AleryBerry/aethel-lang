@@ -668,6 +668,7 @@ pub const SymCtx = struct {
     alloc: std.mem.Allocator,
     source: [:0]const u8,
     fns: []const FnAstEntry,
+    resolved_calls: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = null,
     vars: std.ArrayList(VarSlot) = .empty,
     subst: std.StringHashMapUnmanaged(*const LawExpr) = .empty,
     inline_depth: u8 = 0,
@@ -743,8 +744,7 @@ pub fn astToLawExpr(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawExpr {
             return null;
         },
         .call => |c| {
-            if (c.callee.* != .ident) return null;
-            const cname = c.callee.ident.slice(ctx.source);
+            const cname = resolveLawCalleeName(ctx.source, c.callee, ctx.resolved_calls) orelse return null;
             if (std.mem.eql(u8, cname, "min") and c.args.len == 2) {
                 const a = astToLawExpr(ctx, c.args[0].value) orelse return null;
                 const b = astToLawExpr(ctx, c.args[1].value) orelse return null;
@@ -899,9 +899,22 @@ pub const ConcreteEnv = struct {
     source: [:0]const u8,
     fns: []const FnAstEntry,
     records: []const RecordAstInfo,
+    resolved_calls: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = null,
     bindings: std.StringHashMapUnmanaged(ConcreteVal) = .empty,
     call_depth: u8 = 0,
 };
+
+fn resolveLawCalleeName(
+    source: [:0]const u8,
+    callee: *const ast.Expr,
+    resolved_calls: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, []const u8),
+) ?[]const u8 {
+    if (resolved_calls) |rc| {
+        if (rc.get(callee)) |cname| return cname;
+    }
+    if (callee.* == .ident) return callee.ident.slice(source);
+    return null;
+}
 
 fn wrapIntValue(v: i128, it: int_range.IntType) i128 {
     if (it.bits >= 127) return v;
@@ -1062,8 +1075,7 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
             return .unit_val;
         },
         .call => |c| {
-            if (c.callee.* != .ident) return null;
-            const cname = c.callee.ident.slice(env.source);
+            const cname = resolveLawCalleeName(env.source, c.callee, env.resolved_calls) orelse return null;
             if (std.mem.eql(u8, cname, "min") and c.args.len == 2) {
                 const a = evalConcreteExpr(env, c.args[0].value) orelse return null;
                 const b = evalConcreteExpr(env, c.args[1].value) orelse return null;
@@ -1312,6 +1324,7 @@ fn checkConcreteClause(
     source: [:0]const u8,
     fns: []const FnAstEntry,
     records: []const RecordAstInfo,
+    resolved_calls: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, []const u8),
     params: []const LawParamDomain,
     guards: []const *const ast.Expr,
     goal: *const ast.Expr,
@@ -1339,6 +1352,7 @@ fn checkConcreteClause(
         .source = source,
         .fns = fns,
         .records = records,
+        .resolved_calls = resolved_calls,
     };
 
     var eval_ok = true;
@@ -1410,9 +1424,23 @@ pub fn runTier1Clause(
     goal: *const ast.Expr,
     is_never: bool,
 ) Tier1Outcome {
-    const exh = checkConcreteClause(alloc, source, fns, records, params, guards, goal, is_never, true, 65536);
+    return runTier1ClauseResolved(alloc, source, fns, records, null, params, guards, goal, is_never);
+}
+
+pub fn runTier1ClauseResolved(
+    alloc: std.mem.Allocator,
+    source: [:0]const u8,
+    fns: []const FnAstEntry,
+    records: []const RecordAstInfo,
+    resolved_calls: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, []const u8),
+    params: []const LawParamDomain,
+    guards: []const *const ast.Expr,
+    goal: *const ast.Expr,
+    is_never: bool,
+) Tier1Outcome {
+    const exh = checkConcreteClause(alloc, source, fns, records, resolved_calls, params, guards, goal, is_never, true, 65536);
     if (exh != .inconclusive) return exh;
-    return checkConcreteClause(alloc, source, fns, records, params, guards, goal, is_never, false, 4096);
+    return checkConcreteClause(alloc, source, fns, records, resolved_calls, params, guards, goal, is_never, false, 4096);
 }
 
 pub fn runTier1BoundedFalsify(
@@ -1425,7 +1453,7 @@ pub fn runTier1BoundedFalsify(
     goal: *const ast.Expr,
     is_never: bool,
 ) ?[]const u8 {
-    return switch (checkConcreteClause(alloc, source, fns, records, params, guards, goal, is_never, false, 4096)) {
+    return switch (checkConcreteClause(alloc, source, fns, records, null, params, guards, goal, is_never, false, 4096)) {
         .falsified => |w| w,
         else => null,
     };

@@ -4701,6 +4701,136 @@
     }
   },
   {
+    "type": "qualified_constructor",
+    "named": true,
+    "fields": {
+      "module": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "anonymous_function",
+            "named": true
+          },
+          {
+            "type": "binary_expression",
+            "named": true
+          },
+          {
+            "type": "block",
+            "named": true
+          },
+          {
+            "type": "boolean",
+            "named": true
+          },
+          {
+            "type": "case",
+            "named": true
+          },
+          {
+            "type": "cast_expression",
+            "named": true
+          },
+          {
+            "type": "constructor_name",
+            "named": true
+          },
+          {
+            "type": "discard",
+            "named": true
+          },
+          {
+            "type": "field_access",
+            "named": true
+          },
+          {
+            "type": "float",
+            "named": true
+          },
+          {
+            "type": "fork_expression",
+            "named": true
+          },
+          {
+            "type": "function_call",
+            "named": true
+          },
+          {
+            "type": "hole",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "if_expression",
+            "named": true
+          },
+          {
+            "type": "index_expression",
+            "named": true
+          },
+          {
+            "type": "integer",
+            "named": true
+          },
+          {
+            "type": "list",
+            "named": true
+          },
+          {
+            "type": "panic",
+            "named": true
+          },
+          {
+            "type": "record",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "todo",
+            "named": true
+          },
+          {
+            "type": "try_expression",
+            "named": true
+          },
+          {
+            "type": "tuple",
+            "named": true
+          },
+          {
+            "type": "tuple_access",
+            "named": true
+          },
+          {
+            "type": "unary_expression",
+            "named": true
+          },
+          {
+            "type": "view_expression",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "constructor_name",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "range_pattern",
     "named": true,
     "fields": {},
@@ -4753,6 +4883,10 @@
         "types": [
           {
             "type": "constructor_name",
+            "named": true
+          },
+          {
+            "type": "qualified_constructor",
             "named": true
           }
         ]
@@ -4999,6 +5133,10 @@
         "required": false,
         "types": [
           {
+            "type": "identifier",
+            "named": true
+          },
+          {
             "type": "type_identifier",
             "named": true
           }
@@ -5014,6 +5152,10 @@
           },
           {
             "type": "constructor_name",
+            "named": true
+          },
+          {
+            "type": "type_identifier",
             "named": true
           }
         ]
@@ -6961,6 +7103,10 @@
   },
   {
     "type": "..=",
+    "named": false
+  },
+  {
+    "type": ".{",
     "named": false
   },
   {

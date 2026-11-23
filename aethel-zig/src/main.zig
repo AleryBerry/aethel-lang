@@ -95,11 +95,13 @@ fn runCli(
 
     if (std.mem.eql(u8, args[1], "check") or
         std.mem.eql(u8, args[1], "emit-mir") or
-        std.mem.eql(u8, args[1], "emit-zig"))
+        std.mem.eql(u8, args[1], "emit-zig") or
+        std.mem.eql(u8, args[1], "emit-rust-adapter"))
     {
         const is_check = std.mem.eql(u8, args[1], "check");
         const emit_mir = std.mem.eql(u8, args[1], "emit-mir");
         const emit_zig = std.mem.eql(u8, args[1], "emit-zig");
+        const emit_rust = std.mem.eql(u8, args[1], "emit-rust-adapter");
         var explain_layout = false;
         var path_opt: ?[]const u8 = null;
         if (args.len == 3) {
@@ -119,23 +121,33 @@ fn runCli(
             try stderr.flush();
             return 2;
         };
-        const source = readSourceFile(io, arena, path, stderr) orelse return 1;
 
-        var tree = try aethel.parse(arena, source);
-        defer tree.deinit();
-        if (tree.hasErrors()) {
-            for (tree.diagnostics) |diag| {
-                try printCaretDiagnostic(stderr, path, source, diag.span, diag.message);
+        var loaded = try aethel.module_loader.loadProgram(arena, io, path, null);
+        defer loaded.deinit();
+        if (loaded.hasErrors()) {
+            for (loaded.errors) |lerr| {
+                try printLoadedError(stderr, lerr);
             }
             try stderr.flush();
             return 1;
         }
 
-        var checked = try aethel.check(arena, &tree);
+        var tree = try aethel.parse(arena, loaded.combined_source);
+        defer tree.deinit();
+        if (tree.hasErrors()) {
+            for (tree.diagnostics) |diag| {
+                try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
+            }
+            try stderr.flush();
+            return 1;
+        }
+
+        const mod_infos = try slicesToModuleInfos(arena, loaded.slices);
+        var checked = try aethel.checkWithModules(arena, &tree, mod_infos, loaded.entry_module_id);
         defer checked.deinit();
         if (checked.hasErrors()) {
             for (checked.diagnostics) |diag| {
-                try printCaretDiagnostic(stderr, path, source, diag.span, diag.message);
+                try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
             }
             try stderr.flush();
             return 1;
@@ -148,6 +160,11 @@ fn runCli(
         }
         if (emit_zig) {
             try aethel.emitZig(&tree, &checked, stdout);
+            try stdout.flush();
+            return 0;
+        }
+        if (emit_rust) {
+            try aethel.rust_ffi.emitRustAdapter(&tree, &checked, null, stdout);
             try stdout.flush();
             return 0;
         }
@@ -267,6 +284,7 @@ fn handleBuildOrRun(
 ) !u8 {
     var input_path: ?[]const u8 = null;
     var out_path_opt: ?[]const u8 = null;
+    var rust_path_opt: ?[]const u8 = null;
     var opt_level: OptLevel = .debug;
     var keep_zig = false;
 
@@ -281,6 +299,14 @@ fn handleBuildOrRun(
                 return 2;
             }
             out_path_opt = rest[i];
+        } else if (std.mem.eql(u8, arg, "--rust")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stderr.print("error: missing Rust source path after '--rust'\n", .{});
+                try stderr.flush();
+                return 2;
+            }
+            rust_path_opt = rest[i];
         } else if (std.mem.eql(u8, arg, "-O")) {
             i += 1;
             if (i >= rest.len) {
@@ -318,7 +344,7 @@ fn handleBuildOrRun(
     }
 
     const path = input_path orelse {
-        try stderr.print("usage: aethel {s} <file.aethel>{s} [-O debug|safe|fast|small] [--keep-zig]\n", .{
+        try stderr.print("usage: aethel {s} <file.aethel>{s} [--rust <lib.rs>] [-O debug|safe|fast|small] [--keep-zig]\n", .{
             if (is_run) "run" else "build",
             if (is_run) "" else " [-o <out>]",
         });
@@ -326,23 +352,32 @@ fn handleBuildOrRun(
         return 2;
     };
 
-    const source = readSourceFile(io, arena, path, stderr) orelse return 1;
-
-    var tree = try aethel.parse(arena, source);
-    defer tree.deinit();
-    if (tree.hasErrors()) {
-        for (tree.diagnostics) |diag| {
-            try printCaretDiagnostic(stderr, path, source, diag.span, diag.message);
+    var loaded = try aethel.module_loader.loadProgram(arena, io, path, null);
+    defer loaded.deinit();
+    if (loaded.hasErrors()) {
+        for (loaded.errors) |lerr| {
+            try printLoadedError(stderr, lerr);
         }
         try stderr.flush();
         return 1;
     }
 
-    var checked = try aethel.check(arena, &tree);
+    var tree = try aethel.parse(arena, loaded.combined_source);
+    defer tree.deinit();
+    if (tree.hasErrors()) {
+        for (tree.diagnostics) |diag| {
+            try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
+        }
+        try stderr.flush();
+        return 1;
+    }
+
+    const mod_infos = try slicesToModuleInfos(arena, loaded.slices);
+    var checked = try aethel.checkWithModules(arena, &tree, mod_infos, loaded.entry_module_id);
     defer checked.deinit();
     if (checked.hasErrors()) {
         for (checked.diagnostics) |diag| {
-            try printCaretDiagnostic(stderr, path, source, diag.span, diag.message);
+            try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
         }
         try stderr.flush();
         return 1;
@@ -401,6 +436,11 @@ fn handleBuildOrRun(
         Io.Dir.cwd().deleteFile(io, zig_path) catch {};
     };
 
+    var rust_lib_opt: ?[]const u8 = null;
+    if (rust_path_opt) |rp| {
+        rust_lib_opt = (try aethel.rust_ffi.compileRustStaticlib(io, arena, &tree, &checked, rp, raw_stem, stderr)) orelse return 1;
+    }
+
     const emit_bin_flag = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{out_path});
     var argv_list: std.ArrayList([]const u8) = .empty;
     try argv_list.appendSlice(arena, &.{
@@ -410,6 +450,9 @@ fn handleBuildOrRun(
         "-fno-llvm",
         "-fno-lld",
     });
+    if (rust_lib_opt) |rlib| {
+        try argv_list.appendSlice(arena, &.{ rlib, "-lc", "-lgcc_s" });
+    }
     switch (opt_level) {
         .debug => {},
         .safe => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseSafe" }),
@@ -534,13 +577,9 @@ fn handleVerify(
         return 2;
     };
 
-    const main_src = readSourceFile(io, arena, path, stderr) orelse return 1;
-
     var companion_path: ?[]const u8 = null;
-    var companion_src: ?[:0]const u8 = null;
     if (explicit_laws) |lp| {
         companion_path = lp;
-        companion_src = readSourceFile(io, arena, lp, stderr) orelse return 1;
     } else {
         const bname = std.fs.path.basename(path);
         if (!std.mem.eql(u8, bname, "LAWS.aethel") and !std.mem.eql(u8, bname, "laws.aethel")) {
@@ -558,34 +597,36 @@ fn handleVerify(
                     .limited(16 * 1024 * 1024),
                     .of(u8),
                     0,
-                )) |laws_bytes| {
+                )) |_| {
                     companion_path = cand_path;
-                    companion_src = laws_bytes;
                     break;
                 } else |_| {}
             }
         }
     }
 
-    const combined_src: [:0]const u8 = if (companion_src) |cs| blk: {
-        const buf = try arena.allocSentinel(u8, main_src.len + 1 + cs.len, 0);
-        @memcpy(buf[0..main_src.len], main_src);
-        buf[main_src.len] = '\n';
-        @memcpy(buf[main_src.len + 1 ..], cs);
-        break :blk buf;
-    } else main_src;
-
-    var tree = try aethel.parse(arena, combined_src);
-    defer tree.deinit();
-    if (tree.hasErrors()) {
-        for (tree.diagnostics) |diag| {
-            try printSplitCaretDiagnostic(stderr, path, main_src, companion_path, companion_src, diag.span, diag.message);
+    var loaded = try aethel.module_loader.loadProgram(arena, io, path, companion_path);
+    defer loaded.deinit();
+    if (loaded.hasErrors()) {
+        for (loaded.errors) |lerr| {
+            try printLoadedError(stderr, lerr);
         }
         try stderr.flush();
         return 1;
     }
 
-    var checked = try aethel.check(arena, &tree);
+    var tree = try aethel.parse(arena, loaded.combined_source);
+    defer tree.deinit();
+    if (tree.hasErrors()) {
+        for (tree.diagnostics) |diag| {
+            try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
+        }
+        try stderr.flush();
+        return 1;
+    }
+
+    const mod_infos = try slicesToModuleInfos(arena, loaded.slices);
+    var checked = try aethel.checkWithModules(arena, &tree, mod_infos, loaded.entry_module_id);
     defer checked.deinit();
 
     var has_non_law_error = false;
@@ -597,7 +638,7 @@ fn handleVerify(
     }
     if (has_non_law_error) {
         for (checked.diagnostics) |diag| {
-            try printSplitCaretDiagnostic(stderr, path, main_src, companion_path, companion_src, diag.span, diag.message);
+            try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
         }
         try stderr.flush();
         return 1;
@@ -686,7 +727,7 @@ fn handleVerify(
 
     if (checked.hasErrors()) {
         for (checked.diagnostics) |diag| {
-            try printSplitCaretDiagnostic(stderr, path, main_src, companion_path, companion_src, diag.span, diag.message);
+            try printLocatedCaretDiagnostic(stderr, loaded.slices, path, loaded.combined_source, diag.span, diag.message);
         }
         try stderr.flush();
     }
@@ -702,21 +743,42 @@ fn handleVerify(
     return 0;
 }
 
-fn printSplitCaretDiagnostic(
+fn slicesToModuleInfos(
+    arena: std.mem.Allocator,
+    slices: []const aethel.module_loader.SourceSlice,
+) ![]const aethel.sema.ModuleSliceInfo {
+    const out = try arena.alloc(aethel.sema.ModuleSliceInfo, slices.len);
+    for (slices, 0..) |sl, i| {
+        out[i] = .{
+            .module_id = sl.module_id,
+            .module_key = sl.module_key,
+            .start = sl.start,
+            .end = sl.end,
+        };
+    }
+    return out;
+}
+
+fn printLoadedError(stderr: *Io.Writer, lerr: aethel.module_loader.LoadError) Io.Writer.Error!void {
+    if (lerr.source.len == 0) {
+        try stderr.print("{s}: error: {s}\n", .{ lerr.path, lerr.message });
+    } else {
+        try printCaretDiagnostic(stderr, lerr.path, lerr.source, lerr.span, lerr.message);
+    }
+}
+
+fn printLocatedCaretDiagnostic(
     stderr: *Io.Writer,
-    main_path: []const u8,
-    main_src: [:0]const u8,
-    companion_path: ?[]const u8,
-    companion_src: ?[:0]const u8,
+    slices: []const aethel.module_loader.SourceSlice,
+    fallback_path: []const u8,
+    fallback_src: [:0]const u8,
     span: aethel.ast.Span,
     message: []const u8,
 ) Io.Writer.Error!void {
-    if (companion_path != null and companion_src != null and span.start > main_src.len) {
-        const adj_start = span.start - main_src.len - 1;
-        const adj_end = if (span.end > main_src.len + 1) span.end - main_src.len - 1 else adj_start;
-        try printCaretDiagnostic(stderr, companion_path.?, companion_src.?, .{ .start = adj_start, .end = adj_end }, message);
+    if (aethel.module_loader.locateSpan(slices, span)) |loc| {
+        try printCaretDiagnostic(stderr, loc.slice.path, loc.slice.source, loc.local_span, message);
     } else {
-        try printCaretDiagnostic(stderr, main_path, main_src, span, message);
+        try printCaretDiagnostic(stderr, fallback_path, fallback_src, span, message);
     }
 }
 
@@ -755,8 +817,9 @@ fn printUsage(writer: *Io.Writer) Io.Writer.Error!void {
         \\  aethel verify <file.aethel> [--laws <LAWS.aethel>] [--lean|--no-lean]
         \\  aethel emit-mir <file.aethel>
         \\  aethel emit-zig <file.aethel>
-        \\  aethel build <file.aethel> [-o <out>] [-O debug|safe|fast|small] [--keep-zig]
-        \\  aethel run <file.aethel> [-O debug|safe|fast|small] [--keep-zig]
+        \\  aethel emit-rust-adapter <file.aethel>
+        \\  aethel build <file.aethel> [--rust <lib.rs>] [-o <out>] [-O debug|safe|fast|small] [--keep-zig]
+        \\  aethel run <file.aethel> [--rust <lib.rs>] [-O debug|safe|fast|small] [--keep-zig]
         \\
     , .{});
 }

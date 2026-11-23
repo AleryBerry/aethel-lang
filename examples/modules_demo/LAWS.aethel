@@ -1,0 +1,9 @@
+// Constitutional Laws for multi-module demo (auto-discovered by `aethel verify`)
+law score_capped(score: u32, limit: u32) {
+  always math.cap_score(score, limit) <= limit
+  never math.cap_score(score, limit) > limit
+}
+
+law bounded_hundred(x: u32) {
+  always math.cap_score(x, 100u32) <= 100u32
+}

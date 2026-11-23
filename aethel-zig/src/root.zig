@@ -5,8 +5,10 @@ pub const parser = @import("parser.zig");
 pub const int_range = @import("int_range.zig");
 pub const layout = @import("layout.zig");
 pub const law_verifier = @import("law_verifier.zig");
+pub const module_loader = @import("module_loader.zig");
 pub const sema = @import("sema.zig");
 pub const mir = @import("mir.zig");
+pub const rust_ffi = @import("rust_ffi.zig");
 pub const codegen_zig = @import("codegen_zig.zig");
 
 pub const Lexer = lexer.Lexer;
@@ -22,6 +24,7 @@ pub const Ast = ast.Ast;
 pub const parse = parser.parse;
 pub const CheckedModule = sema.CheckedModule;
 pub const check = sema.analyze;
+pub const checkWithModules = sema.analyzeWithModules;
 pub const emitMir = mir.emitMir;
 pub const emitZig = codegen_zig.emitZig;
 
@@ -30,5 +33,6 @@ test {
     _ = @import("parser_test.zig");
     _ = @import("sema_test.zig");
     _ = @import("law_test.zig");
+    _ = @import("stage_e_test.zig");
     _ = @import("codegen_test.zig");
 }

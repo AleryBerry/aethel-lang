@@ -317,6 +317,12 @@ const Emitter = struct {
             .view => |v| {
                 if (v.target.* == .collection or v.target.* == .slice) {
                     try self.emitTy(v.target);
+                } else if (v.target.* == .opaque_ty) {
+                    if (v.mode == .exclusive) {
+                        try self.w.writeAll("?*anyopaque");
+                    } else {
+                        try self.w.writeAll("?*const anyopaque");
+                    }
                 } else {
                     if (v.mode == .exclusive) {
                         try self.w.writeByte('*');
@@ -528,7 +534,7 @@ const Emitter = struct {
 
     fn emitTypeDecl(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
         const td = decl.kind.type_decl;
-        const name = self.sourceOf(td.name);
+        const name = self.checked.declCanonicalName(decl.span.start) orelse self.sourceOf(td.name);
         switch (td.body) {
             .record => {
                 if (self.findCheckedRecordIndex(name)) |ridx| {
@@ -707,7 +713,15 @@ const Emitter = struct {
                 try self.w.writeAll("const ");
                 try self.emitIdent(name);
                 try self.w.writeAll(" = ");
-                try self.emitAstType(ty_ast);
+                if (self.checked.aliasType(name)) |aty| {
+                    if (aty.* != .err) {
+                        try self.emitTy(aty);
+                    } else {
+                        try self.emitAstType(ty_ast);
+                    }
+                } else {
+                    try self.emitAstType(ty_ast);
+                }
                 try self.w.writeAll(";\n");
             },
             .empty => {
@@ -720,7 +734,7 @@ const Emitter = struct {
 
     fn emitConstDecl(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
         const cd = decl.kind.const_decl;
-        const cname = self.sourceOf(cd.name);
+        const cname = self.checked.declCanonicalName(decl.span.start) orelse self.sourceOf(cd.name);
         const cty = self.checked.constType(cname);
         try self.w.writeAll("const ");
         try self.emitIdent(cname);
@@ -745,11 +759,30 @@ const Emitter = struct {
         try self.w.print("// extern {s} C-ABI declarations\n", .{abi_slice});
         for (ex.fns) |ef| {
             const fname = self.sourceOf(ef.name);
+            const cf = self.findCheckedFn(fname);
             try self.w.writeAll("extern \"c\" fn ");
             try self.emitIdent(fname);
             try self.w.writeByte('(');
             var first = true;
-            for (ef.params) |p| {
+            for (ef.params, 0..) |p, pi| {
+                const pty_resolved: ?*const sema.Ty = if (cf != null and pi < cf.?.param_types.len) cf.?.param_types[pi] else null;
+                if (pty_resolved != null and (pty_resolved.?.* == .slice or (pty_resolved.?.* == .view and pty_resolved.?.view.target.* == .slice))) {
+                    const ExternSliceInfo = struct { mutable: bool, elem: *const sema.Ty };
+                    const sl: ExternSliceInfo = if (pty_resolved.?.* == .slice)
+                        .{ .mutable = pty_resolved.?.slice.mutable, .elem = pty_resolved.?.slice.elem }
+                    else
+                        .{ .mutable = pty_resolved.?.view.mode == .exclusive and pty_resolved.?.view.target.slice.mutable, .elem = pty_resolved.?.view.target.slice.elem };
+                    if (!first) try self.w.writeAll(", ");
+                    first = false;
+                    try self.emitIdent(self.sourceOf(p.name));
+                    try self.w.writeAll("_ptr: [*]");
+                    if (!sl.mutable) try self.w.writeAll("const ");
+                    try self.emitTy(sl.elem);
+                    try self.w.writeAll(", ");
+                    try self.emitIdent(self.sourceOf(p.name));
+                    try self.w.writeAll("_len: usize");
+                    continue;
+                }
                 if (p.ty) |pty| {
                     if (pty.* == .slice) {
                         if (!first) try self.w.writeAll(", ");
@@ -768,14 +801,18 @@ const Emitter = struct {
                 first = false;
                 try self.emitIdent(self.sourceOf(p.name));
                 try self.w.writeAll(": ");
-                if (p.ty) |pty| {
+                if (pty_resolved != null and pty_resolved.?.* != .err) {
+                    try self.emitTy(pty_resolved.?);
+                } else if (p.ty) |pty| {
                     try self.emitAstType(pty);
                 } else {
                     try self.w.writeAll("usize");
                 }
             }
             try self.w.writeAll(") ");
-            if (ef.ret) |ret| {
+            if (cf != null and cf.?.ret_type.* != .err) {
+                try self.emitTy(cf.?.ret_type);
+            } else if (ef.ret) |ret| {
                 try self.emitAstType(ret);
             } else {
                 try self.w.writeAll("void");
@@ -787,17 +824,17 @@ const Emitter = struct {
 
     fn isPointerType(ty: *const sema.Ty) bool {
         if (ty.* == .path_borrow) {
-            return ty.path_borrow.base.* != .collection and ty.path_borrow.base.* != .slice;
+            return ty.path_borrow.base.* != .collection and ty.path_borrow.base.* != .slice and ty.path_borrow.base.* != .opaque_ty;
         }
         if (ty.* == .view) {
-            return ty.view.target.* != .collection and ty.view.target.* != .slice;
+            return ty.view.target.* != .collection and ty.view.target.* != .slice and ty.view.target.* != .opaque_ty;
         }
         return false;
     }
 
     fn emitFnDecl(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
         const fd = decl.kind.fn_decl;
-        const fname = self.sourceOf(fd.name);
+        const fname = self.checked.declCanonicalName(decl.span.start) orelse self.sourceOf(fd.name);
         const cf = self.findCheckedFn(fname);
         const is_main = std.mem.eql(u8, fname, "main");
         const ret_ty: ?*const sema.Ty = if (cf) |f| f.ret_type else null;
@@ -1172,9 +1209,37 @@ const Emitter = struct {
     fn isBlockLikeVoidExpr(self: *const Emitter, expr: *const ast.Expr) bool {
         return switch (expr.*) {
             .if_expr, .block, .view_expr, .fork_expr, .case_expr => true,
-            .binary => |b| b.op == .pipe and b.right.* == .call and b.right.call.callee.* == .ident and blk: {
-                const cn = self.sourceOf(b.right.call.callee.ident);
-                break :blk std.mem.eql(u8, cn, "map_in_place");
+            .call => |c| blk: {
+                const resolved_name = self.checked.resolvedCallName(c.callee) orelse
+                    if (c.callee.* == .ident) self.sourceOf(c.callee.ident) else null;
+                if (resolved_name) |rn| {
+                    if (self.findCheckedFn(rn)) |cf| {
+                        if (cf.has_extern_abi) {
+                            for (cf.param_types) |pt| {
+                                if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) break :blk true;
+                            }
+                        }
+                    }
+                }
+                break :blk false;
+            },
+            .binary => |b| b.op == .pipe and b.right.* == .call and blk: {
+                if (b.right.call.callee.* == .ident) {
+                    const cn = self.sourceOf(b.right.call.callee.ident);
+                    if (std.mem.eql(u8, cn, "map_in_place")) break :blk true;
+                }
+                const resolved_name = self.checked.resolvedCallName(b.right.call.callee) orelse
+                    if (b.right.call.callee.* == .ident) self.sourceOf(b.right.call.callee.ident) else null;
+                if (resolved_name) |rn| {
+                    if (self.findCheckedFn(rn)) |cf| {
+                        if (cf.has_extern_abi) {
+                            for (cf.param_types) |pt| {
+                                if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) break :blk true;
+                            }
+                        }
+                    }
+                }
+                break :blk false;
             },
             else => false,
         };
@@ -1501,6 +1566,8 @@ const Emitter = struct {
                 } else if (self.isCtxValueIdent(name)) {
                     try self.w.writeAll("__ctx.");
                     try self.emitIdent(name);
+                } else if (self.checked.resolvedIdentName(expr)) |rname| {
+                    try self.emitIdent(rname);
                 } else {
                     try self.emitIdent(name);
                 }
@@ -1621,30 +1688,28 @@ const Emitter = struct {
                 try self.emitCall(expr, call_expr.callee, call_expr.args, null);
             },
             .field => |fld| {
+                if (self.checked.resolvedIdentName(expr)) |rname| {
+                    try self.emitIdent(rname);
+                    return;
+                }
+                const var_name = self.sourceOf(fld.name);
                 if (fld.target.* == .upper_ident) {
                     const adt_name = self.sourceOf(fld.target.upper_ident);
-                    const var_name = self.sourceOf(fld.name);
                     if (self.findCheckedVariant(adt_name, var_name)) |found| {
-                        const adt_def = &self.checked.adts[found.aidx];
-                        if (isPureEnumADT(adt_def)) {
-                            try self.emitIdent(adt_def.name);
-                            try self.w.writeByte('.');
-                            try self.emitIdent(var_name);
-                        } else if (isCompactPackedADT(adt_def)) {
-                            try self.emitIdent(adt_def.name);
-                            try self.w.writeAll("{ .tag = .");
-                            try self.emitIdent(var_name);
-                            try self.w.writeAll(", .payload = 0 }");
-                        } else {
-                            try self.emitIdent(adt_def.name);
-                            try self.w.writeAll("{ .");
-                            try self.emitIdent(var_name);
-                            try self.w.writeAll(" = {} }");
-                        }
+                        try self.emitADTZeroArgVariant(found.aidx, var_name);
                         return;
                     }
                 }
-                const fname = self.sourceOf(fld.name);
+                if (self.checked.exprType(expr)) |fty| {
+                    if (fty.* == .adt) {
+                        const adt_def = &self.checked.adts[fty.adt];
+                        if (self.findCheckedVariant(adt_def.name, var_name)) |found| {
+                            try self.emitADTZeroArgVariant(found.aidx, var_name);
+                            return;
+                        }
+                    }
+                }
+                const fname = var_name;
                 if (self.checked.exprType(fld.target)) |tty| {
                     if (recordRecordIdxOfTy(tty)) |ridx| {
                         const rec = self.checked.records[ridx];
@@ -1698,8 +1763,9 @@ const Emitter = struct {
                 }
             },
             .record_lit => |rl| {
-                const rname = if (rl.path.len > 0) self.sourceOf(rl.path[rl.path.len - 1]) else "Record";
-                const ridx = self.findCheckedRecordIndex(rname);
+                const raw_rname = if (rl.path.len > 0) self.sourceOf(rl.path[rl.path.len - 1]) else "Record";
+                const ridx = self.checked.resolvedRecordIdx(expr) orelse self.findCheckedRecordIndex(raw_rname);
+                const rname = if (ridx) |ri| self.checked.records[ri].name else raw_rname;
                 const has_bins = if (ridx) |ri| recordHasAnyBin(&self.checked.records[ri]) else false;
                 try self.emitIdent(rname);
                 try self.w.writeAll("{ ");
@@ -2372,8 +2438,28 @@ const Emitter = struct {
             }
         }
 
-        // 3. Regular user / extern function call (including generic comptime type args) or local closure invocation.
-        const cf: ?*const sema.CheckedFunction = if (callee.* == .ident) self.findCheckedFn(self.sourceOf(callee.ident)) else null;
+        // 3. Regular user / extern function call (including module-qualified, generic comptime args, FFI slices, and closures).
+        if (call_expr != null and callee.* == .field) {
+            if (self.checked.resolvedCallName(callee) == null) {
+                const call_ty = self.checked.exprType(call_expr.?);
+                if (call_ty != null and call_ty.?.* == .adt) {
+                    const adt_def = &self.checked.adts[call_ty.?.adt];
+                    const var_name = self.sourceOf(callee.field.name);
+                    if (self.findCheckedVariant(adt_def.name, var_name)) |found| {
+                        try self.emitADTConstruct(found.aidx, found.vidx, args);
+                        return;
+                    }
+                }
+            }
+        }
+
+        const resolved_name = self.checked.resolvedCallName(callee);
+        const cf: ?*const sema.CheckedFunction = if (resolved_name) |rn|
+            self.findCheckedFn(rn)
+        else if (callee.* == .ident)
+            self.findCheckedFn(self.sourceOf(callee.ident))
+        else
+            null;
         if (cf == null) {
             const callee_ty = self.checked.exprType(callee);
             const is_fn_val = (callee_ty != null and callee_ty.?.* == .fn_ty) or
@@ -2407,10 +2493,75 @@ const Emitter = struct {
             }
         }
 
-        try self.emitExpr(callee);
+        const total_offset: usize = if (piped_recv != null) 1 else 0;
+        var has_ffi_slices = false;
+        if (cf != null and cf.?.has_extern_abi) {
+            for (cf.?.param_types) |pt| {
+                if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) {
+                    has_ffi_slices = true;
+                    break;
+                }
+            }
+        }
+
+        if (cf != null and cf.?.has_extern_abi and has_ffi_slices) {
+            const ret_void = isVoidTy(cf.?.ret_type);
+            const lbl = self.nextLabel();
+            if (ret_void) {
+                try self.w.writeAll("{ ");
+            } else {
+                try self.w.print("blk_{d}: {{ ", .{lbl});
+            }
+            for (cf.?.param_types, 0..) |pt, pidx| {
+                const is_sl = pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice);
+                if (!is_sl) continue;
+                const arg_val: *const ast.Expr = if (piped_recv != null and pidx == 0)
+                    piped_recv.?
+                else if (pidx >= total_offset and (pidx - total_offset) < args.len)
+                    args[pidx - total_offset].value
+                else
+                    continue;
+                try self.w.print("const __ffi_{d}_{d}: ", .{ lbl, pidx });
+                try self.emitTy(pt);
+                try self.w.writeAll(" = ");
+                try self.emitExpr(arg_val);
+                try self.w.writeAll("; ");
+            }
+            if (!ret_void) {
+                try self.w.print("break :blk_{d} ", .{lbl});
+            }
+            try self.emitIdent(cf.?.name);
+            try self.w.writeByte('(');
+            var first_arg = true;
+            for (cf.?.param_types, 0..) |pt, pidx| {
+                if (!first_arg) try self.w.writeAll(", ");
+                first_arg = false;
+                const is_sl = pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice);
+                if (is_sl) {
+                    try self.w.print("__ffi_{d}_{d}.ptr, __ffi_{d}_{d}.len", .{ lbl, pidx, lbl, pidx });
+                } else {
+                    const arg_val: ?*const ast.Expr = if (piped_recv != null and pidx == 0)
+                        piped_recv.?
+                    else if (pidx >= total_offset and (pidx - total_offset) < args.len)
+                        args[pidx - total_offset].value
+                    else
+                        null;
+                    if (arg_val) |av| {
+                        try self.emitCallArg(av, pt);
+                    }
+                }
+            }
+            try self.w.writeAll("); }");
+            return;
+        }
+
+        if (cf) |f| {
+            try self.emitIdent(f.name);
+        } else {
+            try self.emitExpr(callee);
+        }
         try self.w.writeByte('(');
 
-        const total_offset: usize = if (piped_recv != null) 1 else 0;
         var emitted_any = false;
         if (cf != null and cf.?.type_params.len > 0) {
             const targs = if (call_expr) |ce| self.checked.callTypeArgs(ce) else null;
@@ -2513,6 +2664,25 @@ const Emitter = struct {
             try self.w.print("@as(u{d}, @truncate(__adt_{d}.payload))", .{ it.bits, adt_id });
         } else {
             try self.w.print("__adt_{d}.payload", .{adt_id});
+        }
+    }
+
+    fn emitADTZeroArgVariant(self: *Emitter, aidx: usize, var_name: []const u8) Io.Writer.Error!void {
+        const adt_def = &self.checked.adts[aidx];
+        if (isPureEnumADT(adt_def)) {
+            try self.emitIdent(adt_def.name);
+            try self.w.writeByte('.');
+            try self.emitIdent(var_name);
+        } else if (isCompactPackedADT(adt_def)) {
+            try self.emitIdent(adt_def.name);
+            try self.w.writeAll("{ .tag = .");
+            try self.emitIdent(var_name);
+            try self.w.writeAll(", .payload = 0 }");
+        } else {
+            try self.emitIdent(adt_def.name);
+            try self.w.writeAll("{ .");
+            try self.emitIdent(var_name);
+            try self.w.writeAll(" = {} }");
         }
     }
 
@@ -2690,7 +2860,7 @@ const Emitter = struct {
     fn canUseZigSwitch(self: *const Emitter, ce: anytype) bool {
         if (ce.subjects.len != 1) return false;
         const sub_ty = self.checked.exprType(ce.subjects[0]);
-        if (sub_ty != null and sub_ty.?.* == .string) return false;
+        if (sub_ty != null and (sub_ty.?.* == .string or sub_ty.?.* == .option)) return false;
         for (ce.arms) |arm| {
             if (arm.guard != null) return false;
             if (arm.alternatives.len == 0) return false;
@@ -2709,9 +2879,278 @@ const Emitter = struct {
         return true;
     }
 
+    fn canUseOptionIf(self: *const Emitter, ce: anytype) bool {
+        if (ce.subjects.len != 1) return false;
+        for (ce.arms) |arm| {
+            if (arm.guard != null) return false;
+            if (arm.alternatives.len == 0) return false;
+            for (arm.alternatives) |row| {
+                if (row.len != 1) return false;
+                if (!self.isSimpleSwitchPat(row[0])) return false;
+            }
+        }
+        return true;
+    }
+
+    fn evalSwitchInt(self: *const Emitter, pat: *const ast.Pattern) ?i128 {
+        if (pat.* != .literal) return null;
+        const lit = pat.literal;
+        if (lit.tok.tag != .int_literal) return null;
+        const parsed = int_range.parseIntLiteral(self.sourceOf(ast.Span.fromLoc(lit.tok.loc))) orelse return null;
+        if (!lit.negative) {
+            if (parsed.value > @as(u128, @intCast(std.math.maxInt(i128)))) return null;
+            return @intCast(parsed.value);
+        }
+        if (parsed.value == @as(u128, 1) << 127) return std.math.minInt(i128);
+        if (parsed.value > @as(u128, @intCast(std.math.maxInt(i128)))) return null;
+        return -@as(i128, @intCast(parsed.value));
+    }
+
+    const SwitchIntInterval = struct { lo: i128, hi: i128 };
+
+    fn collectSwitchIntervals(self: *const Emitter, pat: *const ast.Pattern, list: *std.ArrayList(SwitchIntInterval)) void {
+        switch (pat.*) {
+            .literal => {
+                if (self.evalSwitchInt(pat)) |v| {
+                    list.append(self.alloc, .{ .lo = v, .hi = v }) catch {};
+                }
+            },
+            .range => |rg| {
+                const lo_v = self.evalSwitchInt(rg.lo) orelse return;
+                const hi_v = self.evalSwitchInt(rg.hi) orelse return;
+                if (lo_v <= hi_v) {
+                    list.append(self.alloc, .{ .lo = lo_v, .hi = hi_v }) catch {};
+                }
+            },
+            .or_pat => |op| {
+                for (op.alternatives) |alt| self.collectSwitchIntervals(alt, list);
+            },
+            else => {},
+        }
+    }
+
+    fn zigIntSwitchComplete(self: *const Emitter, sub_ty: *const sema.Ty, arms: anytype) bool {
+        const full_dom: int_range.IntRange = switch (sub_ty.*) {
+            .int => |it| int_range.IntRange.ofType(it),
+            .int_range => |ir| int_range.IntRange.ofType(ir.synthesized),
+            else => return false,
+        };
+        if (full_dom != .bounded) return false;
+        const dom = full_dom.bounded;
+        var intervals: std.ArrayList(SwitchIntInterval) = .empty;
+        for (arms) |arm| {
+            for (arm.alternatives) |row| {
+                if (row.len == 1) {
+                    self.collectSwitchIntervals(row[0], &intervals);
+                }
+            }
+        }
+        std.mem.sort(SwitchIntInterval, intervals.items, {}, struct {
+            fn lessThan(_: void, a: SwitchIntInterval, b: SwitchIntInterval) bool {
+                if (a.lo != b.lo) return a.lo < b.lo;
+                return a.hi < b.hi;
+            }
+        }.lessThan);
+        var cur: i128 = dom.lo;
+        for (intervals.items) |iv| {
+            if (iv.hi < cur) continue;
+            if (iv.lo > cur) return false;
+            if (iv.hi >= dom.hi) return true;
+            cur = iv.hi + 1;
+        }
+        return false;
+    }
+
+    fn emitOptionCaseExpr(
+        self: *Emitter,
+        full_expr: *const ast.Expr,
+        ce: anytype,
+        inner_ty: *const sema.Ty,
+        sub_ty: *const sema.Ty,
+    ) Io.Writer.Error!void {
+        const res_ty = self.checked.exprType(full_expr);
+        const res_void = if (res_ty) |rt| isVoidTy(rt) else true;
+
+        var some_body: ?*const ast.Expr = null;
+        var some_bind: ?[]const u8 = null;
+        var some_whole_bind: ?[]const u8 = null;
+        var none_body: ?*const ast.Expr = null;
+        var none_whole_bind: ?[]const u8 = null;
+
+        for (ce.arms) |arm| {
+            for (arm.alternatives) |row| {
+                if (row.len != 1) continue;
+                var stack_buf: [16]*const ast.Pattern = undefined;
+                var stack_len: usize = 0;
+                if (row[0].* == .or_pat) {
+                    for (row[0].or_pat.alternatives) |alt| {
+                        if (stack_len < stack_buf.len) {
+                            stack_buf[stack_len] = alt;
+                            stack_len += 1;
+                        }
+                    }
+                } else {
+                    stack_buf[0] = row[0];
+                    stack_len = 1;
+                }
+                for (stack_buf[0..stack_len]) |p| {
+                    switch (p.*) {
+                        .wildcard => {
+                            if (some_body == null) some_body = arm.body;
+                            if (none_body == null) none_body = arm.body;
+                        },
+                        .ident => |id| {
+                            const vn = self.sourceOf(id.name);
+                            if (some_body == null) {
+                                some_body = arm.body;
+                                some_whole_bind = vn;
+                            }
+                            if (none_body == null) {
+                                none_body = arm.body;
+                                none_whole_bind = vn;
+                            }
+                        },
+                        .constructor => |c| {
+                            const vn = if (c.path.len > 0) self.sourceOf(c.path[c.path.len - 1]) else "";
+                            if (std.mem.eql(u8, vn, "Some")) {
+                                if (some_body == null) {
+                                    some_body = arm.body;
+                                    if (c.args.len > 0 and c.args[0].pattern.* == .ident) {
+                                        some_bind = self.sourceOf(c.args[0].pattern.ident.name);
+                                    }
+                                }
+                            } else if (std.mem.eql(u8, vn, "None")) {
+                                if (none_body == null) none_body = arm.body;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+
+        const opt_lbl = self.nextLabel();
+        if (res_void) {
+            try self.w.writeAll("{\n");
+        } else {
+            try self.w.print("blk_{d}: {{\n", .{opt_lbl});
+        }
+        self.indent += 1;
+        try self.writeIndent();
+        try self.w.print("const __opt_{d} = ", .{opt_lbl});
+        try self.emitExpr(ce.subjects[0]);
+        try self.w.writeAll(";\n");
+
+        try self.writeIndent();
+        const use_capture = some_bind != null and some_body != null and self.exprMentionsIdent(some_body.?, some_bind.?);
+        if (use_capture) {
+            try self.w.print("if (__opt_{d}) |", .{opt_lbl});
+            try self.emitIdent(some_bind.?);
+            try self.w.writeAll("| {\n");
+        } else {
+            try self.w.print("if (__opt_{d} != null) {{\n", .{opt_lbl});
+        }
+        self.indent += 1;
+        {
+            const sv = self.pushScopeVars();
+            defer self.popScopeVars(sv);
+            if (use_capture) {
+                self.bindScopeVar(some_bind.?, inner_ty, false);
+            }
+            if (some_whole_bind) |wb| {
+                try self.writeIndent();
+                try self.w.writeAll("const ");
+                try self.emitIdent(wb);
+                try self.w.print(" = __opt_{d};\n", .{opt_lbl});
+                self.bindScopeVar(wb, sub_ty, false);
+                if (some_body == null or !self.exprMentionsIdent(some_body.?, wb)) {
+                    try self.writeIndent();
+                    try self.w.writeAll("_ = ");
+                    try self.emitIdent(wb);
+                    try self.w.writeAll(";\n");
+                }
+            }
+            try self.writeIndent();
+            if (some_body) |sb| {
+                if (res_void) {
+                    if (self.isVoidExpr(sb)) {
+                        try self.emitExpr(sb);
+                        if (!self.isBlockLikeVoidExpr(sb)) try self.w.writeByte(';');
+                        try self.w.writeByte('\n');
+                    } else {
+                        try self.w.writeAll("_ = ");
+                        try self.emitExpr(sb);
+                        try self.w.writeAll(";\n");
+                    }
+                } else {
+                    try self.w.print("break :blk_{d} ", .{opt_lbl});
+                    if (res_ty) |rt| try self.emitCoercedExpr(sb, rt) else try self.emitExpr(sb);
+                    try self.w.writeAll(";\n");
+                }
+            } else {
+                try self.w.writeAll("unreachable;\n");
+            }
+        }
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.w.writeAll("} else {\n");
+        self.indent += 1;
+        {
+            const nsv = self.pushScopeVars();
+            defer self.popScopeVars(nsv);
+            if (none_whole_bind) |wb| {
+                try self.writeIndent();
+                try self.w.writeAll("const ");
+                try self.emitIdent(wb);
+                try self.w.print(" = __opt_{d};\n", .{opt_lbl});
+                self.bindScopeVar(wb, sub_ty, false);
+                if (none_body == null or !self.exprMentionsIdent(none_body.?, wb)) {
+                    try self.writeIndent();
+                    try self.w.writeAll("_ = ");
+                    try self.emitIdent(wb);
+                    try self.w.writeAll(";\n");
+                }
+            }
+            try self.writeIndent();
+            if (none_body) |nb| {
+                if (res_void) {
+                    if (self.isVoidExpr(nb)) {
+                        try self.emitExpr(nb);
+                        if (!self.isBlockLikeVoidExpr(nb)) try self.w.writeByte(';');
+                        try self.w.writeByte('\n');
+                    } else {
+                        try self.w.writeAll("_ = ");
+                        try self.emitExpr(nb);
+                        try self.w.writeAll(";\n");
+                    }
+                } else {
+                    try self.w.print("break :blk_{d} ", .{opt_lbl});
+                    if (res_ty) |rt| try self.emitCoercedExpr(nb, rt) else try self.emitExpr(nb);
+                    try self.w.writeAll(";\n");
+                }
+            } else {
+                try self.w.writeAll("unreachable;\n");
+            }
+        }
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.w.writeAll("}\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.w.writeByte('}');
+    }
+
     fn emitCaseExpr(self: *Emitter, full_expr: *const ast.Expr, ce: anytype) Io.Writer.Error!void {
         const res_ty = self.checked.exprType(full_expr);
         const res_void = if (res_ty) |rt| isVoidTy(rt) else true;
+
+        if (ce.subjects.len == 1) {
+            const sub_ty = self.checked.exprType(ce.subjects[0]);
+            if (sub_ty != null and sub_ty.?.* == .option and self.canUseOptionIf(ce)) {
+                try self.emitOptionCaseExpr(full_expr, ce, sub_ty.?.option, sub_ty.?);
+                return;
+            }
+        }
 
         if (self.canUseZigSwitch(ce)) {
             const sub_ty = self.checked.exprType(ce.subjects[0]);
@@ -2720,10 +3159,11 @@ const Emitter = struct {
                 &self.checked.adts[sub_ty.?.adt]
             else
                 null;
-            const is_adt_union = if (compact_adt == null and sub_ty != null and sub_ty.?.* == .adt)
+            const is_result_union = sub_ty != null and sub_ty.?.* == .result;
+            const is_adt_union = is_result_union or (if (compact_adt == null and sub_ty != null and sub_ty.?.* == .adt)
                 !isPureEnumADT(&self.checked.adts[sub_ty.?.adt])
             else
-                false;
+                false);
 
             var compact_lbl: usize = 0;
             if (compact_adt != null) {
@@ -2818,7 +3258,19 @@ const Emitter = struct {
                     if (!need_cap_block and bind_ident != null) {
                         const arm_sv = self.pushScopeVars();
                         defer self.popScopeVars(arm_sv);
-                        if (is_adt_union and pat0.* == .constructor) {
+                        if (is_result_union and pat0.* == .constructor) {
+                            const vn = if (pat0.constructor.path.len > 0)
+                                self.sourceOf(pat0.constructor.path[pat0.constructor.path.len - 1])
+                            else
+                                "";
+                            const payload_ty: ?*const sema.Ty = if (std.mem.eql(u8, vn, "Ok"))
+                                sub_ty.?.result.ok
+                            else if (std.mem.eql(u8, vn, "Err"))
+                                sub_ty.?.result.err
+                            else
+                                null;
+                            self.bindScopeVar(bind_ident.?, payload_ty, false);
+                        } else if (is_adt_union and pat0.* == .constructor) {
                             // Capture binding already bound in Zig arm.
                             self.bindScopeVar(bind_ident.?, null, false);
                         } else if (sub_ty) |st| {
@@ -2934,7 +3386,9 @@ const Emitter = struct {
                     try self.w.writeAll(",\n");
                 }
             }
-            if (!emitted_else and (sub_ty == null or (sub_ty.?.* != .adt and sub_ty.?.* != .bool))) {
+            if (!emitted_else and (sub_ty == null or
+                (sub_ty.?.* != .adt and sub_ty.?.* != .bool and sub_ty.?.* != .result and !self.zigIntSwitchComplete(sub_ty.?, ce.arms))))
+            {
                 try self.writeIndent();
                 try self.w.writeAll("else => unreachable,\n");
             }
@@ -3075,6 +3529,16 @@ const Emitter = struct {
                 try self.w.print(" and __subj_{d} {s} ", .{ subj_idx, if (rg.inclusive) "<=" else "<" });
                 try self.emitSwitchPattern(rg.hi, false);
                 try self.w.writeByte(')');
+            },
+            .constructor => |c| {
+                const vname = if (c.path.len > 0) self.sourceOf(c.path[c.path.len - 1]) else "";
+                if (std.mem.eql(u8, vname, "None")) {
+                    try self.w.print("(__subj_{d} == null)", .{subj_idx});
+                } else if (std.mem.eql(u8, vname, "Some")) {
+                    try self.w.print("(__subj_{d} != null)", .{subj_idx});
+                } else {
+                    try self.w.print("(__subj_{d} == .{s})", .{ subj_idx, vname });
+                }
             },
             .or_pat => |op| {
                 try self.w.writeByte('(');
@@ -3259,11 +3723,15 @@ const Emitter = struct {
                 break :blk std.mem.eql(u8, rn, name);
             }) or self.exprMutatesOrBorrowsIdent(u.operand, name),
             .binary => |b| blk: {
-                if (b.op == .pipe and b.right.* == .call and b.right.call.callee.* == .ident) {
-                    if (self.findCheckedFn(self.sourceOf(b.right.call.callee.ident))) |cf| {
-                        if (cf.param_types.len > 0 and isPointerType(cf.param_types[0])) {
-                            if (self.rootIdentOf(b.left)) |rn| {
-                                if (std.mem.eql(u8, rn, name)) break :blk true;
+                if (b.op == .pipe and b.right.* == .call) {
+                    const cn_opt = self.checked.resolvedCallName(b.right.call.callee) orelse
+                        if (b.right.call.callee.* == .ident) self.sourceOf(b.right.call.callee.ident) else null;
+                    if (cn_opt) |cn| {
+                        if (self.findCheckedFn(cn)) |cf| {
+                            if (cf.param_types.len > 0 and isPointerType(cf.param_types[0])) {
+                                if (self.rootIdentOf(b.left)) |rn| {
+                                    if (std.mem.eql(u8, rn, name)) break :blk true;
+                                }
                             }
                         }
                     }
@@ -3271,8 +3739,10 @@ const Emitter = struct {
                 break :blk self.exprMutatesOrBorrowsIdent(b.left, name) or self.exprMutatesOrBorrowsIdent(b.right, name);
             },
             .call => |c| blk: {
-                if (c.callee.* == .ident) {
-                    if (self.findCheckedFn(self.sourceOf(c.callee.ident))) |cf| {
+                const cn_opt = self.checked.resolvedCallName(c.callee) orelse
+                    if (c.callee.* == .ident) self.sourceOf(c.callee.ident) else null;
+                if (cn_opt) |cn| {
+                    if (self.findCheckedFn(cn)) |cf| {
                         for (c.args, 0..) |a, ai| {
                             if (ai < cf.param_types.len and isPointerType(cf.param_types[ai])) {
                                 if (self.rootIdentOf(a.value)) |rn| {

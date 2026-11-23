@@ -1,0 +1,47 @@
+// Multi-file Gleam-like modules & exhaustive pattern matching demo (Stage E)
+import math
+import math.{clamp}
+import geometry/vec2 as v2
+
+fn classify_hp(hp: Int(0..=100)) -> u8 {
+  case hp {
+    0 -> 0
+    1..=49 -> 1
+    50..=100 -> 2
+  }
+}
+
+fn unwrap_score(opt: Option(i32)) -> i32 {
+  case opt {
+    Some(v) -> v
+    None -> 0
+  }
+}
+
+fn eval_result(res: Result(i32, i32)) -> i32 {
+  case res {
+    Ok(val) -> val
+    Err(code) -> 0 -% code
+  }
+}
+
+fn describe_flag(ok: bool) -> String {
+  case ok {
+    true -> "valid"
+    false -> "invalid"
+  }
+}
+
+fn main() {
+  let p = v2.Vec2 { x: 3, y: 4 }
+  let q = v2.Vec2 { x: 2, y: 5 }
+  let dp = v2.dot(p, q)
+  let clamped = clamp(dp +% math.SCALE, 0, 30)
+  let cs = v2.clamped_sum(p, 0, 10)
+  let capped = math.cap_score(42u32, 25u32)
+  let bucket = classify_hp(75)
+  let opt_v = unwrap_score(Some(clamped))
+  let res_v = eval_result(Ok(dp))
+  let flag_s = describe_flag(math.abs_diff(10u32, 4u32) == 6u32)
+  println("dot=", dp, " clamped=", opt_v, " cs=", cs, " capped=", capped, " bucket=", bucket, " res=", res_v, " flag=", flag_s)
+}

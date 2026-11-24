@@ -1,0 +1,3 @@
+[submodule "tree-sitter-aethel"]
+	path = tree-sitter-aethel
+	url = https://github.com/AleryBerry/tree-sitter-aethel.git

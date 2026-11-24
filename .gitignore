@@ -1,7 +1,6 @@
 aethel-lean/.lake/
 aethel-zig/.zig-cache/
 aethel-zig/zig-out/
-/tree-sitter-aethel/src/parser.c
 .aethel-build/
 /.agents/
 /scratch/

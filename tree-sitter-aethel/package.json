@@ -1,6 +1,0 @@
-{
-  "name": "tree-sitter-aethel",
-  "version": "0.1.0",
-  "description": "Tree-sitter grammar for the Aethel programming language",
-  "main": "grammar.js"
-}

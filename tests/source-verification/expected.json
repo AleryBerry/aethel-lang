@@ -1,0 +1,20 @@
+{
+  "direct_store_then_read.aethel": 72,
+  "duplicate_field.aethel": "syntax",
+  "exclusive_view_blocks_direct_read.aethel": "resourceConflict",
+  "exclusive_view_blocks_overlapping_reservation.aethel": "resourceConflict",
+  "exclusive_views_on_disjoint_fields.aethel": 23,
+  "initializers_by_field.aethel": 23,
+  "missing_field.aethel": "unknownField",
+  "missing_initializer.aethel": "syntax",
+  "out_of_range_literal.aethel": "syntax",
+  "release_restores_write_authority.aethel": 88,
+  "released_view_cannot_be_read.aethel": "unknownView",
+  "shadowed_view_binding.aethel": "duplicateView",
+  "shared_view_allows_sibling_write.aethel": 29,
+  "shared_view_blocks_earlier_write.aethel": "resourceConflict",
+  "shared_views_overlap.aethel": 17,
+  "unknown_operation_after_valid_store.aethel": "syntax",
+  "unknown_record_root.aethel": "unknownField",
+  "view_names_can_be_reused.aethel": 17
+}

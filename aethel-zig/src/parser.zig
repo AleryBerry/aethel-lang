@@ -307,6 +307,7 @@ const Parser = struct {
             .soa => .soa,
             .auto => .auto,
             .@"packed" => .@"packed",
+            .flat => .flat,
             .aosoa => blk: {
                 var tile: ?*const ast.Expr = null;
                 if (self.match(.l_paren)) |_| {
@@ -367,7 +368,7 @@ const Parser = struct {
                 };
             },
             .kw_fn => {
-                const kind = try self.parseFnDecl();
+                const kind = try self.parseFnDecl(attrs);
                 return ast.Decl{
                     .span = Span.merge(start_span, self.lastConsumedSpan(head)),
                     .doc_comments = docs,
@@ -375,6 +376,30 @@ const Parser = struct {
                     .is_pub = is_pub,
                     .kind = kind,
                 };
+            },
+            .ident => {
+                if (self.atContextual(.trait)) {
+                    const kind = try self.parseTraitDecl();
+                    return ast.Decl{
+                        .span = Span.merge(start_span, self.lastConsumedSpan(head)),
+                        .doc_comments = docs,
+                        .attrs = attrs,
+                        .is_pub = is_pub,
+                        .kind = kind,
+                    };
+                }
+                if (self.atContextual(.default) or self.atContextual(.instance)) {
+                    const kind = try self.parseInstanceDecl(attrs);
+                    return ast.Decl{
+                        .span = Span.merge(start_span, self.lastConsumedSpan(head)),
+                        .doc_comments = docs,
+                        .attrs = attrs,
+                        .is_pub = is_pub,
+                        .kind = kind,
+                    };
+                }
+                self.reportError(.expected_decl, Span.fromLoc(head.loc), "expected top-level declaration ('import', 'type', 'opaque', 'trait', 'instance', 'fn', 'const', 'law', or 'extern')");
+                return null;
             },
             .kw_const => {
                 const kind = try self.parseConstDecl();
@@ -407,10 +432,17 @@ const Parser = struct {
                 };
             },
             else => {
-                self.reportError(.expected_decl, Span.fromLoc(head.loc), "expected top-level declaration ('import', 'type', 'opaque', 'fn', 'const', 'law', or 'extern')");
+                self.reportError(.expected_decl, Span.fromLoc(head.loc), "expected top-level declaration ('import', 'type', 'opaque', 'trait', 'instance', 'fn', 'const', 'law', or 'extern')");
                 return null;
             },
         }
+    }
+
+    fn hasExternalAttr(self: *const Parser, attrs: []const ast.Attribute) bool {
+        for (attrs) |a| {
+            if (std.mem.eql(u8, a.name.slice(self.source), "external")) return true;
+        }
+        return false;
     }
 
     fn lastConsumedSpan(self: *const Parser, fallback: Token) Span {
@@ -482,6 +514,12 @@ const Parser = struct {
             _ = self.expect(.r_paren, "expected ')' after type parameters");
         }
 
+        var constraints: []const ast.TraitConstraint = &.{};
+        if (self.atContextual(.with)) {
+            _ = self.advance();
+            constraints = try self.parseTraitConstraintList();
+        }
+
         var body: ast.TypeBody = .empty;
         if (self.match(.eq) != null) {
             body = .{ .alias = try self.parseType() };
@@ -493,6 +531,7 @@ const Parser = struct {
             .is_opaque = is_opaque,
             .name = name,
             .type_params = try type_params.toOwnedSlice(self.alloc),
+            .constraints = constraints,
             .body = body,
         } };
     }
@@ -619,7 +658,7 @@ const Parser = struct {
         return false;
     }
 
-    fn parseFnDecl(self: *Parser) std.mem.Allocator.Error!ast.Decl.Kind {
+    fn parseFnDecl(self: *Parser, attrs: []const ast.Attribute) std.mem.Allocator.Error!ast.Decl.Kind {
         _ = self.advance(); // 'fn'
         const name = self.parseAnyIdentSpan("expected function name");
         const params = try self.parseParamList(true);
@@ -628,9 +667,28 @@ const Parser = struct {
             ret = try self.parseType();
         }
         var decreases: ?*const ast.Expr = null;
-        if (self.atContextual(.decreases)) {
-            _ = self.advance();
-            decreases = try self.parseExprPrec(1, false);
+        var constraints: std.ArrayList(ast.TraitConstraint) = .empty;
+        while (self.atContextual(.decreases) or self.atContextual(.with)) {
+            if (self.atContextual(.decreases)) {
+                _ = self.advance();
+                decreases = try self.parseExprPrec(1, false);
+            } else {
+                _ = self.advance(); // 'with'
+                const parsed = try self.parseTraitConstraintList();
+                try constraints.appendSlice(self.alloc, parsed);
+            }
+        }
+        if (self.hasExternalAttr(attrs) and !self.at(.l_brace)) {
+            _ = self.match(.semicolon);
+            return .{ .fn_decl = .{
+                .name = name,
+                .params = params,
+                .ret = ret,
+                .decreases = decreases,
+                .constraints = try constraints.toOwnedSlice(self.alloc),
+                .has_body = false,
+                .body = .{ .span = name, .attrs = &.{}, .stmts = &.{}, .tail = null },
+            } };
         }
         const body = try self.parseBlock();
         return .{ .fn_decl = .{
@@ -638,7 +696,215 @@ const Parser = struct {
             .params = params,
             .ret = ret,
             .decreases = decreases,
+            .constraints = try constraints.toOwnedSlice(self.alloc),
+            .has_body = true,
             .body = body,
+        } };
+    }
+
+    fn parseTraitConstraint(self: *Parser) std.mem.Allocator.Error!ast.TraitConstraint {
+        const first = self.parseAnyIdentSpan("expected trait name");
+        var path: std.ArrayList(Span) = .empty;
+        try path.append(self.alloc, first);
+        var end_span = first;
+        while (self.match(.dot) != null) {
+            const seg = self.parseAnyIdentSpan("expected trait path segment after '.'");
+            try path.append(self.alloc, seg);
+            end_span = seg;
+        }
+        var args: std.ArrayList(*const ast.TypeExpr) = .empty;
+        if (self.match(.l_paren) != null) {
+            while (!self.at(.r_paren) and !self.at(.eof)) {
+                const iter_start = self.cursor;
+                try args.append(self.alloc, try self.parseType());
+                if (self.match(.comma) == null) break;
+                if (self.cursor == iter_start) break;
+            }
+            const close = self.expect(.r_paren, "expected ')' after trait type arguments");
+            if (close) |c| end_span = Span.fromLoc(c.loc);
+        }
+        return .{
+            .span = Span.merge(first, end_span),
+            .path = try path.toOwnedSlice(self.alloc),
+            .args = try args.toOwnedSlice(self.alloc),
+        };
+    }
+
+    fn parseTraitConstraintList(self: *Parser) std.mem.Allocator.Error![]const ast.TraitConstraint {
+        var list: std.ArrayList(ast.TraitConstraint) = .empty;
+        while (!self.at(.l_brace) and !self.at(.eof) and !self.at(.semicolon)) {
+            const iter_start = self.cursor;
+            try list.append(self.alloc, try self.parseTraitConstraint());
+            if (self.match(.comma) == null) break;
+            if (self.cursor == iter_start) break;
+        }
+        return try list.toOwnedSlice(self.alloc);
+    }
+
+    fn parseTraitDecl(self: *Parser) std.mem.Allocator.Error!ast.Decl.Kind {
+        _ = self.advance(); // 'trait'
+        const name = self.parseAnyIdentSpan("expected trait name");
+
+        var params: std.ArrayList(ast.TraitParam) = .empty;
+        if (self.match(.l_paren) != null) {
+            while (!self.at(.r_paren) and !self.at(.eof)) {
+                const iter_start = self.cursor;
+                const pname = self.parseAnyIdentSpan("expected trait parameter name");
+                var end_span = pname;
+                var arity: u8 = 0;
+                if (self.match(.l_paren) != null) {
+                    while (!self.at(.r_paren) and !self.at(.eof)) {
+                        const a_start = self.cursor;
+                        _ = self.expect(.underscore, "expected '_' in higher-kinded trait parameter (e.g. 'f(_)')");
+                        arity += 1;
+                        if (self.match(.comma) == null) break;
+                        if (self.cursor == a_start) break;
+                    }
+                    const close_p = self.expect(.r_paren, "expected ')' closing trait parameter arity");
+                    if (close_p) |cp| end_span = Span.fromLoc(cp.loc);
+                }
+                try params.append(self.alloc, .{
+                    .span = Span.merge(pname, end_span),
+                    .name = pname,
+                    .arity = arity,
+                });
+                if (self.match(.comma) == null) break;
+                if (self.cursor == iter_start) break;
+            }
+            _ = self.expect(.r_paren, "expected ')' after trait parameters");
+        }
+
+        var supers: []const ast.TraitConstraint = &.{};
+        if (self.match(.lt_eq) != null) {
+            supers = try self.parseTraitConstraintList();
+        }
+
+        _ = self.expect(.l_brace, "expected '{' starting trait body");
+        var methods: std.ArrayList(ast.TraitMethodSig) = .empty;
+        var laws: std.ArrayList(ast.TraitLaw) = .empty;
+        while (!self.at(.r_brace) and !self.at(.eof)) {
+            const iter_start = self.cursor;
+            const m_docs = try self.collectDocComments();
+            _ = try self.parseAttributes();
+            if (self.match(.kw_fn)) |fn_tok| {
+                const mname = self.parseAnyIdentSpan("expected trait method name");
+                const mparams = try self.parseParamList(true);
+                var mret: ?*const ast.TypeExpr = null;
+                if (self.match(.arrow) != null) {
+                    mret = try self.parseType();
+                }
+                const end_span = if (mret) |r| r.getSpan() else self.lastConsumedSpan(fn_tok);
+                try methods.append(self.alloc, .{
+                    .span = Span.merge(Span.fromLoc(fn_tok.loc), end_span),
+                    .doc_comments = m_docs,
+                    .name = mname,
+                    .params = mparams,
+                    .ret = mret,
+                });
+                _ = self.match(.semicolon);
+                _ = self.match(.comma);
+            } else if (self.match(.kw_law)) |law_tok| {
+                const lname = self.parseAnyIdentSpan("expected trait law name");
+                const lparams = try self.parseParamList(true);
+                const clauses = try self.parseLawClauses();
+                try laws.append(self.alloc, .{
+                    .span = Span.merge(Span.fromLoc(law_tok.loc), self.lastConsumedSpan(law_tok)),
+                    .name = lname,
+                    .params = lparams,
+                    .clauses = clauses,
+                });
+                _ = self.match(.semicolon);
+                _ = self.match(.comma);
+            } else {
+                const bad = self.peek();
+                self.reportError(.expected_decl, Span.fromLoc(bad.loc), "expected 'fn' method signature or 'law' inside trait body");
+                if (!self.at(.r_brace) and !self.at(.eof)) _ = self.advance();
+            }
+            if (self.cursor == iter_start and !self.at(.eof)) _ = self.advance();
+        }
+        _ = self.expect(.r_brace, "expected '}' closing trait body");
+
+        return .{ .trait_decl = .{
+            .name = name,
+            .params = try params.toOwnedSlice(self.alloc),
+            .supers = supers,
+            .methods = try methods.toOwnedSlice(self.alloc),
+            .laws = try laws.toOwnedSlice(self.alloc),
+        } };
+    }
+
+    fn parseInstanceDecl(self: *Parser, attrs: []const ast.Attribute) std.mem.Allocator.Error!ast.Decl.Kind {
+        var is_default = false;
+        if (self.atContextual(.default)) {
+            is_default = true;
+            _ = self.advance();
+            if (!self.atContextual(.instance)) {
+                const tok = self.peek();
+                self.reportError(.expected_decl, Span.fromLoc(tok.loc), "expected 'instance' after 'default'");
+            } else {
+                _ = self.advance();
+            }
+        } else {
+            _ = self.advance(); // 'instance'
+        }
+
+        var inst_name: ?Span = null;
+        if ((self.at(.ident) or self.at(.upper_ident)) and self.peek2().tag == .colon) {
+            inst_name = Span.fromLoc(self.advance().loc);
+            _ = self.advance(); // ':'
+        }
+
+        const trait_ref = try self.parseTraitConstraint();
+        var constraints: []const ast.TraitConstraint = &.{};
+        if (self.atContextual(.with)) {
+            _ = self.advance();
+            constraints = try self.parseTraitConstraintList();
+        }
+
+        var methods: std.ArrayList(ast.InstanceMethod) = .empty;
+        if (self.match(.l_brace) != null) {
+            while (!self.at(.r_brace) and !self.at(.eof)) {
+                const iter_start = self.cursor;
+                _ = try self.collectDocComments();
+                _ = try self.parseAttributes();
+                if (self.match(.kw_fn)) |fn_tok| {
+                    const mname = self.parseAnyIdentSpan("expected instance method name");
+                    const mparams = try self.parseParamList(true);
+                    var mret: ?*const ast.TypeExpr = null;
+                    if (self.match(.arrow) != null) {
+                        mret = try self.parseType();
+                    }
+                    const mbody = try self.parseBlock();
+                    try methods.append(self.alloc, .{
+                        .span = Span.merge(Span.fromLoc(fn_tok.loc), mbody.span),
+                        .name = mname,
+                        .params = mparams,
+                        .ret = mret,
+                        .body = mbody,
+                    });
+                    _ = self.match(.semicolon);
+                    _ = self.match(.comma);
+                } else {
+                    const bad = self.peek();
+                    self.reportError(.expected_decl, Span.fromLoc(bad.loc), "expected 'fn' method definition inside instance body");
+                    if (!self.at(.r_brace) and !self.at(.eof)) _ = self.advance();
+                }
+                if (self.cursor == iter_start and !self.at(.eof)) _ = self.advance();
+            }
+            _ = self.expect(.r_brace, "expected '}' closing instance body");
+        } else {
+            if (!self.hasExternalAttr(attrs)) {
+                self.reportError(.expected_token, Span.fromLoc(self.peek().loc), "expected '{' starting instance body (or '@external(rust)' attribute)");
+            }
+            _ = self.match(.semicolon);
+        }
+
+        return .{ .instance_decl = .{
+            .is_default = is_default,
+            .name = inst_name,
+            .trait_ref = trait_ref,
+            .constraints = constraints,
+            .methods = try methods.toOwnedSlice(self.alloc),
         } };
     }
 
@@ -719,6 +985,16 @@ const Parser = struct {
         _ = self.advance(); // 'law'
         const name = self.parseAnyIdentSpan("expected law name");
         const params = try self.parseParamList(true);
+        const clauses = try self.parseLawClauses();
+
+        return .{ .law_decl = .{
+            .name = name,
+            .params = params,
+            .clauses = clauses,
+        } };
+    }
+
+    fn parseLawClauses(self: *Parser) std.mem.Allocator.Error![]const ast.LawClause {
         _ = self.expect(.l_brace, "expected '{' before law clauses");
 
         var clauses: std.ArrayList(ast.LawClause) = .empty;
@@ -773,12 +1049,7 @@ const Parser = struct {
             }
         }
         _ = self.expect(.r_brace, "expected '}' closing law block");
-
-        return .{ .law_decl = .{
-            .name = name,
-            .params = params,
-            .clauses = try clauses.toOwnedSlice(self.alloc),
-        } };
+        return try clauses.toOwnedSlice(self.alloc);
     }
 
     fn parseExternDecl(self: *Parser) std.mem.Allocator.Error!ast.Decl.Kind {
@@ -846,6 +1117,15 @@ const Parser = struct {
             .params = params,
             .ret = ret,
         };
+    }
+
+    fn parseDottedIdentPath(self: *Parser) std.mem.Allocator.Error![]const Span {
+        var segs: std.ArrayList(Span) = .empty;
+        try segs.append(self.alloc, self.parseAnyIdentSpan("expected instance identifier after 'using'"));
+        while (self.match(.dot) != null) {
+            try segs.append(self.alloc, self.parseAnyIdentSpan("expected identifier segment after '.'"));
+        }
+        return try segs.toOwnedSlice(self.alloc);
     }
 
     fn parseFieldPath(self: *Parser) std.mem.Allocator.Error!ast.FieldPath {
@@ -1583,7 +1863,7 @@ const Parser = struct {
 
         while (true) {
             const cur = self.peek();
-            // Cast operator (`expr as Type`) sits at precedence 12 (tighter than `*`, looser than unary `-`).
+            // Cast operator (`expr as Type`) and instance selector (`expr using inst`) sit at precedence 12.
             if (cur.tag == .kw_as and 12 >= min_prec) {
                 _ = self.advance();
                 const ty = try self.parseType();
@@ -1591,6 +1871,46 @@ const Parser = struct {
                     .span = Span.merge(lhs.getSpan(), ty.getSpan()),
                     .expr = lhs,
                     .ty = ty,
+                } });
+                continue;
+            }
+            if (self.atContextual(.using) and 12 >= min_prec and !self.hasNewlineBetween(lhs.getSpan().end, cur.loc.start)) {
+                const using_tok = self.advance();
+                var insts: std.ArrayList([]const Span) = .empty;
+                var end_span = Span.fromLoc(using_tok.loc);
+                if (self.at(.dot) and self.peek2().tag == .l_brace) {
+                    _ = self.advance();
+                    _ = self.advance();
+                    while (!self.at(.r_brace) and !self.at(.eof)) {
+                        const iter_start = self.cursor;
+                        const p = try self.parseDottedIdentPath();
+                        if (p.len > 0) end_span = p[p.len - 1];
+                        try insts.append(self.alloc, p);
+                        if (self.match(.comma) == null) break;
+                        if (self.cursor == iter_start) break;
+                    }
+                    const close = self.expect(.r_brace, "expected '}' closing 'using' instance list");
+                    if (close) |c| end_span = Span.fromLoc(c.loc);
+                } else if (self.match(.l_brace) != null) {
+                    while (!self.at(.r_brace) and !self.at(.eof)) {
+                        const iter_start = self.cursor;
+                        const p = try self.parseDottedIdentPath();
+                        if (p.len > 0) end_span = p[p.len - 1];
+                        try insts.append(self.alloc, p);
+                        if (self.match(.comma) == null) break;
+                        if (self.cursor == iter_start) break;
+                    }
+                    const close = self.expect(.r_brace, "expected '}' closing 'using' instance list");
+                    if (close) |c| end_span = Span.fromLoc(c.loc);
+                } else {
+                    const p = try self.parseDottedIdentPath();
+                    if (p.len > 0) end_span = p[p.len - 1];
+                    try insts.append(self.alloc, p);
+                }
+                lhs = try self.allocExpr(.{ .using_expr = .{
+                    .span = Span.merge(lhs.getSpan(), end_span),
+                    .target = lhs,
+                    .instances = try insts.toOwnedSlice(self.alloc),
                 } });
                 continue;
             }

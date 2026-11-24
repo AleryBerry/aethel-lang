@@ -1,0 +1,18 @@
+//// SwissTable-style SoA hash map (`Map(K, V)`), zero allocator plumbing.
+////
+//// Physical representation separates 64B-aligned 1-byte `ctrl` (`h2` fingerprint)
+//// slots from dense `keys` and `vals` columns, capping load factor at 7/8
+//// (`used * 8 <= cap * 7`), verified in `Aethel.StdContainers`.
+////
+//// Intrinsics exposed via `import std/map [as map]`:
+////   map.new() / map.with_capacity(cap) / map.len(m) / map.is_empty(m)
+////   map.insert(m, k, v) / map.put(m, k, v) / map.get(m, k)
+////   map.contains(m, k) / map.remove(m, k) / map.clear(m)
+
+pub fn load_factor_numerator() -> u32 {
+  7u32
+}
+
+pub fn load_factor_denominator() -> u32 {
+  8u32
+}

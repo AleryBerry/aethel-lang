@@ -63,6 +63,42 @@ pub const LayoutSpec = union(enum) {
     aosoa: ?*const Expr,
     auto,
     @"packed",
+    flat,
+};
+
+pub const TraitParam = struct {
+    span: Span,
+    name: Span,
+    arity: u8,
+};
+
+pub const TraitConstraint = struct {
+    span: Span,
+    path: []const Span,
+    args: []const *const TypeExpr,
+};
+
+pub const TraitMethodSig = struct {
+    span: Span,
+    doc_comments: []const Span,
+    name: Span,
+    params: []const Param,
+    ret: ?*const TypeExpr,
+};
+
+pub const TraitLaw = struct {
+    span: Span,
+    name: Span,
+    params: []const Param,
+    clauses: []const LawClause,
+};
+
+pub const InstanceMethod = struct {
+    span: Span,
+    name: Span,
+    params: []const Param,
+    ret: ?*const TypeExpr,
+    body: Block,
 };
 
 pub const Attribute = struct {
@@ -425,6 +461,11 @@ pub const Expr = union(enum) {
         explicit_join: bool,
         is_parallel: bool = false,
     },
+    using_expr: struct {
+        span: Span,
+        target: *const Expr,
+        instances: []const []const Span,
+    },
     todo_expr: struct {
         span: Span,
         message: ?*const Expr,
@@ -460,6 +501,7 @@ pub const Expr = union(enum) {
             .lambda => |v| v.span,
             .view_expr => |v| v.span,
             .fork_expr => |v| v.span,
+            .using_expr => |v| v.span,
             .todo_expr => |v| v.span,
             .panic_expr => |v| v.span,
             .err => |s| s,
@@ -606,6 +648,7 @@ pub const Decl = struct {
             is_opaque: bool,
             name: Span,
             type_params: []const Span,
+            constraints: []const TraitConstraint = &.{},
             body: TypeBody,
         },
         fn_decl: struct {
@@ -613,7 +656,23 @@ pub const Decl = struct {
             params: []const Param,
             ret: ?*const TypeExpr,
             decreases: ?*const Expr,
+            constraints: []const TraitConstraint = &.{},
+            has_body: bool = true,
             body: Block,
+        },
+        trait_decl: struct {
+            name: Span,
+            params: []const TraitParam,
+            supers: []const TraitConstraint,
+            methods: []const TraitMethodSig,
+            laws: []const TraitLaw,
+        },
+        instance_decl: struct {
+            is_default: bool,
+            name: ?Span,
+            trait_ref: TraitConstraint,
+            constraints: []const TraitConstraint,
+            methods: []const InstanceMethod,
         },
         const_decl: struct {
             name: Span,
@@ -699,6 +758,7 @@ fn formatAttributes(source: []const u8, attrs: []const Attribute, writer: *Io.Wr
                     },
                     .auto => try writer.writeAll("auto"),
                     .@"packed" => try writer.writeAll("packed"),
+                    .flat => try writer.writeAll("flat"),
                 }
             },
             .args => |args| {
@@ -816,9 +876,54 @@ fn formatDecl(source: []const u8, decl: *const Decl, depth: usize, writer: *Io.W
                 try formatExpr(source, dec, depth + 1, writer);
                 try writer.writeByte(')');
             }
-            try writer.writeByte('\n');
-            try writeIndent(writer, depth + 1);
-            try formatBlock(source, &f.body, depth + 1, writer);
+            if (f.constraints.len > 0) {
+                try writer.writeAll(" (with");
+                for (f.constraints) |c| {
+                    try writer.writeByte(' ');
+                    try formatPath(source, c.path, ".", writer);
+                }
+                try writer.writeByte(')');
+            }
+            if (f.has_body) {
+                try writer.writeByte('\n');
+                try writeIndent(writer, depth + 1);
+                try formatBlock(source, &f.body, depth + 1, writer);
+            } else {
+                try writer.writeAll(" (external_decl)");
+            }
+            try writer.writeByte(')');
+        },
+        .trait_decl => |tr| {
+            try writer.writeAll("(trait");
+            if (decl.is_pub) try writer.writeAll(" pub");
+            try writer.print(" {s}", .{tr.name.slice(source)});
+            for (tr.methods) |m| {
+                try writer.writeByte('\n');
+                try writeIndent(writer, depth + 1);
+                try writer.print("(method {s} ", .{m.name.slice(source)});
+                try formatParams(source, m.params, writer);
+                if (m.ret) |ret| {
+                    try writer.writeAll(" -> ");
+                    try formatType(source, ret, writer);
+                }
+                try writer.writeByte(')');
+            }
+            try writer.writeByte(')');
+        },
+        .instance_decl => |inst| {
+            try writer.writeAll("(instance");
+            if (decl.is_pub) try writer.writeAll(" pub");
+            if (inst.is_default) try writer.writeAll(" default");
+            if (inst.name) |nm| try writer.print(" {s}:", .{nm.slice(source)});
+            try writer.writeByte(' ');
+            try formatPath(source, inst.trait_ref.path, ".", writer);
+            for (inst.methods) |m| {
+                try writer.writeByte('\n');
+                try writeIndent(writer, depth + 1);
+                try writer.print("(method {s} ", .{m.name.slice(source)});
+                try formatParams(source, m.params, writer);
+                try writer.writeByte(')');
+            }
             try writer.writeByte(')');
         },
         .const_decl => |c| {
@@ -1282,6 +1387,15 @@ pub fn formatExpr(source: []const u8, expr: *const Expr, depth: usize, writer: *
             for (fk.branches) |*br| {
                 try writer.writeByte(' ');
                 try formatBlock(source, br, depth, writer);
+            }
+            try writer.writeByte(')');
+        },
+        .using_expr => |ue| {
+            try writer.writeAll("(using ");
+            try formatExpr(source, ue.target, depth, writer);
+            for (ue.instances) |inst_path| {
+                try writer.writeByte(' ');
+                try formatPath(source, inst_path, ".", writer);
             }
             try writer.writeByte(')');
         },

@@ -1,0 +1,13 @@
+//// Double-ended ring-buffer queue (`Deque(T)`), zero allocator plumbing.
+////
+//// Uses power-of-two capacity modular indexing `(head + idx) % cap` verified
+//// injective in `Aethel.StdContainers` and automatic scope-exit drop.
+////
+//// Intrinsics exposed via `import std/deque [as deque]`:
+////   deque.new() / deque.with_capacity(cap) / deque.len(d) / deque.is_empty(d)
+////   deque.push_back(d, x) / deque.push_front(d, x)
+////   deque.pop_front(d) / deque.pop_back(d) / deque.get(d, i) / deque.clear(d)
+
+pub fn empty_count() -> u64 {
+  0u64
+}

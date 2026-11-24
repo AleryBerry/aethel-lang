@@ -49,3 +49,36 @@
 **Aethel adaptation:** define Aethel's permissions and access footprints directly; prove the checker respects them. Start with scoped concurrency and no raw-pointer escape hatch. Add optimization claims only with their own simulation or stated backend trust.
 
 **Counterexamples:** a 64-byte-aligned base with a 4-byte-offset access incorrectly marked 64-aligned; vector FMA replacing strict separate arithmetic; a parent writing storage delegated to a running child.
+
+## Rust Borrow Checker (rustc_borrowck)
+
+**Extract:** lockstep projection conflict monoid (`Overlap`: `Arbitrary`, `EqualOrDisjoint`, `Disjoint`), `PlaceConflictBias` (`Overlap` vs `NoOverlap`), non-overlapping struct fields and `downcast` enum variants, disjoint constant-index/subslice ranges, and two-phase borrows (`MutBorrowKind::TwoPhaseBorrow`).
+
+**Assumptions:** `rustc_borrowck` compares syntactic MIR `Place`s conservatively under `PlaceConflictBias::Overlap` for runtime `ProjectionElem::Index`, and lacks first-class inter-procedural SoA field splitting over a monolithic array without `unsafe` raw pointer splitting.
+
+**Aethel adaptation:** embed every non-conflicting `rustc_borrowck` addressable place pair into Aethel's compatible byte footprints (`RustBorrowBridge`), refine `TwoPhaseBorrow` to `BorrowPerm`, strictly subsume dynamic index and Bevy-style split SoA column disjointness via `AffineIndex` and `MultiPathViews`, and safely lend verified disjoint views/slices to Rust FFI while rejecting sub-byte bit-packed references.
+
+**Counterexamples:** two distinct runtime indices `a[i]` and `a[j]` under `i < j` are treated as `EqualOrDisjoint` (rejected) by `rustc_borrowck` under `Overlap` bias; borrowing a sub-byte bit-packed field directly as `&T`/`&mut T` breaks Rust pointer alignment and byte-granularity guarantees.
+
+## Rust Trait Solver, Orphan Rule, and ABI (rustc_next_trait_solver & rustc_abi)
+
+**Extract:** `orphan_check_trait_ref` (`InCrate::Local` vs `InCrate::Remote`, fundamental wrappers `Box`/`&`/`&mut`, uncovered type-parameter ordering), `overlapping_trait_impls` coherence, `#[repr(C)]` deterministic declaration-order layout (`ReprOptions` / `FieldsShape::Arbitrary`), and unstable `repr(Rust)` (`field_shuffle_seed`) / `dyn Trait` vtables (`VtblEntry`).
+
+**Assumptions:** Rust enforces global coherence via the orphan rule (blocking downstream retroactive composition of upstream traits on upstream types) and does not check equational trait laws; `repr(Rust)` structs and `dyn Trait` fat pointers have no stable cross-compiler ABI.
+
+**Aethel adaptation:** prove link-safety of Rust orphan-checked ground impls and coherent 1-to-1 migration into Aethel `default instance`s (`RustTraitBridge`); solve Haskell's typeclass trilemma and Rust's orphan limitation in Aethel via open-universe named `instance`s, call-site `using` overrides, polynomial structural lifting (`no newtype` needed), `InstanceId`-branded container coherence, and Lean-checked `trait` laws (`CategoricalTraits`). Cross the FFI boundary strictly from Rust into Aethel using deterministic flat C-ABI structs, Bevy-style split SoA queries, and 64B-aligned AoSoA tile slices (`RustComplexABI`), recording foreign Rust trait contracts honestly without project axioms.
+
+**Counterexamples:** an app crate implementing an upstream trait (`ToJson`) for an upstream type (`Foo`) is rejected by `orphan_check_trait_ref`; an unlawful `Monoid` impl (`empty = 1, combine = +`) passes Rust type-checking despite violating identity laws; passing a `repr(Rust)` or bit-packed container directly as `&[AoS]` causes field/stride mismatch across compilers.
+
+## Segmented AoSoA growth
+
+Rust's typed compiler arena keeps backing chunks separately allocated and grows by adding a chunk descriptor. Aethel's experiment uses fixed-width chunks with one column per field so a row has a stable allocation identity and a simple tile index. Each append resolves its destination and checks exclusive byte access. The Lean proof tracks which bytes and views an append preserves. The benchmark compares this design with geometric growth of a contiguous tiled buffer. A Rust slice over a tile remains subject to the single-allocation rule. [Pinned Rust arena](https://github.com/rust-lang/rust/blob/c884ecfbabb04b04fa5054dafc67ec258ecde745/compiler/rustc_arena/src/lib.rs) · [Experiment](segmented-aosoa/README.md)
+
+## Compiler refactor candidates from the inspection
+
+- The inspected standard-library draft held identical source text for eleven modules in `std/` and the Zig embedding table. Build-time embedding from the source files could preserve standalone import behavior and remove the duplicated module bodies.
+- The analyzer and code generator had separate identifier walkers. Their treatment of `using` differed in the inspected snapshot. A shared traversal for syntax with caller-specific binding policies would let borrow liveness and code emission use the same coverage of expression forms. Exercise shadowing and nested `using` before consolidation.
+
+## Source-to-MIR correspondence
+
+The Phase G working snapshot examined during the source verification work emitted an empty `main` MIR body for `missing_field.aethel`. Its terminal field lookup returned an error type without a diagnostic. The MIR validator established the properties of the supplied empty body. The reference checker resolves the return path before lowering and rejects the same input. The next verification expansion needs to derive effects, guards, and reservation footprints from each actual operation and link every checked function body to compiler input. [Source fixture](../tests/source-verification/missing_field.aethel) · [MIR emitter](../aethel-zig/src/mir.zig)

@@ -15,11 +15,16 @@ import Aethel.Phase2Tests
 import Aethel.Phase3Tests
 import Aethel.Phase4Tests
 import Aethel.Phase5And6Tests
+import Aethel.Phase7Tests
+import Aethel.Phase8Tests
 import Aethel.IntInferenceTests
 import Aethel.LitmusCorpus
+import Aethel.SourceVerification
 
 open Aethel
 open Aethel.LitmusCorpus
+
+private def usage := "Usage: aethel-check [--self-test | --help | <file.mir> | --source <file.aethel>]"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -47,14 +52,38 @@ def main (args : List String) : IO UInt32 := do
     Phase3.Tests.run
     Phase4.Tests.run
     Phase5And6.Tests.run
+    Phase7.Tests.run
+    Phase8.Tests.run
     IntInference.Tests.run
     runLitmusCorpus
     IO.println "Lean component checks passed. Full program checker and safety gate remain open."
     return 0
   | ["--help"] =>
-    IO.println "Usage: aethel-check [--self-test | --help | <file.mir>]"
-    IO.println "Runs Lean foundation, layout, borrow, law, MIR validator, fork/join, Rust FFI, and 250 litmus regressions, or validates a versioned .mir file."
+    IO.println usage
+    IO.println "Runs Lean foundation, layout, borrow, law, MIR validator, fork/join, Rust FFI, and 250 Lean litmus fixtures, or validates a versioned .mir file."
+    IO.println "Use --source for the reference checker for closed byte-record programs."
     return 0
+  | ["--source"] =>
+    IO.eprintln usage
+    return 2
+  | ["--source", path] =>
+    try
+      let input ← IO.FS.readFile path
+      match SourceVerification.verify input with
+      | .error err =>
+        IO.eprintln s!"Source verification failed: {repr err}"
+        return 1
+      | .ok accepted =>
+        match SourceVerification.execute accepted with
+        | some value =>
+          IO.println s!"Source verified (u8 result: {value})"
+          return 0
+        | none =>
+          IO.eprintln "Verified source produced no result"
+          return 1
+    catch err =>
+      IO.eprintln s!"Failed to read '{path}': {err}"
+      return 1
   | [mirPath] =>
     try
       let contents ← IO.FS.readFile mirPath
@@ -69,5 +98,5 @@ def main (args : List String) : IO UInt32 := do
       IO.eprintln s!"Failed to read '{mirPath}': {err}"
       return 1
   | _ =>
-    IO.eprintln "Usage: aethel-check [--self-test | --help | <file.mir>]"
+    IO.eprintln usage
     return 2

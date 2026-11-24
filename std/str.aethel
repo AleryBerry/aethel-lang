@@ -1,0 +1,8 @@
+//// Standard string helpers for Aethel (immutable copyable slices).
+//// Core operations (`str.len`, `str.is_empty`, `str.eq`, `str.concat`,
+//// `str.starts_with`, `str.ends_with`, `str.contains`, `str.byte_at`,
+//// `str.slice_bytes`) are lowered directly by the compiler backend.
+
+pub fn empty() -> String {
+  ""
+}

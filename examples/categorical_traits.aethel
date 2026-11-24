@@ -1,0 +1,126 @@
+// Stage F Showcase 1:
+// Law-Verified Categorical Traits (Semigroup <= Monoid, Functor <= Applicative <= Monad)
+// Solving Haskell's typeclass trilemma:
+//   1. Open-universe named instances + `default instance` + explicit `using`
+//   2. Mandatory Constitutional Law checking on every instance
+//   3. Nested structural lifting without newtype wrappers (`Bar(Qux(Foo))`)
+//   4. Branded container coherence (`BrandedBag` under `sum_u32` vs `max_u32`)
+
+pub trait Semigroup(a) {
+  fn combine(x: a, y: a) -> a
+  law assoc(x: a, y: a, z: a) {
+    always combine(combine(x, y), z) == combine(x, combine(y, z))
+  }
+}
+
+pub trait Monoid(a) <= Semigroup(a) {
+  fn empty() -> a
+  law left_id(x: a) {
+    always combine(empty(), x) == x
+  }
+  law right_id(x: a) {
+    always combine(x, empty()) == x
+  }
+}
+
+pub default instance sum_u32: Monoid(u32) {
+  fn empty() -> u32 { 0u32 }
+  fn combine(x: u32, y: u32) -> u32 { x +| y }
+}
+
+pub instance max_u32: Monoid(u32) {
+  fn empty() -> u32 { 0u32 }
+  fn combine(x: u32, y: u32) -> u32 { max(x, y) }
+}
+
+pub fn fold_slice(xs: [a]) -> a with Monoid(a) {
+  let mut acc: a = empty()
+  for x in xs {
+    acc = combine(acc, x)
+  }
+  acc
+}
+
+pub trait Functor(f(_)) {
+  fn fmap(fa: f(a), g: fn(a) -> b) -> f(b)
+}
+
+pub trait Applicative(f(_)) <= Functor(f) {
+  fn pure(x: a) -> f(a)
+  fn ap(ff: f(fn(a) -> b), fa: f(a)) -> f(b)
+}
+
+pub trait Monad(f(_)) <= Applicative(f) {
+  fn bind(ma: f(a), k: fn(a) -> f(b)) -> f(b)
+  law left_id_m(x: a, k: fn(a) -> f(b)) {
+    always bind(pure(x), k) == k(x)
+  }
+  law right_id_m(m: f(a)) {
+    always bind(m, fn(x: a) -> f(a) { pure(x) }) == m
+  }
+}
+
+pub default instance opt_monad: Monad(Option) {
+  fn pure(x: a) -> Option(a) { Some(x) }
+  fn bind(ma: Option(a), k: fn(a) -> Option(b)) -> Option(b) {
+    case ma {
+      None -> None
+      Some(v) -> k(v)
+    }
+  }
+}
+
+pub fn bump_wrapped(x: f(u32)) -> f(u32) with Functor(f) {
+  fmap(x, fn(n: u32) -> u32 { n +% 10u32 })
+}
+
+// Nested polynomial structural `using` without `newtype` wrappers
+pub trait Weight(a) {
+  fn weight(x: a) -> u32
+}
+
+pub type Payload { base: u32 }
+pub type Slot(a) { item: a }
+pub type Crate(a) { slot: a }
+
+pub default instance w_payload: Weight(Payload) {
+  fn weight(x: Payload) -> u32 { x.base }
+}
+
+pub instance double_payload: Weight(Payload) {
+  fn weight(x: Payload) -> u32 { x.base *| 2u32 }
+}
+
+pub default instance w_slot: Weight(Slot(a)) with Weight(a) {
+  fn weight(x: Slot(a)) -> u32 { weight(x.item) }
+}
+
+pub default instance w_crate: Weight(Crate(a)) with Weight(a) {
+  fn weight(x: Crate(a)) -> u32 { weight(x.slot) }
+}
+
+// Branded container coherence
+pub type AccBox(a) with Monoid(a) { value: a }
+
+pub fn wrap_acc(x: a) -> AccBox(a) with Monoid(a) {
+  AccBox { value: x }
+}
+
+pub fn main() {
+  let scores = [3u32, 9u32, 4u32]
+  let total = fold_slice(scores)
+  let peak = fold_slice(scores) using max_u32
+
+  let bumped = bump_wrapped(Some(32u32)) |> unwrap_or(0u32)
+
+  let c = Crate { slot: Slot { item: Payload { base: 7u32 } } }
+  let w_std = weight(c)
+  let w_dbl = weight(c) using double_payload
+
+  let sum_box = wrap_acc(total)
+  let max_box = wrap_acc(peak) using max_u32
+
+  println("fold sum=", sum_box.value, " fold max=", max_box.value)
+  println("Functor Option bumped=", bumped)
+  println("Nested Crate(Slot(Payload)) weight=", w_std, " doubled=", w_dbl)
+}

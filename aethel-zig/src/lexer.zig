@@ -327,6 +327,14 @@ pub const ContextualKeyword = enum {
     exclusive,
     fork,
     join,
+    trait,
+    instance,
+    default,
+    with,
+    using,
+    external,
+    rust,
+    flat,
 };
 
 pub const contextual_keywords = std.StaticStringMap(ContextualKeyword).initComptime(.{
@@ -346,6 +354,14 @@ pub const contextual_keywords = std.StaticStringMap(ContextualKeyword).initCompt
     .{ "exclusive", .exclusive },
     .{ "fork", .fork },
     .{ "join", .join },
+    .{ "trait", .trait },
+    .{ "instance", .instance },
+    .{ "default", .default },
+    .{ "with", .with },
+    .{ "using", .using },
+    .{ "external", .external },
+    .{ "rust", .rust },
+    .{ "flat", .flat },
 });
 
 pub fn contextualKeyword(lexeme: []const u8) ?ContextualKeyword {

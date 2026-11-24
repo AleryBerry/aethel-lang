@@ -99,6 +99,7 @@ pub const SymbolicLawCert = struct {
     kind: SymbolicLawKind,
     hyps: []const *const LawProp,
     goal: *const LawProp,
+    is_trait_law: bool = false,
 };
 
 pub const DecreasesCertEmit = struct {
@@ -637,14 +638,24 @@ pub const LawParamDomain = struct {
             adt_name: []const u8,
             variant_count: usize,
         },
+        option_ty,
+        fn_scalar_ty,
+        fn_opt_ty,
         other,
     };
+};
+
+pub const SynthMethodKind = enum {
+    none,
+    monad_map,
+    monad_ap,
 };
 
 pub const FnAstEntry = struct {
     name: []const u8,
     params: []const ast.Param,
     body: ast.Block,
+    synth: SynthMethodKind = .none,
 };
 
 pub const RecordFieldRuntime = struct {
@@ -814,6 +825,34 @@ pub fn astToLawExpr(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawExpr {
 pub fn astToLawProp(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawProp {
     switch (expr.*) {
         .bool_lit => |bl| return mkLawProp(ctx.alloc, if (bl.value) .tt else .ff),
+        .call => |c| {
+            const cname = resolveLawCalleeName(ctx.source, c.callee, ctx.resolved_calls) orelse return null;
+            if (ctx.inline_depth >= 4) return null;
+            for (ctx.fns) |fn_entry| {
+                if (!std.mem.eql(u8, fn_entry.name, cname)) continue;
+                if (fn_entry.params.len != c.args.len) return null;
+                if (fn_entry.body.stmts.len != 0 or fn_entry.body.tail == null) return null;
+                const arg_vals = ctx.alloc.alloc(*const LawExpr, c.args.len) catch return null;
+                for (c.args, 0..) |ca, ai| {
+                    arg_vals[ai] = astToLawExpr(ctx, ca.value) orelse return null;
+                }
+                const saved_subst = ctx.subst;
+                ctx.subst = .empty;
+                for (fn_entry.params, 0..) |p, pi| {
+                    ctx.subst.put(ctx.alloc, p.name.slice(ctx.source), arg_vals[pi]) catch {
+                        ctx.subst = saved_subst;
+                        return null;
+                    };
+                }
+                ctx.inline_depth += 1;
+                defer {
+                    ctx.inline_depth -= 1;
+                    ctx.subst = saved_subst;
+                }
+                return astToLawProp(ctx, fn_entry.body.tail.?);
+            }
+            return null;
+        },
         .unary => |u| {
             if (u.op == .not) {
                 const inner = astToLawProp(ctx, u.operand) orelse return null;
@@ -834,17 +873,31 @@ pub fn astToLawProp(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawProp {
                     return mkLawProp(ctx.alloc, .{ .or_op = .{ .p = p, .q = q } });
                 },
                 .eq, .ne, .le, .lt, .ge, .gt => {
-                    const a = astToLawExpr(ctx, b.left) orelse return null;
-                    const bv = astToLawExpr(ctx, b.right) orelse return null;
-                    return switch (b.op) {
-                        .eq => mkLawProp(ctx.alloc, .{ .eq = .{ .a = a, .b = bv } }),
-                        .ne => mkLawProp(ctx.alloc, .{ .ne = .{ .a = a, .b = bv } }),
-                        .le => mkLawProp(ctx.alloc, .{ .le = .{ .a = a, .b = bv } }),
-                        .lt => mkLawProp(ctx.alloc, .{ .lt = .{ .a = a, .b = bv } }),
-                        .ge => mkLawProp(ctx.alloc, .{ .le = .{ .a = bv, .b = a } }),
-                        .gt => mkLawProp(ctx.alloc, .{ .lt = .{ .a = bv, .b = a } }),
-                        else => unreachable,
-                    };
+                    if (astToLawExpr(ctx, b.left)) |a| {
+                        if (astToLawExpr(ctx, b.right)) |bv| {
+                            return switch (b.op) {
+                                .eq => mkLawProp(ctx.alloc, .{ .eq = .{ .a = a, .b = bv } }),
+                                .ne => mkLawProp(ctx.alloc, .{ .ne = .{ .a = a, .b = bv } }),
+                                .le => mkLawProp(ctx.alloc, .{ .le = .{ .a = a, .b = bv } }),
+                                .lt => mkLawProp(ctx.alloc, .{ .lt = .{ .a = a, .b = bv } }),
+                                .ge => mkLawProp(ctx.alloc, .{ .le = .{ .a = bv, .b = a } }),
+                                .gt => mkLawProp(ctx.alloc, .{ .lt = .{ .a = bv, .b = a } }),
+                                else => unreachable,
+                            };
+                        }
+                    }
+                    if (b.op == .eq) {
+                        const lp = astToLawProp(ctx, b.left) orelse return null;
+                        const rp = astToLawProp(ctx, b.right) orelse return null;
+                        if (rp.* == .tt) return lp;
+                        if (lp.* == .tt) return rp;
+                        if (rp.* == .ff) return mkLawProp(ctx.alloc, .{ .not = lp });
+                        if (lp.* == .ff) return mkLawProp(ctx.alloc, .{ .not = rp });
+                        const lr = mkLawProp(ctx.alloc, .{ .imp = .{ .p = lp, .q = rp } });
+                        const rl = mkLawProp(ctx.alloc, .{ .imp = .{ .p = rp, .q = lp } });
+                        return mkLawProp(ctx.alloc, .{ .and_op = .{ .p = lr, .q = rl } });
+                    }
+                    return null;
                 },
                 else => return null,
             }
@@ -891,8 +944,71 @@ pub const ConcreteVal = union(enum) {
     bool_val: bool,
     enum_val: usize,
     record_val: []const ConcreteField,
+    option_val: ?*const ConcreteVal,
+    builtin_fn: u8,
+    lambda_val: struct {
+        params: []const ast.Param,
+        body: ast.Block,
+        captured: std.StringHashMapUnmanaged(ConcreteVal),
+    },
+    synth_map_k: *const ConcreteVal,
+    synth_ap_k: *const ConcreteVal,
     unit_val,
 };
+
+fn concreteValEql(a: ConcreteVal, b: ConcreteVal) bool {
+    if (@intFromEnum(a) != @intFromEnum(b)) return false;
+    return switch (a) {
+        .int_val => |iv| iv.val == b.int_val.val,
+        .bool_val => |bv| bv == b.bool_val,
+        .enum_val => |ev| ev == b.enum_val,
+        .unit_val => true,
+        .option_val => |oa| blk: {
+            const ob = b.option_val;
+            if (oa == null and ob == null) break :blk true;
+            if (oa != null and ob != null) break :blk concreteValEql(oa.?.*, ob.?.*);
+            break :blk false;
+        },
+        .record_val => |ra| blk: {
+            const rb = b.record_val;
+            if (ra.len != rb.len) break :blk false;
+            for (ra, rb) |fa, fb| {
+                if (!std.mem.eql(u8, fa.name, fb.name) or !concreteValEql(fa.val, fb.val)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn evalBuiltinFnVal(tag: u8, arg: ConcreteVal, alloc: std.mem.Allocator) ?ConcreteVal {
+    if (arg != .int_val) return null;
+    const x = arg.int_val.val;
+    const it = arg.int_val.int_ty;
+    return switch (tag) {
+        0 => arg, // id
+        1 => .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x + 1, t) else x + 1, .int_ty = it } }, // + 1
+        2 => .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x * 2 + 1, t) else x * 2 + 1, .int_ty = it } }, // *2 + 1
+        3 => .{ .int_val = .{ .val = 7, .int_ty = it } }, // const 7
+        10 => blk: { // some(x + 1)
+            const p = alloc.create(ConcreteVal) catch return null;
+            p.* = .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x + 1, t) else x + 1, .int_ty = it } };
+            break :blk .{ .option_val = p };
+        },
+        11 => blk: { // none if x == 0 else some(x - 1)
+            if (x == 0) break :blk .{ .option_val = null };
+            const p = alloc.create(ConcreteVal) catch return null;
+            p.* = .{ .int_val = .{ .val = x - 1, .int_ty = it } };
+            break :blk .{ .option_val = p };
+        },
+        12 => blk: { // some(x * 2)
+            const p = alloc.create(ConcreteVal) catch return null;
+            p.* = .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x * 2, t) else x * 2, .int_ty = it } };
+            break :blk .{ .option_val = p };
+        },
+        else => null,
+    };
+}
 
 pub const ConcreteEnv = struct {
     alloc: std.mem.Allocator,
@@ -964,6 +1080,88 @@ fn intTypeFromAstType(source: [:0]const u8, te: ?*const ast.TypeExpr) ?int_range
     };
 }
 
+fn callConcreteFnVal(env: *ConcreteEnv, fnv: ConcreteVal, arg_vals: []const ConcreteVal) ?ConcreteVal {
+    if (env.call_depth >= 12) return null;
+    switch (fnv) {
+        .builtin_fn => |tag| {
+            if (arg_vals.len != 1) return null;
+            return evalBuiltinFnVal(tag, arg_vals[0], env.alloc);
+        },
+        .lambda_val => |lv| {
+            if (lv.params.len != arg_vals.len) return null;
+            const saved = env.bindings;
+            env.bindings = lv.captured.clone(env.alloc) catch {
+                env.bindings = saved;
+                return null;
+            };
+            for (lv.params, 0..) |p, pi| {
+                env.bindings.put(env.alloc, p.name.slice(env.source), arg_vals[pi]) catch {
+                    env.bindings = saved;
+                    return null;
+                };
+            }
+            env.call_depth += 1;
+            defer {
+                env.call_depth -= 1;
+                env.bindings = saved;
+            }
+            const fake_blk = ast.Expr{ .block = lv.body };
+            return evalConcreteExpr(env, &fake_blk);
+        },
+        .synth_map_k => |fn_ptr| {
+            if (arg_vals.len != 1) return null;
+            const fx = callConcreteFnVal(env, fn_ptr.*, arg_vals) orelse return null;
+            return callConcreteNamedFn(env, "pure", &.{fx});
+        },
+        .synth_ap_k => |mx_ptr| {
+            if (arg_vals.len != 1) return null;
+            return callConcreteNamedFn(env, "map", &.{ mx_ptr.*, arg_vals[0] }) orelse
+                callConcreteNamedFn(env, "fmap", &.{ mx_ptr.*, arg_vals[0] });
+        },
+        else => return null,
+    }
+}
+
+fn callConcreteNamedFn(env: *ConcreteEnv, cname: []const u8, arg_vals: []const ConcreteVal) ?ConcreteVal {
+    if (env.call_depth >= 12) return null;
+    for (env.fns) |fn_entry| {
+        if (!std.mem.eql(u8, fn_entry.name, cname)) continue;
+        if (fn_entry.params.len != arg_vals.len) return null;
+        if (fn_entry.synth == .monad_map and arg_vals.len == 2) {
+            const f_ptr = env.alloc.create(ConcreteVal) catch return null;
+            f_ptr.* = arg_vals[1];
+            const k = ConcreteVal{ .synth_map_k = f_ptr };
+            return callConcreteNamedFn(env, "bind", &.{ arg_vals[0], k });
+        }
+        if (fn_entry.synth == .monad_ap and arg_vals.len == 2) {
+            const mx_ptr = env.alloc.create(ConcreteVal) catch return null;
+            mx_ptr.* = arg_vals[1];
+            const k = ConcreteVal{ .synth_ap_k = mx_ptr };
+            return callConcreteNamedFn(env, "bind", &.{ arg_vals[0], k });
+        }
+        const saved = env.bindings;
+        env.bindings = .empty;
+        for (fn_entry.params, 0..) |p, pi| {
+            var av = arg_vals[pi];
+            if (av == .int_val and av.int_val.int_ty == null) {
+                av.int_val.int_ty = intTypeFromAstType(env.source, p.ty);
+            }
+            env.bindings.put(env.alloc, p.name.slice(env.source), av) catch {
+                env.bindings = saved;
+                return null;
+            };
+        }
+        env.call_depth += 1;
+        defer {
+            env.call_depth -= 1;
+            env.bindings = saved;
+        }
+        const fake_blk = ast.Expr{ .block = fn_entry.body };
+        return evalConcreteExpr(env, &fake_blk);
+    }
+    return null;
+}
+
 pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
     switch (expr.*) {
         .int_lit => |sp| {
@@ -974,7 +1172,49 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
         .bool_lit => |bl| return .{ .bool_val = bl.value },
         .ident => |sp| return env.bindings.get(sp.slice(env.source)),
         .upper_ident => |sp| {
-            _ = sp;
+            const name = sp.slice(env.source);
+            if (std.mem.eql(u8, name, "None")) {
+                return .{ .option_val = null };
+            }
+            return null;
+        },
+        .lambda => |lam| {
+            const snap = env.bindings.clone(env.alloc) catch return null;
+            return .{ .lambda_val = .{ .params = lam.params, .body = lam.body, .captured = snap } };
+        },
+        .case_expr => |ce| {
+            if (ce.subjects.len != 1) return null;
+            const subj = evalConcreteExpr(env, ce.subjects[0]) orelse return null;
+            for (ce.arms) |arm| {
+                if (arm.alternatives.len == 0 or arm.alternatives[0].len != 1) continue;
+                const pat = arm.alternatives[0][0];
+                const saved = env.bindings;
+                env.bindings = saved.clone(env.alloc) catch return null;
+                defer env.bindings = saved;
+                var matched = false;
+                switch (pat.*) {
+                    .wildcard => matched = true,
+                    .ident => |id| {
+                        env.bindings.put(env.alloc, id.name.slice(env.source), subj) catch return null;
+                        matched = true;
+                    },
+                    .constructor => |ctor| {
+                        if (ctor.path.len > 0) {
+                            const cname = ctor.path[ctor.path.len - 1].slice(env.source);
+                            if (std.mem.eql(u8, cname, "None") and subj == .option_val and subj.option_val == null) {
+                                matched = true;
+                            } else if (std.mem.eql(u8, cname, "Some") and subj == .option_val and subj.option_val != null) {
+                                matched = true;
+                                if (ctor.args.len == 1 and ctor.args[0].pattern.* == .ident) {
+                                    env.bindings.put(env.alloc, ctor.args[0].pattern.ident.name.slice(env.source), subj.option_val.?.*) catch return null;
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+                if (matched) return evalConcreteExpr(env, arm.body);
+            }
             return null;
         },
         .cast => |c| {
@@ -1074,7 +1314,23 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
             if (blk.tail) |t| return evalConcreteExpr(env, t);
             return .unit_val;
         },
+        .using_expr => |ue| return evalConcreteExpr(env, ue.target),
         .call => |c| {
+            if (c.callee.* == .upper_ident and std.mem.eql(u8, c.callee.upper_ident.slice(env.source), "Some") and c.args.len == 1) {
+                const inner = evalConcreteExpr(env, c.args[0].value) orelse return null;
+                const ptr = env.alloc.create(ConcreteVal) catch return null;
+                ptr.* = inner;
+                return .{ .option_val = ptr };
+            }
+            if (c.callee.* == .ident) {
+                if (env.bindings.get(c.callee.ident.slice(env.source))) |fnv| {
+                    var arg_vals = env.alloc.alloc(ConcreteVal, c.args.len) catch return null;
+                    for (c.args, 0..) |ca, ai| {
+                        arg_vals[ai] = evalConcreteExpr(env, ca.value) orelse return null;
+                    }
+                    return callConcreteFnVal(env, fnv, arg_vals);
+                }
+            }
             const cname = resolveLawCalleeName(env.source, c.callee, env.resolved_calls) orelse return null;
             if (std.mem.eql(u8, cname, "min") and c.args.len == 2) {
                 const a = evalConcreteExpr(env, c.args[0].value) orelse return null;
@@ -1088,35 +1344,11 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
                 if (a != .int_val or b != .int_val) return null;
                 return .{ .int_val = .{ .val = @max(a.int_val.val, b.int_val.val), .int_ty = a.int_val.int_ty orelse b.int_val.int_ty } };
             }
-            if (env.call_depth >= 12) return null;
-            for (env.fns) |fn_entry| {
-                if (!std.mem.eql(u8, fn_entry.name, cname)) continue;
-                if (fn_entry.params.len != c.args.len) return null;
-                var arg_vals = env.alloc.alloc(ConcreteVal, c.args.len) catch return null;
-                for (c.args, 0..) |ca, ai| {
-                    var av = evalConcreteExpr(env, ca.value) orelse return null;
-                    if (av == .int_val and av.int_val.int_ty == null) {
-                        av.int_val.int_ty = intTypeFromAstType(env.source, fn_entry.params[ai].ty);
-                    }
-                    arg_vals[ai] = av;
-                }
-                const saved = env.bindings;
-                env.bindings = .empty;
-                for (fn_entry.params, 0..) |p, pi| {
-                    env.bindings.put(env.alloc, p.name.slice(env.source), arg_vals[pi]) catch {
-                        env.bindings = saved;
-                        return null;
-                    };
-                }
-                env.call_depth += 1;
-                defer {
-                    env.call_depth -= 1;
-                    env.bindings = saved;
-                }
-                const fake_blk = ast.Expr{ .block = fn_entry.body };
-                return evalConcreteExpr(env, &fake_blk);
+            var arg_vals = env.alloc.alloc(ConcreteVal, c.args.len) catch return null;
+            for (c.args, 0..) |ca, ai| {
+                arg_vals[ai] = evalConcreteExpr(env, ca.value) orelse return null;
             }
-            return null;
+            return callConcreteNamedFn(env, cname, arg_vals);
         },
         .binary => |b| {
             const lv = evalConcreteExpr(env, b.left) orelse return null;
@@ -1137,6 +1369,13 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
                 return switch (b.op) {
                     .eq => .{ .bool_val = lv.bool_val == rv.bool_val },
                     .ne => .{ .bool_val = lv.bool_val != rv.bool_val },
+                    else => null,
+                };
+            }
+            if (lv == .option_val and rv == .option_val) {
+                return switch (b.op) {
+                    .eq => .{ .bool_val = concreteValEql(lv, rv) },
+                    .ne => .{ .bool_val = !concreteValEql(lv, rv) },
                     else => null,
                 };
             }
@@ -1258,6 +1497,32 @@ fn buildParamCandidates(alloc: std.mem.Allocator, dom: LawParamDomain, exhaustiv
             for (0..et.variant_count) |vi| vals[vi] = .{ .enum_val = vi };
             return vals;
         },
+        .option_ty => {
+            var vals = alloc.alloc(ConcreteVal, 6) catch return null;
+            vals[0] = .{ .option_val = null };
+            const samples = [_]i128{ 0, 1, 2, 7, 255 };
+            for (samples, 0..) |sv, si| {
+                const p = alloc.create(ConcreteVal) catch return null;
+                p.* = .{ .int_val = .{ .val = sv, .int_ty = .{ .signed = false, .bits = 8 } } };
+                vals[si + 1] = .{ .option_val = p };
+            }
+            return vals;
+        },
+        .fn_scalar_ty => {
+            var vals = alloc.alloc(ConcreteVal, 4) catch return null;
+            vals[0] = .{ .builtin_fn = 0 };
+            vals[1] = .{ .builtin_fn = 1 };
+            vals[2] = .{ .builtin_fn = 2 };
+            vals[3] = .{ .builtin_fn = 3 };
+            return vals;
+        },
+        .fn_opt_ty => {
+            var vals = alloc.alloc(ConcreteVal, 3) catch return null;
+            vals[0] = .{ .builtin_fn = 10 };
+            vals[1] = .{ .builtin_fn = 11 };
+            vals[2] = .{ .builtin_fn = 12 };
+            return vals;
+        },
         .record_ty => |rt| {
             if (rt.fields.len == 0 or rt.fields.len > 6) return null;
             var field_cands: [6][]const ConcreteVal = undefined;
@@ -1315,6 +1580,13 @@ fn formatConcreteVal(alloc: std.mem.Allocator, val: ConcreteVal) []const u8 {
             buf.append(alloc, '}') catch {};
             break :blk buf.toOwnedSlice(alloc) catch "{...}";
         },
+        .option_val => |ov| if (ov) |inner|
+            std.fmt.allocPrint(alloc, "Some({s})", .{formatConcreteVal(alloc, inner.*)}) catch "Some(?)"
+        else
+            "None",
+        .builtin_fn => |tag| std.fmt.allocPrint(alloc, "<fn#{d}>", .{tag}) catch "<fn>",
+        .lambda_val => "<lambda>",
+        .synth_map_k, .synth_ap_k => "<synth-fn>",
         .unit_val => "()",
     };
 }

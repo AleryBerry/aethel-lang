@@ -1,0 +1,74 @@
+//// Core categorical trait hierarchy for Aethel (`Semigroup <= Monoid`,
+//// `Functor <= Applicative <= Monad`), verified by Constitutional Laws.
+
+pub trait Semigroup(a) {
+  fn combine(x: a, y: a) -> a
+  law assoc(x: a, y: a, z: a) {
+    always combine(combine(x, y), z) == combine(x, combine(y, z))
+  }
+}
+
+pub trait Monoid(a) <= Semigroup(a) {
+  fn empty() -> a
+  law left_id(x: a) {
+    always combine(empty(), x) == x
+  }
+  law right_id(x: a) {
+    always combine(x, empty()) == x
+  }
+}
+
+pub default instance sum_u32: Monoid(u32) {
+  fn empty() -> u32 { 0u32 }
+  fn combine(x: u32, y: u32) -> u32 { x +| y }
+}
+
+pub instance max_u32: Monoid(u32) {
+  fn empty() -> u32 { 0u32 }
+  fn combine(x: u32, y: u32) -> u32 { max(x, y) }
+}
+
+pub default instance all_bool: Semigroup(bool) {
+  fn combine(x: bool, y: bool) -> bool { x && y }
+}
+
+pub instance any_bool: Semigroup(bool) {
+  fn combine(x: bool, y: bool) -> bool { x || y }
+}
+
+pub trait Functor(f(_)) {
+  fn fmap(fa: f(a), g: fn(a) -> b) -> f(b)
+}
+
+pub trait Applicative(f(_)) <= Functor(f) {
+  fn pure(x: a) -> f(a)
+  fn ap(ff: f(fn(a) -> b), fa: f(a)) -> f(b)
+}
+
+pub trait Monad(f(_)) <= Applicative(f) {
+  fn bind(ma: f(a), k: fn(a) -> f(b)) -> f(b)
+  law left_id_m(x: a, k: fn(a) -> f(b)) {
+    always bind(pure(x), k) == k(x)
+  }
+  law right_id_m(m: f(a)) {
+    always bind(m, fn(x: a) -> f(a) { pure(x) }) == m
+  }
+}
+
+pub default instance opt_monad: Monad(Option) {
+  fn pure(x: a) -> Option(a) { Some(x) }
+  fn bind(ma: Option(a), k: fn(a) -> Option(b)) -> Option(b) {
+    case ma {
+      None -> None
+      Some(v) -> k(v)
+    }
+  }
+}
+
+pub fn fold_slice(xs: [a]) -> a with Monoid(a) {
+  let mut acc: a = empty()
+  for x in xs {
+    acc = combine(acc, x)
+  }
+  acc
+}

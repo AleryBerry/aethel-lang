@@ -36,6 +36,16 @@ structure MIRCollectionDecl where
   fieldCount : Nat
   deriving Repr, DecidableEq
 
+structure MIRDynVecDecl where
+  name : String
+  layout : CollectionLayout
+  fieldCount : Nat
+  initCap : Nat
+  deriving Repr, DecidableEq
+
+def MIRDynVecDecl.Valid (d : MIRDynVecDecl) : Prop :=
+  d.layout.Valid ∧ 0 < d.fieldCount ∧ 0 < d.initCap
+
 structure MIRDecreasesCert where
   guards : List LawProp := []
   curMeasure : LawExpr
@@ -170,6 +180,12 @@ def validateCollection (c : MIRCollectionDecl) : Except MIRError Unit :=
   if layoutValidBool c.layout && decide (0 < c.fieldCount) then .ok ()
   else .error (.invalidCollectionLayout c.name)
 
+def validateDynVec (d : MIRDynVecDecl) : Except MIRError MIRCollectionDecl :=
+  if layoutValidBool d.layout && decide (0 < d.fieldCount) && decide (0 < d.initCap) then
+    .ok ⟨d.name, d.layout, d.fieldCount⟩
+  else
+    .error (.invalidCollectionLayout d.name)
+
 def validateFunction (f : MIRFunctionDecl) : Except MIRError Unit :=
   if !verifyResources f.body then .error (.invalidResources f.name)
   else if !checkEffectPreserves f.effects f.preserves then .error (.frameViolation f.name)
@@ -186,53 +202,32 @@ def validateLaw (l : MIRLawDecl) : Except MIRError Unit :=
     | some (v0, v1, v2) => .error (.lawCounterexample l.name s!"v0={v0}, v1={v1}, v2={v2}")
     | none => .error (.unprovedLaw l.name)
 
-def validateRecords : List MIRRecordDecl → Except MIRError (List (String × Nat))
-  | [] => .ok []
-  | r :: rs =>
-    match validateRecord r with
-    | .error e => .error e
-    | .ok pair =>
-      match validateRecords rs with
-      | .error e => .error e
-      | .ok rest => .ok (pair :: rest)
-
-def validateCollections : List MIRCollectionDecl → Except MIRError Unit
+private def validateEach (validate : α → Except MIRError Unit) :
+    List α → Except MIRError Unit
   | [] => .ok ()
-  | c :: cs =>
-    match validateCollection c with
-    | .error e => .error e
-    | .ok () => validateCollections cs
+  | x :: xs => do
+    validate x
+    validateEach validate xs
 
-def validateFunctions : List MIRFunctionDecl → Except MIRError Unit
-  | [] => .ok ()
-  | f :: fs =>
-    match validateFunction f with
-    | .error e => .error e
-    | .ok () => validateFunctions fs
+def validateRecords (records : List MIRRecordDecl) :
+    Except MIRError (List (String × Nat)) :=
+  records.mapM validateRecord
 
-def validateLaws : List MIRLawDecl → Except MIRError Unit
-  | [] => .ok ()
-  | l :: ls =>
-    match validateLaw l with
-    | .error e => .error e
-    | .ok () => validateLaws ls
+def validateCollections := validateEach validateCollection
+
+def validateFunctions := validateEach validateFunction
+
+def validateLaws := validateEach validateLaw
 
 def validateMIR (m : MIRModule) : Except MIRError MIRCertificate :=
   if m.version != currentMIRVersion then
     .error (.unsupportedVersion m.version currentMIRVersion)
-  else
-    match validateRecords m.records with
-    | .error e => .error e
-    | .ok sizes =>
-      match validateCollections m.collections with
-      | .error e => .error e
-      | .ok () =>
-        match validateFunctions m.functions with
-        | .error e => .error e
-        | .ok () =>
-          match validateLaws m.laws with
-          | .error e => .error e
-          | .ok () => .ok ⟨m.version, sizes, m.functions.length, m.laws.length⟩
+  else do
+    let sizes ← validateRecords m.records
+    validateCollections m.collections
+    validateFunctions m.functions
+    validateLaws m.laws
+    return ⟨m.version, sizes, m.functions.length, m.laws.length⟩
 
 theorem validateRecord_sound {r : MIRRecordDecl} {pair : String × Nat}
     (hOk : validateRecord r = .ok pair) :
@@ -271,6 +266,24 @@ theorem validateCollection_sound {c : MIRCollectionDecl}
       simp only [hLay, layoutValidBool, CollectionLayout.Valid, Bool.and_eq_true,
         decide_eq_true_eq] at hCond ⊢
       exact hCond
+  · cases hOk
+
+theorem validateDynVec_sound {d : MIRDynVecDecl} {c : MIRCollectionDecl}
+    (hOk : validateDynVec d = .ok c) :
+    d.Valid ∧ c.Valid := by
+  dsimp [validateDynVec, MIRDynVecDecl.Valid, MIRCollectionDecl.Valid] at hOk ⊢
+  split at hOk
+  · next hCond =>
+    cases hOk
+    cases hLay : d.layout with
+    | aos | soa =>
+      simp only [hLay, layoutValidBool, CollectionLayout.Valid, Bool.true_and, Bool.and_eq_true,
+        decide_eq_true_eq] at hCond ⊢
+      exact ⟨⟨trivial, hCond.1, hCond.2⟩, ⟨trivial, hCond.1⟩⟩
+    | aosoa w =>
+      simp only [hLay, layoutValidBool, CollectionLayout.Valid, Bool.and_eq_true,
+        decide_eq_true_eq] at hCond ⊢
+      exact ⟨⟨hCond.1.1, hCond.1.2, hCond.2⟩, ⟨hCond.1.1, hCond.1.2⟩⟩
   · cases hOk
 
 private theorem if_err_eq_ok {α ε : Type} (cond : Bool) (err : ε) (k : Except ε α) (v : α)
@@ -338,99 +351,59 @@ theorem validateLaw_counterexample_refutes {l : MIRLawDecl} {w : String}
       cases hk : l.kind <;>
         simpa [MIRLawDecl.Valid, MIRLawDecl.targetProp, LawProp.Holds, hk] using hNot
 
+private theorem validateMap_sound {validate : α → Except MIRError β} {Valid : α → Prop}
+    (sound : ∀ {x value}, validate x = .ok value → Valid x)
+    {xs : List α} {values : List β} (ok : xs.mapM validate = .ok values) :
+    ∀ x ∈ xs, Valid x := by
+  induction xs generalizing values with
+  | nil => simp
+  | cons x xs ih =>
+    cases checked : validate x with
+    | error err => simp [List.mapM_cons, checked, bind, Except.bind] at ok
+    | ok value =>
+      cases tail : xs.mapM validate with
+      | error err => simp [List.mapM_cons, checked, tail, bind, Except.bind] at ok
+      | ok rest =>
+        simpa only [List.forall_mem_cons] using And.intro (sound checked) (ih tail)
+
+private theorem validateEach_sound {validate : α → Except MIRError Unit} {Valid : α → Prop}
+    (sound : ∀ {x}, validate x = .ok () → Valid x)
+    {xs : List α} (ok : validateEach validate xs = .ok ()) :
+    ∀ x ∈ xs, Valid x := by
+  induction xs with
+  | nil => simp
+  | cons x xs ih =>
+    cases checked : validate x with
+    | error err => simp [validateEach, checked, bind, Except.bind] at ok
+    | ok value =>
+      cases value
+      simpa only [List.forall_mem_cons] using
+        And.intro (sound checked) (ih (by simpa [validateEach, checked, bind, Except.bind] using ok))
+
 theorem validateRecords_sound {rs : List MIRRecordDecl} {sizes : List (String × Nat)}
     (hOk : validateRecords rs = .ok sizes) :
-    ∀ r ∈ rs, r.Valid := by
-  induction rs generalizing sizes with
-  | nil =>
-    intro _ hr
-    cases hr
-  | cons r rs ih =>
-    dsimp [validateRecords] at hOk
-    cases h1 : validateRecord r with
-    | error e =>
-      rw [h1] at hOk
-      cases hOk
-    | ok pair =>
-      rw [h1] at hOk
-      cases h2 : validateRecords rs with
-      | error e =>
-        rw [h2] at hOk
-        cases hOk
-      | ok rest =>
-        intro x hx
-        simp only [List.mem_cons] at hx
-        rcases hx with rfl | hxRest
-        · exact validateRecord_sound h1
-        · exact ih h2 x hxRest
+    ∀ r ∈ rs, r.Valid :=
+  validateMap_sound (fun h => validateRecord_sound h) hOk
 
 theorem validateCollections_sound {cs : List MIRCollectionDecl}
     (hOk : validateCollections cs = .ok ()) :
-    ∀ c ∈ cs, c.Valid := by
-  induction cs with
-  | nil =>
-    intro _ hc
-    cases hc
-  | cons c cs ih =>
-    dsimp [validateCollections] at hOk
-    cases h1 : validateCollection c with
-    | error e =>
-      rw [h1] at hOk
-      cases hOk
-    | ok u =>
-      rw [h1] at hOk
-      intro x hx
-      simp only [List.mem_cons] at hx
-      rcases hx with rfl | hxRest
-      · exact validateCollection_sound h1
-      · exact ih hOk x hxRest
+    ∀ c ∈ cs, c.Valid :=
+  validateEach_sound (fun h => validateCollection_sound h) hOk
 
 theorem validateFunctions_sound {fs : List MIRFunctionDecl}
     (hOk : validateFunctions fs = .ok ()) :
-    ∀ f ∈ fs, f.Valid := by
-  induction fs with
-  | nil =>
-    intro _ hf
-    cases hf
-  | cons f fs ih =>
-    dsimp [validateFunctions] at hOk
-    cases h1 : validateFunction f with
-    | error e =>
-      rw [h1] at hOk
-      cases hOk
-    | ok u =>
-      rw [h1] at hOk
-      intro x hx
-      simp only [List.mem_cons] at hx
-      rcases hx with rfl | hxRest
-      · exact validateFunction_sound h1
-      · exact ih hOk x hxRest
+    ∀ f ∈ fs, f.Valid :=
+  validateEach_sound (fun h => validateFunction_sound h) hOk
 
 theorem validateLaws_sound {ls : List MIRLawDecl}
     (hOk : validateLaws ls = .ok ()) :
-    ∀ l ∈ ls, l.Valid := by
-  induction ls with
-  | nil =>
-    intro _ hl
-    cases hl
-  | cons l ls ih =>
-    dsimp [validateLaws] at hOk
-    cases h1 : validateLaw l with
-    | error e =>
-      rw [h1] at hOk
-      cases hOk
-    | ok u =>
-      rw [h1] at hOk
-      intro x hx
-      simp only [List.mem_cons] at hx
-      rcases hx with rfl | hxRest
-      · exact validateLaw_sound h1
-      · exact ih hOk x hxRest
+    ∀ l ∈ ls, l.Valid :=
+  validateEach_sound (fun h => validateLaw_sound h) hOk
 
 theorem validateMIR_sound {m : MIRModule} {cert : MIRCertificate}
     (hOk : validateMIR m = .ok cert) :
     m.Valid := by
-  dsimp [validateMIR] at hOk
+  simp only [validateMIR, bind, Except.bind] at hOk
   by_cases hVer : m.version = currentMIRVersion
   · simp only [hVer, bne_self_eq_false] at hOk
     cases hR : validateRecords m.records with
@@ -699,6 +672,25 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
       let w ← parseNatTok wTok
       let fc ← parseNatTok fcTok
       return { st with mod := { st.mod with collections := st.mod.collections ++ [⟨name, .aosoa w, fc⟩] } }
+    | ["dyn_vec", name, "aos", fcTok, capTok] =>
+      let fc ← parseNatTok fcTok
+      let cap ← parseNatTok capTok
+      match validateDynVec ⟨name, .aos, fc, cap⟩ with
+      | .ok c => return { st with mod := { st.mod with collections := st.mod.collections ++ [c] } }
+      | .error e => .error s!"invalid dynamic vector '{name}': {reprStr e}"
+    | ["dyn_vec", name, "soa", fcTok, capTok] =>
+      let fc ← parseNatTok fcTok
+      let cap ← parseNatTok capTok
+      match validateDynVec ⟨name, .soa, fc, cap⟩ with
+      | .ok c => return { st with mod := { st.mod with collections := st.mod.collections ++ [c] } }
+      | .error e => .error s!"invalid dynamic vector '{name}': {reprStr e}"
+    | ["dyn_vec", name, "aosoa", wTok, fcTok, capTok] =>
+      let w ← parseNatTok wTok
+      let fc ← parseNatTok fcTok
+      let cap ← parseNatTok capTok
+      match validateDynVec ⟨name, .aosoa w, fc, cap⟩ with
+      | .ok c => return { st with mod := { st.mod with collections := st.mod.collections ++ [c] } }
+      | .error e => .error s!"invalid dynamic vector '{name}': {reprStr e}"
     | ["record", name] =>
       return { st with block := .inRecord ⟨name, [], [], none⟩ }
     | ["record", name, szTok] =>
@@ -710,6 +702,8 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
       return { st with block := .inLaw name .always [] none }
     | ["law_never", name] =>
       return { st with block := .inLaw name .never [] none }
+    | ["trait_law", name] =>
+      return { st with block := .inLaw name .always [] none }
     | _ => .error s!"unexpected top-level MIR directive '{String.intercalate " " toks}'"
   | .inRecord r =>
     match toks with
@@ -914,7 +908,7 @@ theorem validateMIR_rejects_forged_size (r : MIRRecordDecl) {lay : Layout} {sz :
     ∃ err, validateMIR { version := currentMIRVersion, records := [r] } = .error err := by
   refine ⟨.staleLayoutSize r.name sz lay.size, ?_⟩
   have hBne : (lay.size == sz) = false := beq_false_of_ne hNe
-  simp [validateMIR, validateRecords, validateRecord, hPlan, hClaim, hBne, currentMIRVersion]
+  simp [validateMIR, validateRecords, validateRecord, hPlan, hClaim, hBne, currentMIRVersion, bind, Except.bind]
 
 theorem validateMIR_rejects_leaked_view :
     ∃ err, validateMIR sampleLeakedViewMIR = .error err := by

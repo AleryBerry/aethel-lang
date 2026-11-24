@@ -29,6 +29,19 @@ private def runMIRTests : IO Unit := do
   | .error (.unsupportedVersion 2 1) => pure ()
   | _ => throw (IO.userError "stale MIR version was not rejected")
 
+  let records := sampleValidMIR.records ++
+    (sampleValidMIR.records.map fun r => { r with name := "Second" })
+  match validateMIR { sampleValidMIR with records := records } with
+  | .ok cert =>
+    require "MIR certificate preserves record order"
+      (cert.recordSizes == [("EntityFlags", 8), ("Second", 8)])
+  | .error _ => throw (IO.userError "ordered record list unexpectedly failed")
+
+  let badCollections : List MIRCollectionDecl := [⟨"first", .aosoa 0, 1⟩, ⟨"second", .soa, 0⟩]
+  match validateMIR { sampleLeakedViewMIR with collections := badCollections } with
+  | .error (.invalidCollectionLayout "first") => pure ()
+  | _ => throw (IO.userError "MIR validation must report the first error")
+
   let frameBad : MIRModule :=
     { version := 1
       functions :=

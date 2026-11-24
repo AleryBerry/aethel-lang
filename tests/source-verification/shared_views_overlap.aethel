@@ -1,0 +1,16 @@
+type Pair {
+  left: u8,
+  right: u8,
+}
+
+fn main() -> u8 {
+  let mut pair = Pair { left: 17u8, right: 23u8, };
+  view shared outer = pair.left {
+    view shared inner = pair.left {
+      let _ = outer;
+      let _ = inner;
+      let _ = pair.left;
+    };
+  };
+  pair.left
+}

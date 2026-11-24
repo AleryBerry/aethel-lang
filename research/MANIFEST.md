@@ -17,4 +17,6 @@ Current Lean definitions and proofs are written for Aethel. No upstream formaliz
 ## Law system and Rust interoperability
 
 - Bend 2 at `0e2f38f759cc830849e489307f3d256a7d148288`, https://github.com/bendlang/bend . The companion law/proof workflow and BendTT verdict are described in the guide and `bend2/safe.ts`.
-- Rust at `c884ecfbabb04b04fa5054dafc67ec258ecde745`, https://github.com/rust-lang/rust . Inspect `compiler/rustc_borrowck/src/places_conflict.rs` and `library/core/src/slice/raw.rs`. A separate host probe used rustc 1.88.0 and Zig 0.17.0 to sort a Zig-owned scalar buffer in place through a static Rust C-ABI adapter.
+- Rust at `c884ecfbabb04b04fa5054dafc67ec258ecde745`, https://github.com/rust-lang/rust . Inspected `compiler/rustc_borrowck/src/places_conflict.rs`, `compiler/rustc_next_trait_solver/src/coherence.rs`, `compiler/rustc_trait_selection/src/traits/coherence.rs`, `compiler/rustc_hir_analysis/src/coherence/orphan.rs`, `compiler/rustc_abi/src/lib.rs`, `compiler/rustc_middle/src/ty/vtable.rs`, and `library/core/src/slice/raw.rs`. A separate host probe used rustc 1.88.0 and Zig 0.17.0 to sort a Zig-owned scalar buffer in place through a static Rust C-ABI adapter.
+
+The segmented AoSoA experiment also references `compiler/rustc_arena/src/lib.rs` at the same pinned Rust revision `c884ecfbabb04b04fa5054dafc67ec258ecde745`.

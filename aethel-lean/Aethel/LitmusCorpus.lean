@@ -13,7 +13,7 @@ namespace Aethel.LitmusCorpus
 
 open Litmus
 
-/-- The complete 250-program full-language litmus corpus across all 9 domains. -/
+/-- The 250 Lean litmus fixtures across nine domains. -/
 def allFixtures : List Fixture :=
   AliasingScopes.fixtures ++
   InvalidationFacts.fixtures ++
@@ -40,6 +40,6 @@ def runLitmusCorpus : IO Unit := do
     else
       throw (IO.userError s!"Litmus test failed: {f.name} ({f.description})")
 
-  IO.println s!"250 full-language litmus programs and safety counterexamples passed across all 9 domains"
+  IO.println s!"250 Lean litmus fixtures passed across nine domains"
 
 end Aethel.LitmusCorpus

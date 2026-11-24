@@ -15,6 +15,9 @@ lake exe aethel-check
 Run the complete current verification suite from the project root with
 `bash scripts/verify.sh`.
 
+Check and execute the reference byte-record source fragment from `aethel-lean` with
+`lake exe aethel-check --source ../tests/source-verification/shared_view_allows_sibling_write.aethel`.
+
 The executable runs Lean regressions for the foundations, the byte resource checker, the pure functional fragment, bounded search, and structured programs. The verification status records the exact proved claims and the remaining formal gate.
 
 The [research manifest](research/MANIFEST.md) records the upstream publications and artifact revisions.

@@ -213,6 +213,37 @@ pub fn planCompactADT(variant_count: usize, max_payload_bits: u16) CompactADTLay
     };
 }
 
+pub fn planFlatCLayout(
+    alloc: std.mem.Allocator,
+    fields: []const FieldSchema,
+) std.mem.Allocator.Error!RecordLayout {
+    if (fields.len == 0) {
+        return .{ .size = 0, .alignment = 1, .fields = &.{} };
+    }
+    const out = try alloc.alloc(FieldPlacement, fields.len);
+    var cursor: usize = 0;
+    var max_align: usize = 1;
+    for (fields, 0..) |f, idx| {
+        const a = @max(@as(usize, 1), f.addressable_align);
+        if (a > max_align) max_align = a;
+        const offset = alignUp(cursor, a);
+        cursor = offset + f.addressable_size;
+        out[idx] = .{
+            .byte_offset = offset,
+            .bit_offset = null,
+            .size = f.addressable_size,
+            .alignment = a,
+            .bits = f.bits,
+            .policy = .addressable,
+        };
+    }
+    return .{
+        .size = alignUp(cursor, max_align),
+        .alignment = max_align,
+        .fields = out,
+    };
+}
+
 /// Synthesize co-borrow-safe field layout matching `Aethel.CoBorrowPacking.autoPlan`
 /// and `Aethel.AutomaticLayout.plan` (stable alignment ordering + FFD sub-byte bins).
 pub fn planRecordLayout(

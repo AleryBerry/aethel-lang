@@ -41,3 +41,11 @@ import Aethel.MIRValidator
 import Aethel.ScopedForkJoin
 import Aethel.RustFFI
 import Aethel.IntInference
+import Aethel.CategoricalTraits
+import Aethel.RustBorrowBridge
+import Aethel.RustTraitBridge
+import Aethel.RustComplexABI
+import Aethel.DynamicMemory
+import Aethel.SegmentedAoSoA
+import Aethel.StdContainers
+import Aethel.SourceVerification

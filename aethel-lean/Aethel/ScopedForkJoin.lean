@@ -23,19 +23,19 @@ structure TaskFootprint where
 def TaskFootprint.touched (f : TaskFootprint) : List ByteLocation :=
   f.reads ++ f.writes
 
-def checkForkDisjoint (a b : TaskFootprint) : Bool :=
-  a.writes.all (fun w => !decide (w ∈ b.reads) && !decide (w ∈ b.writes)) &&
-  b.writes.all (fun w => !decide (w ∈ a.reads) && !decide (w ∈ a.writes))
+private def TaskFootprint.toFootprint (f : TaskFootprint) : Footprint :=
+  ⟨f.reads, f.writes⟩
 
-/-- Independent mathematical race-freedom specification for scoped child tasks. -/
+def checkForkDisjoint (a b : TaskFootprint) : Bool :=
+  a.toFootprint.compatible b.toFootprint
+
+/-- Compatibility of the physical reads and writes of two tasks. -/
 def ForkDisjoint (a b : TaskFootprint) : Prop :=
-  (∀ w ∈ a.writes, w ∉ b.reads ∧ w ∉ b.writes) ∧
-  (∀ w ∈ b.writes, w ∉ a.reads ∧ w ∉ a.writes)
+  a.toFootprint.Compatible b.toFootprint
 
 theorem checkForkDisjoint_correct (a b : TaskFootprint) :
-    checkForkDisjoint a b = true ↔ ForkDisjoint a b := by
-  simp only [checkForkDisjoint, ForkDisjoint, Bool.and_eq_true, List.all_eq_true,
-    Bool.not_eq_true', decide_eq_false_iff_not]
+    checkForkDisjoint a b = true ↔ ForkDisjoint a b :=
+  Footprint.compatible_correct a.toFootprint b.toFootprint
 
 theorem forkDisjoint_symm {a b : TaskFootprint} (h : ForkDisjoint a b) :
     ForkDisjoint b a :=

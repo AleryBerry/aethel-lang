@@ -724,6 +724,16 @@ fn handleVerify(
     if (lean_summary) |ls| {
         try stdout.print("  [LEAN MIR]  {s}\n", .{ls});
     }
+    if (checked.foreign_contracts.len > 0) {
+        try stdout.print("  [FOREIGN]   Foreign contracts assumed: {d}\n", .{checked.foreign_contracts.len});
+        for (checked.foreign_contracts) |fc| {
+            if (fc.trait_name) |tn| {
+                try stdout.print("              - instance {s}: {s} -> rust \"{s}\"\n", .{ fc.aethel_name, tn, fc.rust_sym });
+            } else {
+                try stdout.print("              - fn {s} -> rust \"{s}\"\n", .{ fc.aethel_name, fc.rust_sym });
+            }
+        }
+    }
 
     if (checked.hasErrors()) {
         for (checked.diagnostics) |diag| {
@@ -818,8 +828,8 @@ fn printUsage(writer: *Io.Writer) Io.Writer.Error!void {
         \\  aethel emit-mir <file.aethel>
         \\  aethel emit-zig <file.aethel>
         \\  aethel emit-rust-adapter <file.aethel>
-        \\  aethel build <file.aethel> [--rust <lib.rs>] [-o <out>] [-O debug|safe|fast|small] [--keep-zig]
-        \\  aethel run <file.aethel> [--rust <lib.rs>] [-O debug|safe|fast|small] [--keep-zig]
+        \\  aethel build <file.aethel> [--rust <lib.rs|crate_dir>] [-o <out>] [-O debug|safe|fast|small] [--keep-zig]
+        \\  aethel run <file.aethel> [--rust <lib.rs|crate_dir>] [-O debug|safe|fast|small] [--keep-zig]
         \\
     , .{});
 }

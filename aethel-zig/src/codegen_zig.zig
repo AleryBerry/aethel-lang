@@ -26,6 +26,8 @@ const ScopeVar = struct {
     name: []const u8,
     ty: ?*const sema.Ty,
     is_mut: bool,
+    is_owned_dyn: bool = false,
+    has_moved_flag: bool = false,
 };
 
 const Emitter = struct {
@@ -53,7 +55,27 @@ const Emitter = struct {
             .name = name,
             .ty = ty,
             .is_mut = is_mut,
+            .is_owned_dyn = false,
+            .has_moved_flag = false,
         }) catch {};
+    }
+
+    fn bindOwnedScopeVar(self: *Emitter, name: []const u8, ty: ?*const sema.Ty, is_mut: bool, has_moved_flag: bool) void {
+        self.scope_vars.append(self.alloc, .{
+            .name = name,
+            .ty = ty,
+            .is_mut = is_mut,
+            .is_owned_dyn = true,
+            .has_moved_flag = has_moved_flag,
+        }) catch {};
+    }
+
+    fn isOwnedDynamicTy(ty: ?*const sema.Ty) bool {
+        const t = ty orelse return false;
+        return switch (t.*) {
+            .vec, .map, .set, .deque => true,
+            else => false,
+        };
     }
 
     fn lookupScopeVar(self: *const Emitter, name: []const u8) ?ScopeVar {
@@ -130,19 +152,31 @@ const Emitter = struct {
             }
         }
 
-        // 3. Extern C-ABI declarations (Rust staticlib bridge)
+        // 3. Extern C-ABI & @external(rust) declarations (Rust staticlib bridge)
         for (self.tree.module.decls) |decl| {
-            if (decl.kind == .extern_decl) {
-                try self.emitExternDecl(&decl);
+            switch (decl.kind) {
+                .extern_decl => try self.emitExternDecl(&decl),
+                .fn_decl => |fd| if (!fd.has_body) {
+                    try self.emitExternalFnProto(&decl);
+                },
+                else => {},
             }
         }
 
-        // 4. Functions & erased Constitutional Laws
+        // 4. Trait instances (compile-time zero-overhead witness structs/functors)
+        for (self.checked.instances) |*inst| {
+            try self.emitInstanceDecl(inst);
+            try self.w.writeByte('\n');
+        }
+
+        // 5. Functions & erased Constitutional Laws
         for (self.tree.module.decls) |decl| {
             switch (decl.kind) {
-                .fn_decl => {
-                    try self.emitFnDecl(&decl);
-                    try self.w.writeByte('\n');
+                .fn_decl => |fd| {
+                    if (fd.has_body) {
+                        try self.emitFnDecl(&decl);
+                        try self.w.writeByte('\n');
+                    }
                 },
                 .law_decl => |ld| {
                     const lname = self.sourceOf(ld.name);
@@ -154,6 +188,9 @@ const Emitter = struct {
                         }
                     }
                     try self.w.print("// law {s}: erased ({s})\n", .{ lname, verdict_str });
+                },
+                .trait_decl => |tr| {
+                    try self.w.print("// trait {s}: erased (laws checked per instance)\n", .{self.sourceOf(tr.name)});
                 },
                 else => {},
             }
@@ -167,6 +204,7 @@ const Emitter = struct {
             \\
             \\var aethel_io: std.Io = undefined;
             \\var aethel_alloc: std.mem.Allocator = undefined;
+            \\var aethel_gpa: std.mem.Allocator = std.heap.smp_allocator;
             \\
             \\fn aethelPrint(args: anytype, newline: bool, to_stderr: bool) void {
             \\    var buf: [4096]u8 = undefined;
@@ -251,6 +289,588 @@ const Emitter = struct {
             \\    }
             \\}
             \\
+            \\fn aethelHashVal(val: anytype) u64 {
+            \\    const T = @TypeOf(val);
+            \\    if (T == []const u8 or T == []u8) {
+            \\        return std.hash.Wyhash.hash(0, val);
+            \\    }
+            \\    switch (@typeInfo(T)) {
+            \\        .int => |info| {
+            \\            if (info.bits <= 64) {
+            \\                const uval: u64 = if (info.signedness == .signed) @bitCast(@as(i64, @intCast(val))) else @intCast(val);
+            \\                return std.hash.Wyhash.hash(0, std.mem.asBytes(&uval));
+            \\            }
+            \\            return std.hash.Wyhash.hash(0, std.mem.asBytes(&val));
+            \\        },
+            \\        .bool => return if (val) 0x9e3779b97f4a7c15 else 0x517cc1b727220a95,
+            \\        .@"enum" => {
+            \\            const tag: usize = @intFromEnum(val);
+            \\            return std.hash.Wyhash.hash(0, std.mem.asBytes(&tag));
+            \\        },
+            \\        .optional => {
+            \\            if (val) |inner| return aethelHashVal(inner) ^ 0x5555555555555555;
+            \\            return 0xaaaaaaaaaaaaaaaa;
+            \\        },
+            \\        .@"struct" => |si| {
+            \\            var h: u64 = 0x243f6a8885a308d3;
+            \\            inline for (si.fields) |fld| {
+            \\                h = h *% 0x9e3779b185ebca87 +% aethelHashVal(@field(val, fld.name));
+            \\            }
+            \\            return h;
+            \\        },
+            \\        .pointer => |ptr| {
+            \\            if (ptr.size == .one and @typeInfo(ptr.child) == .array and @typeInfo(ptr.child).array.child == u8) {
+            \\                return std.hash.Wyhash.hash(0, val);
+            \\            }
+            \\            return std.hash.Wyhash.hash(0, std.mem.asBytes(&val));
+            \\        },
+            \\        else => return std.hash.Wyhash.hash(0, std.mem.asBytes(&val)),
+            \\    }
+            \\}
+            \\
+            \\fn aethelEqlVal(a: anytype, b: @TypeOf(a)) bool {
+            \\    const T = @TypeOf(a);
+            \\    if (T == []const u8 or T == []u8) {
+            \\        return std.mem.eql(u8, a, b);
+            \\    }
+            \\    switch (@typeInfo(T)) {
+            \\        .optional => {
+            \\            if (a) |va| {
+            \\                if (b) |vb| return aethelEqlVal(va, vb);
+            \\                return false;
+            \\            }
+            \\            return b == null;
+            \\        },
+            \\        .@"struct" => |si| {
+            \\            inline for (si.fields) |fld| {
+            \\                if (!aethelEqlVal(@field(a, fld.name), @field(b, fld.name))) return false;
+            \\            }
+            \\            return true;
+            \\        },
+            \\        else => return std.meta.eql(a, b),
+            \\    }
+            \\}
+            \\
+            \\fn aethelStrStartsWith(s: []const u8, pre: []const u8) bool {
+            \\    return std.mem.startsWith(u8, s, pre);
+            \\}
+            \\
+            \\fn aethelStrEndsWith(s: []const u8, suf: []const u8) bool {
+            \\    return std.mem.endsWith(u8, s, suf);
+            \\}
+            \\
+            \\fn aethelStrContains(s: []const u8, sub: []const u8) bool {
+            \\    return std.mem.indexOf(u8, s, sub) != null;
+            \\}
+            \\
+            \\fn aethelStrByteAt(s: []const u8, idx: u64) ?u8 {
+            \\    const i: usize = @intCast(idx);
+            \\    if (i >= s.len) return null;
+            \\    return s[i];
+            \\}
+            \\
+            \\fn aethelStrSlice(s: []const u8, lo: u64, hi: u64) []const u8 {
+            \\    const a: usize = @min(@as(usize, @intCast(lo)), s.len);
+            \\    const b: usize = @max(a, @min(@as(usize, @intCast(hi)), s.len));
+            \\    return s[a..b];
+            \\}
+            \\
+            \\fn AethelVec(comptime T: type) type {
+            \\    return struct {
+            \\        items_ptr: ?[*]align(64) T = null,
+            \\        len: usize = 0,
+            \\        cap: usize = 0,
+            \\
+            \\        pub fn new() @This() {
+            \\            return .{};
+            \\        }
+            \\
+            \\        pub fn withCapacity(req_cap: u64) @This() {
+            \\            var self = @This(){};
+            \\            if (req_cap > 0) self.ensureCap(@intCast(req_cap));
+            \\            return self;
+            \\        }
+            \\
+            \\        pub fn fromSlice(src: []const T) @This() {
+            \\            var self = @This(){};
+            \\            if (src.len > 0) {
+            \\                self.ensureCap(src.len);
+            \\                if (self.items_ptr) |p| {
+            \\                    @memcpy(p[0..src.len], src);
+            \\                }
+            \\                self.len = src.len;
+            \\            }
+            \\            return self;
+            \\        }
+            \\
+            \\        fn ensureCap(self: *@This(), min_cap: usize) void {
+            \\            if (min_cap <= self.cap) return;
+            \\            var new_cap: usize = if (self.cap == 0) 8 else self.cap * 2;
+            \\            while (new_cap < min_cap) new_cap *= 2;
+            \\            if (@sizeOf(T) == 0) {
+            \\                self.cap = new_cap;
+            \\                return;
+            \\            }
+            \\            const new_mem = aethel_gpa.alignedAlloc(T, .@"64", new_cap) catch @panic("aethel: out of memory");
+            \\            if (self.items_ptr) |old_p| {
+            \\                if (self.len > 0) @memcpy(new_mem[0..self.len], old_p[0..self.len]);
+            \\                if (self.cap > 0) aethel_gpa.free(old_p[0..self.cap]);
+            \\            }
+            \\            self.items_ptr = new_mem.ptr;
+            \\            self.cap = new_cap;
+            \\        }
+            \\
+            \\        pub fn reserve(self: *@This(), additional: u64) void {
+            \\            self.ensureCap(self.len + @as(usize, @intCast(additional)));
+            \\        }
+            \\
+            \\        pub fn push(self: *@This(), val: T) void {
+            \\            if (self.len == self.cap) self.ensureCap(self.len + 1);
+            \\            if (self.items_ptr) |p| p[self.len] = val;
+            \\            self.len += 1;
+            \\        }
+            \\
+            \\        pub fn pop(self: *@This()) ?T {
+            \\            if (self.len == 0) return null;
+            \\            self.len -= 1;
+            \\            return if (self.items_ptr) |p| p[self.len] else null;
+            \\        }
+            \\
+            \\        pub fn get(self: @This(), idx: u64) ?T {
+            \\            const i: usize = @intCast(idx);
+            \\            if (i >= self.len) return null;
+            \\            return if (self.items_ptr) |p| p[i] else null;
+            \\        }
+            \\
+            \\        pub fn set(self: *@This(), idx: u64, val: T) bool {
+            \\            const i: usize = @intCast(idx);
+            \\            if (i >= self.len) return false;
+            \\            if (self.items_ptr) |p| p[i] = val;
+            \\            return true;
+            \\        }
+            \\
+            \\        pub fn swapRemove(self: *@This(), idx: u64) ?T {
+            \\            const i: usize = @intCast(idx);
+            \\            if (i >= self.len) return null;
+            \\            const p = self.items_ptr orelse return null;
+            \\            const removed = p[i];
+            \\            self.len -= 1;
+            \\            if (i != self.len) p[i] = p[self.len];
+            \\            return removed;
+            \\        }
+            \\
+            \\        pub fn clear(self: *@This()) void {
+            \\            self.len = 0;
+            \\        }
+            \\
+            \\        pub fn asSlice(self: @This()) []T {
+            \\            if (self.len == 0) return &.{};
+            \\            return if (self.items_ptr) |p| p[0..self.len] else &.{};
+            \\        }
+            \\
+            \\        pub inline fn mutSlice(self: *@This()) []T {
+            \\            return self.asSlice();
+            \\        }
+            \\
+            \\        pub fn slice(self: @This(), lo: usize, hi: usize) []T {
+            \\            const p = self.items_ptr orelse return &.{};
+            \\            return p[lo..hi];
+            \\        }
+            \\
+            \\        pub fn deinit(self: @This()) void {
+            \\            if (@sizeOf(T) > 0 and self.cap > 0) {
+            \\                if (self.items_ptr) |p| aethel_gpa.free(p[0..self.cap]);
+            \\            }
+            \\        }
+            \\    };
+            \\}
+            \\
+            \\fn AethelMap(comptime K: type, comptime V: type) type {
+            \\    return struct {
+            \\        ctrl: ?[*]align(64) u8 = null,
+            \\        keys: ?[*]K = null,
+            \\        vals: ?[*]V = null,
+            \\        len: usize = 0,
+            \\        used: usize = 0,
+            \\        cap: usize = 0,
+            \\
+            \\        pub fn new() @This() {
+            \\            return .{};
+            \\        }
+            \\
+            \\        pub fn withCapacity(req_cap: u64) @This() {
+            \\            var self = @This(){};
+            \\            if (req_cap > 0) {
+            \\                var c: usize = 8;
+            \\                while (c * 7 < @as(usize, @intCast(req_cap)) * 8) c *= 2;
+            \\                self.rehash(c);
+            \\            }
+            \\            return self;
+            \\        }
+            \\
+            \\        fn rehash(self: *@This(), new_cap: usize) void {
+            \\            const new_ctrl = aethel_gpa.alignedAlloc(u8, .@"64", new_cap) catch @panic("aethel: out of memory");
+            \\            @memset(new_ctrl, 0);
+            \\            const new_keys = aethel_gpa.alloc(K, new_cap) catch @panic("aethel: out of memory");
+            \\            const new_vals = aethel_gpa.alloc(V, new_cap) catch @panic("aethel: out of memory");
+            \\            const mask = new_cap - 1;
+            \\            var new_len: usize = 0;
+            \\            if (self.cap > 0 and self.ctrl != null and self.keys != null and self.vals != null) {
+            \\                const oc = self.ctrl.?;
+            \\                const ok = self.keys.?;
+            \\                const ov = self.vals.?;
+            \\                for (0..self.cap) |i| {
+            \\                    if ((oc[i] & 0x80) != 0) {
+            \\                        const k = ok[i];
+            \\                        const h = aethelHashVal(k);
+            \\                        const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\                        var idx: usize = @intCast(h & mask);
+            \\                        while (new_ctrl[idx] != 0) idx = (idx + 1) & mask;
+            \\                        new_ctrl[idx] = h2;
+            \\                        new_keys[idx] = k;
+            \\                        new_vals[idx] = ov[i];
+            \\                        new_len += 1;
+            \\                    }
+            \\                }
+            \\                aethel_gpa.free(oc[0..self.cap]);
+            \\                aethel_gpa.free(ok[0..self.cap]);
+            \\                aethel_gpa.free(ov[0..self.cap]);
+            \\            }
+            \\            self.ctrl = new_ctrl.ptr;
+            \\            self.keys = new_keys.ptr;
+            \\            self.vals = new_vals.ptr;
+            \\            self.cap = new_cap;
+            \\            self.len = new_len;
+            \\            self.used = new_len;
+            \\        }
+            \\
+            \\        pub fn insert(self: *@This(), k: K, v: V) ?V {
+            \\            if (self.cap == 0) {
+            \\                self.rehash(8);
+            \\            } else if ((self.used + 1) * 8 > self.cap * 7) {
+            \\                const next_cap = if (self.len * 2 <= self.cap) self.cap else self.cap * 2;
+            \\                self.rehash(next_cap);
+            \\            }
+            \\            const c = self.ctrl.?;
+            \\            const ks = self.keys.?;
+            \\            const vs = self.vals.?;
+            \\            const mask = self.cap - 1;
+            \\            const h = aethelHashVal(k);
+            \\            const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\            var idx: usize = @intCast(h & mask);
+            \\            var first_tomb: ?usize = null;
+            \\            while (true) {
+            \\                const slot = c[idx];
+            \\                if (slot == 0) {
+            \\                    const dst = first_tomb orelse idx;
+            \\                    if (first_tomb == null) self.used += 1;
+            \\                    c[dst] = h2;
+            \\                    ks[dst] = k;
+            \\                    vs[dst] = v;
+            \\                    self.len += 1;
+            \\                    return null;
+            \\                }
+            \\                if (slot == 1) {
+            \\                    if (first_tomb == null) first_tomb = idx;
+            \\                } else if (slot == h2 and aethelEqlVal(ks[idx], k)) {
+            \\                    const prev = vs[idx];
+            \\                    vs[idx] = v;
+            \\                    return prev;
+            \\                }
+            \\                idx = (idx + 1) & mask;
+            \\            }
+            \\        }
+            \\
+            \\        pub fn put(self: *@This(), k: K, v: V) void {
+            \\            _ = self.insert(k, v);
+            \\        }
+            \\
+            \\        pub fn get(self: @This(), k: K) ?V {
+            \\            if (self.cap == 0 or self.len == 0) return null;
+            \\            const c = self.ctrl orelse return null;
+            \\            const ks = self.keys orelse return null;
+            \\            const vs = self.vals orelse return null;
+            \\            const mask = self.cap - 1;
+            \\            const h = aethelHashVal(k);
+            \\            const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\            var idx: usize = @intCast(h & mask);
+            \\            while (true) {
+            \\                const slot = c[idx];
+            \\                if (slot == 0) return null;
+            \\                if (slot == h2 and aethelEqlVal(ks[idx], k)) return vs[idx];
+            \\                idx = (idx + 1) & mask;
+            \\            }
+            \\        }
+            \\
+            \\        pub fn contains(self: @This(), k: K) bool {
+            \\            return self.get(k) != null;
+            \\        }
+            \\
+            \\        pub fn remove(self: *@This(), k: K) ?V {
+            \\            if (self.cap == 0 or self.len == 0) return null;
+            \\            const c = self.ctrl orelse return null;
+            \\            const ks = self.keys orelse return null;
+            \\            const vs = self.vals orelse return null;
+            \\            const mask = self.cap - 1;
+            \\            const h = aethelHashVal(k);
+            \\            const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\            var idx: usize = @intCast(h & mask);
+            \\            while (true) {
+            \\                const slot = c[idx];
+            \\                if (slot == 0) return null;
+            \\                if (slot == h2 and aethelEqlVal(ks[idx], k)) {
+            \\                    c[idx] = 1;
+            \\                    self.len -= 1;
+            \\                    return vs[idx];
+            \\                }
+            \\                idx = (idx + 1) & mask;
+            \\            }
+            \\        }
+            \\
+            \\        pub fn clear(self: *@This()) void {
+            \\            if (self.cap > 0) {
+            \\                if (self.ctrl) |c| @memset(c[0..self.cap], 0);
+            \\            }
+            \\            self.len = 0;
+            \\            self.used = 0;
+            \\        }
+            \\
+            \\        pub fn deinit(self: @This()) void {
+            \\            if (self.cap > 0) {
+            \\                if (self.ctrl) |c| aethel_gpa.free(c[0..self.cap]);
+            \\                if (self.keys) |ks| aethel_gpa.free(ks[0..self.cap]);
+            \\                if (self.vals) |vs| aethel_gpa.free(vs[0..self.cap]);
+            \\            }
+            \\        }
+            \\    };
+            \\}
+            \\
+            \\fn AethelSet(comptime K: type) type {
+            \\    return struct {
+            \\        ctrl: ?[*]align(64) u8 = null,
+            \\        keys: ?[*]K = null,
+            \\        len: usize = 0,
+            \\        used: usize = 0,
+            \\        cap: usize = 0,
+            \\
+            \\        pub fn new() @This() {
+            \\            return .{};
+            \\        }
+            \\
+            \\        pub fn withCapacity(req_cap: u64) @This() {
+            \\            var self = @This(){};
+            \\            if (req_cap > 0) {
+            \\                var c: usize = 8;
+            \\                while (c * 7 < @as(usize, @intCast(req_cap)) * 8) c *= 2;
+            \\                self.rehash(c);
+            \\            }
+            \\            return self;
+            \\        }
+            \\
+            \\        fn rehash(self: *@This(), new_cap: usize) void {
+            \\            const new_ctrl = aethel_gpa.alignedAlloc(u8, .@"64", new_cap) catch @panic("aethel: out of memory");
+            \\            @memset(new_ctrl, 0);
+            \\            const new_keys = aethel_gpa.alloc(K, new_cap) catch @panic("aethel: out of memory");
+            \\            const mask = new_cap - 1;
+            \\            var new_len: usize = 0;
+            \\            if (self.cap > 0 and self.ctrl != null and self.keys != null) {
+            \\                const oc = self.ctrl.?;
+            \\                const ok = self.keys.?;
+            \\                for (0..self.cap) |i| {
+            \\                    if ((oc[i] & 0x80) != 0) {
+            \\                        const k = ok[i];
+            \\                        const h = aethelHashVal(k);
+            \\                        const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\                        var idx: usize = @intCast(h & mask);
+            \\                        while (new_ctrl[idx] != 0) idx = (idx + 1) & mask;
+            \\                        new_ctrl[idx] = h2;
+            \\                        new_keys[idx] = k;
+            \\                        new_len += 1;
+            \\                    }
+            \\                }
+            \\                aethel_gpa.free(oc[0..self.cap]);
+            \\                aethel_gpa.free(ok[0..self.cap]);
+            \\            }
+            \\            self.ctrl = new_ctrl.ptr;
+            \\            self.keys = new_keys.ptr;
+            \\            self.cap = new_cap;
+            \\            self.len = new_len;
+            \\            self.used = new_len;
+            \\        }
+            \\
+            \\        pub fn insert(self: *@This(), k: K) bool {
+            \\            if (self.cap == 0) {
+            \\                self.rehash(8);
+            \\            } else if ((self.used + 1) * 8 > self.cap * 7) {
+            \\                const next_cap = if (self.len * 2 <= self.cap) self.cap else self.cap * 2;
+            \\                self.rehash(next_cap);
+            \\            }
+            \\            const c = self.ctrl.?;
+            \\            const ks = self.keys.?;
+            \\            const mask = self.cap - 1;
+            \\            const h = aethelHashVal(k);
+            \\            const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\            var idx: usize = @intCast(h & mask);
+            \\            var first_tomb: ?usize = null;
+            \\            while (true) {
+            \\                const slot = c[idx];
+            \\                if (slot == 0) {
+            \\                    const dst = first_tomb orelse idx;
+            \\                    if (first_tomb == null) self.used += 1;
+            \\                    c[dst] = h2;
+            \\                    ks[dst] = k;
+            \\                    self.len += 1;
+            \\                    return true;
+            \\                }
+            \\                if (slot == 1) {
+            \\                    if (first_tomb == null) first_tomb = idx;
+            \\                } else if (slot == h2 and aethelEqlVal(ks[idx], k)) {
+            \\                    return false;
+            \\                }
+            \\                idx = (idx + 1) & mask;
+            \\            }
+            \\        }
+            \\
+            \\        pub fn contains(self: @This(), k: K) bool {
+            \\            if (self.cap == 0 or self.len == 0) return false;
+            \\            const c = self.ctrl orelse return false;
+            \\            const ks = self.keys orelse return false;
+            \\            const mask = self.cap - 1;
+            \\            const h = aethelHashVal(k);
+            \\            const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\            var idx: usize = @intCast(h & mask);
+            \\            while (true) {
+            \\                const slot = c[idx];
+            \\                if (slot == 0) return false;
+            \\                if (slot == h2 and aethelEqlVal(ks[idx], k)) return true;
+            \\                idx = (idx + 1) & mask;
+            \\            }
+            \\        }
+            \\
+            \\        pub fn remove(self: *@This(), k: K) bool {
+            \\            if (self.cap == 0 or self.len == 0) return false;
+            \\            const c = self.ctrl orelse return false;
+            \\            const ks = self.keys orelse return false;
+            \\            const mask = self.cap - 1;
+            \\            const h = aethelHashVal(k);
+            \\            const h2: u8 = @as(u8, @truncate((h >> 57) & 0x7F)) | 0x80;
+            \\            var idx: usize = @intCast(h & mask);
+            \\            while (true) {
+            \\                const slot = c[idx];
+            \\                if (slot == 0) return false;
+            \\                if (slot == h2 and aethelEqlVal(ks[idx], k)) {
+            \\                    c[idx] = 1;
+            \\                    self.len -= 1;
+            \\                    return true;
+            \\                }
+            \\                idx = (idx + 1) & mask;
+            \\            }
+            \\        }
+            \\
+            \\        pub fn clear(self: *@This()) void {
+            \\            if (self.cap > 0) {
+            \\                if (self.ctrl) |c| @memset(c[0..self.cap], 0);
+            \\            }
+            \\            self.len = 0;
+            \\            self.used = 0;
+            \\        }
+            \\
+            \\        pub fn deinit(self: @This()) void {
+            \\            if (self.cap > 0) {
+            \\                if (self.ctrl) |c| aethel_gpa.free(c[0..self.cap]);
+            \\                if (self.keys) |ks| aethel_gpa.free(ks[0..self.cap]);
+            \\            }
+            \\        }
+            \\    };
+            \\}
+            \\
+            \\fn AethelDeque(comptime T: type) type {
+            \\    return struct {
+            \\        buf: ?[*]T = null,
+            \\        head: usize = 0,
+            \\        len: usize = 0,
+            \\        cap: usize = 0,
+            \\
+            \\        pub fn new() @This() {
+            \\            return .{};
+            \\        }
+            \\
+            \\        pub fn withCapacity(req_cap: u64) @This() {
+            \\            var self = @This(){};
+            \\            if (req_cap > 0) self.ensureCap(@intCast(req_cap));
+            \\            return self;
+            \\        }
+            \\
+            \\        fn ensureCap(self: *@This(), min_cap: usize) void {
+            \\            if (min_cap <= self.cap) return;
+            \\            var new_cap: usize = if (self.cap == 0) 8 else self.cap * 2;
+            \\            while (new_cap < min_cap) new_cap *= 2;
+            \\            const new_buf = aethel_gpa.alloc(T, new_cap) catch @panic("aethel: out of memory");
+            \\            if (self.buf) |old_p| {
+            \\                const mask = self.cap - 1;
+            \\                for (0..self.len) |i| {
+            \\                    new_buf[i] = old_p[(self.head + i) & mask];
+            \\                }
+            \\                if (self.cap > 0) aethel_gpa.free(old_p[0..self.cap]);
+            \\            }
+            \\            self.buf = new_buf.ptr;
+            \\            self.head = 0;
+            \\            self.cap = new_cap;
+            \\        }
+            \\
+            \\        pub fn pushBack(self: *@This(), val: T) void {
+            \\            if (self.len == self.cap) self.ensureCap(self.len + 1);
+            \\            const p = self.buf.?;
+            \\            const idx = (self.head + self.len) & (self.cap - 1);
+            \\            p[idx] = val;
+            \\            self.len += 1;
+            \\        }
+            \\
+            \\        pub fn pushFront(self: *@This(), val: T) void {
+            \\            if (self.len == self.cap) self.ensureCap(self.len + 1);
+            \\            const p = self.buf.?;
+            \\            self.head = (self.head + self.cap - 1) & (self.cap - 1);
+            \\            p[self.head] = val;
+            \\            self.len += 1;
+            \\        }
+            \\
+            \\        pub fn popFront(self: *@This()) ?T {
+            \\            if (self.len == 0) return null;
+            \\            const p = self.buf orelse return null;
+            \\            const v = p[self.head];
+            \\            self.head = (self.head + 1) & (self.cap - 1);
+            \\            self.len -= 1;
+            \\            return v;
+            \\        }
+            \\
+            \\        pub fn popBack(self: *@This()) ?T {
+            \\            if (self.len == 0) return null;
+            \\            const p = self.buf orelse return null;
+            \\            self.len -= 1;
+            \\            const idx = (self.head + self.len) & (self.cap - 1);
+            \\            return p[idx];
+            \\        }
+            \\
+            \\        pub fn get(self: @This(), idx: u64) ?T {
+            \\            const i: usize = @intCast(idx);
+            \\            if (i >= self.len) return null;
+            \\            const p = self.buf orelse return null;
+            \\            return p[(self.head + i) & (self.cap - 1)];
+            \\        }
+            \\
+            \\        pub fn clear(self: *@This()) void {
+            \\            self.head = 0;
+            \\            self.len = 0;
+            \\        }
+            \\
+            \\        pub fn deinit(self: @This()) void {
+            \\            if (self.cap > 0) {
+            \\                if (self.buf) |p| aethel_gpa.free(p[0..self.cap]);
+            \\            }
+            \\        }
+            \\    };
+            \\}
+            \\
             \\
         );
     }
@@ -311,8 +931,62 @@ const Emitter = struct {
                 try self.emitTy(sl.elem);
             },
             .collection => |c| {
+                if (c.elem_record) |ridx| {
+                    if (ridx < self.checked.records.len) {
+                        const rec = &self.checked.records[ridx];
+                        switch (recordBackingKind(rec)) {
+                            .soa => {
+                                try self.w.print("__AethelSoA_{s}", .{rec.name});
+                                return;
+                            },
+                            .aosoa => |w| {
+                                try self.w.print("__AethelAoSoA_{d}_{s}", .{ w, rec.name });
+                                return;
+                            },
+                            .aos_slice => {},
+                        }
+                    }
+                }
                 try self.w.writeAll("[]");
                 try self.emitTy(c.elem_ty);
+            },
+            .vec => |v| {
+                if (v.elem_record) |ridx| {
+                    if (ridx < self.checked.records.len) {
+                        const rec = &self.checked.records[ridx];
+                        switch (recordBackingKind(rec)) {
+                            .soa => {
+                                try self.w.print("__AethelDynSoA_{s}", .{rec.name});
+                                return;
+                            },
+                            .aosoa => |w| {
+                                try self.w.print("__AethelDynAoSoA_{d}_{s}", .{ w, rec.name });
+                                return;
+                            },
+                            .aos_slice => {},
+                        }
+                    }
+                }
+                try self.w.writeAll("AethelVec(");
+                try self.emitTy(v.elem_ty);
+                try self.w.writeByte(')');
+            },
+            .map => |m| {
+                try self.w.writeAll("AethelMap(");
+                try self.emitTy(m.key_ty);
+                try self.w.writeAll(", ");
+                try self.emitTy(m.val_ty);
+                try self.w.writeByte(')');
+            },
+            .set => |s| {
+                try self.w.writeAll("AethelSet(");
+                try self.emitTy(s.elem_ty);
+                try self.w.writeByte(')');
+            },
+            .deque => |d| {
+                try self.w.writeAll("AethelDeque(");
+                try self.emitTy(d.elem_ty);
+                try self.w.writeByte(')');
             },
             .view => |v| {
                 if (v.target.* == .collection or v.target.* == .slice) {
@@ -376,6 +1050,27 @@ const Emitter = struct {
                 try self.emitTy(ft.ret);
             },
             .type_var => |tv| try self.w.print("__T_{s}", .{tv}),
+            .applied => |ap| {
+                const base_name = switch (ap.kind) {
+                    .record => self.checked.records[ap.decl_idx].name,
+                    .adt => self.checked.adts[ap.decl_idx].name,
+                    .opaque_ty => "Opaque",
+                };
+                try self.emitIdent(base_name);
+                if (ap.args.len > 0) {
+                    try self.w.writeByte('(');
+                    for (ap.args, 0..) |a, ai| {
+                        if (ai > 0) try self.w.writeAll(", ");
+                        try self.emitTy(a);
+                    }
+                    try self.w.writeByte(')');
+                }
+            },
+            .hkt_app => |ha| {
+                try self.w.print("__F_{s}(", .{ha.ctor});
+                try self.emitTy(ha.arg);
+                try self.w.writeByte(')');
+            },
         }
     }
 
@@ -475,9 +1170,57 @@ const Emitter = struct {
         return false;
     }
 
+    const BackingKind = union(enum) {
+        aos_slice,
+        soa,
+        aosoa: usize,
+    };
+
+    fn recordBackingKind(rec: *const sema.CheckedRecord) BackingKind {
+        if (rec.fields.len == 0 or recordHasAnyBin(rec)) return .aos_slice;
+        if (rec.collection_layout) |cl| {
+            return switch (cl) {
+                .soa => .soa,
+                .aosoa => |w| .{ .aosoa = w },
+                else => .aos_slice,
+            };
+        }
+        return .aos_slice;
+    }
+
+    fn tyBackingKind(self: *const Emitter, ty: ?*const sema.Ty) ?struct { ridx: usize, kind: BackingKind } {
+        const t = ty orelse return null;
+        const inner: *const sema.Ty = switch (t.*) {
+            .view => |v| v.target,
+            .path_borrow => |pb| pb.base,
+            else => t,
+        };
+        const ridx = switch (inner.*) {
+            .collection => |c| c.elem_record,
+            .vec => |v| v.elem_record,
+            else => null,
+        } orelse return null;
+        if (ridx >= self.checked.records.len) return null;
+        const bk = recordBackingKind(&self.checked.records[ridx]);
+        if (bk == .aos_slice) return null;
+        return .{ .ridx = ridx, .kind = bk };
+    }
+
+    fn isVecTyOrViewToVec(self: *const Emitter, ty: ?*const sema.Ty) bool {
+        _ = self;
+        const t = ty orelse return false;
+        const inner: *const sema.Ty = switch (t.*) {
+            .view => |v| v.target,
+            .path_borrow => |pb| pb.base,
+            else => t,
+        };
+        return inner.* == .vec;
+    }
+
     fn recordRecordIdxOfTy(ty: *const sema.Ty) ?usize {
         return switch (ty.*) {
             .record => |ri| ri,
+            .applied => |ap| if (ap.kind == .record) ap.decl_idx else null,
             .view => |v| recordRecordIdxOfTy(v.target),
             .path_borrow => |pb| recordRecordIdxOfTy(pb.base),
             else => null,
@@ -532,6 +1275,272 @@ const Emitter = struct {
         return null;
     }
 
+    fn emitBackingHelpers(self: *Emitter, rec: *const sema.CheckedRecord) Io.Writer.Error!void {
+        switch (recordBackingKind(rec)) {
+            .aos_slice => {},
+            .soa => {
+                try self.w.print("const __AethelSoA_{s} = struct {{\n", .{rec.name});
+                try self.w.writeAll("    len: usize,\n");
+                for (rec.fields) |f| {
+                    try self.w.writeAll("    ");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(": []");
+                    try self.emitTy(f.ty);
+                    try self.w.writeAll(",\n");
+                }
+                try self.w.writeAll("    pub inline fn slice(self: @This(), lo: usize, hi: usize) @This() {\n");
+                try self.w.writeAll("        return .{ .len = hi - lo");
+                for (rec.fields) |f| {
+                    try self.w.writeAll(", .");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(" = self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[lo..hi]");
+                }
+                try self.w.writeAll(" };\n    }\n");
+                try self.w.writeAll("    pub inline fn get(self: @This(), idx: usize) ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        return .{ ");
+                for (rec.fields, 0..) |f, fi| {
+                    if (fi > 0) try self.w.writeAll(", ");
+                    try self.w.writeByte('.');
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(" = self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[idx]");
+                }
+                try self.w.writeAll(" };\n    }\n");
+                try self.w.writeAll("    pub inline fn set(self: @This(), idx: usize, v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") void {\n");
+                for (rec.fields) |f| {
+                    try self.w.writeAll("        self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[idx] = v.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(";\n");
+                }
+                try self.w.writeAll("    }\n};\n");
+                try self.w.print("const __AethelDynSoA_{s} = struct {{\n", .{rec.name});
+                try self.w.writeAll("    len: usize = 0,\n    cap: usize = 0,\n");
+                for (rec.fields) |f| {
+                    try self.w.writeAll("    ");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(": ?[*]align(64) ");
+                    try self.emitTy(f.ty);
+                    try self.w.writeAll(" = null,\n");
+                }
+                try self.w.writeAll("    pub fn new() @This() { return .{}; }\n");
+                try self.w.writeAll("    pub fn withCapacity(req_cap: u64) @This() {\n        var self = @This(){};\n        if (req_cap > 0) self.ensureCap(@intCast(req_cap));\n        return self;\n    }\n");
+                try self.w.writeAll("    pub fn fromSlice(src: []const ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") @This() {\n        var self = @This(){};\n        if (src.len > 0) {\n            self.ensureCap(src.len);\n            for (src, 0..) |item, k| self.set(k, item);\n            self.len = src.len;\n        }\n        return self;\n    }\n");
+                try self.w.writeAll("    fn ensureCap(self: *@This(), min_cap: usize) void {\n");
+                try self.w.writeAll("        if (min_cap <= self.cap) return;\n");
+                try self.w.writeAll("        var new_cap: usize = if (self.cap == 0) 8 else self.cap * 2;\n");
+                try self.w.writeAll("        while (new_cap < min_cap) new_cap *= 2;\n");
+                for (rec.fields, 0..) |f, fi| {
+                    try self.w.print("        const __nf_{d} = aethel_gpa.alignedAlloc(", .{fi});
+                    try self.emitTy(f.ty);
+                    try self.w.writeAll(", .@\"64\", new_cap) catch @panic(\"aethel: out of memory\");\n");
+                    try self.w.writeAll("        if (self.");
+                    try self.emitIdent(f.name);
+                    try self.w.print(") |op| {{ if (self.len > 0) @memcpy(__nf_{d}[0..self.len], op[0..self.len]); if (self.cap > 0) aethel_gpa.free(op[0..self.cap]); }}\n", .{fi});
+                    try self.w.writeAll("        self.");
+                    try self.emitIdent(f.name);
+                    try self.w.print(" = __nf_{d}.ptr;\n", .{fi});
+                }
+                try self.w.writeAll("        self.cap = new_cap;\n    }\n");
+                try self.w.writeAll("    pub fn reserve(self: *@This(), additional: u64) void { self.ensureCap(self.len + @as(usize, @intCast(additional))); }\n");
+                try self.w.writeAll("    pub fn push(self: *@This(), v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") void {\n        if (self.len == self.cap) self.ensureCap(self.len + 1);\n        self.set(self.len, v);\n        self.len += 1;\n    }\n");
+                try self.w.writeAll("    pub fn pop(self: *@This()) ?");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        if (self.len == 0) return null;\n        self.len -= 1;\n        return self.get(self.len);\n    }\n");
+                try self.w.writeAll("    pub inline fn get(self: @This(), idx: usize) ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        return .{ ");
+                for (rec.fields, 0..) |f, fi| {
+                    if (fi > 0) try self.w.writeAll(", ");
+                    try self.w.writeByte('.');
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(" = self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(".?[idx]");
+                }
+                try self.w.writeAll(" };\n    }\n");
+                try self.w.writeAll("    pub fn getOpt(self: @This(), idx: u64) ?");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        const i: usize = @intCast(idx);\n        if (i >= self.len) return null;\n        return self.get(i);\n    }\n");
+                try self.w.writeAll("    pub inline fn set(self: @This(), idx: usize, v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") void {\n");
+                for (rec.fields) |f| {
+                    try self.w.writeAll("        self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(".?[idx] = v.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(";\n");
+                }
+                try self.w.writeAll("    }\n");
+                try self.w.writeAll("    pub fn setChecked(self: *@This(), idx: u64, v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") bool {\n        const i: usize = @intCast(idx);\n        if (i >= self.len) return false;\n        self.set(i, v);\n        return true;\n    }\n");
+                try self.w.writeAll("    pub fn swapRemove(self: *@This(), idx: u64) ?");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        const i: usize = @intCast(idx);\n        if (i >= self.len) return null;\n        const removed = self.get(i);\n        self.len -= 1;\n        if (i != self.len) self.set(i, self.get(self.len));\n        return removed;\n    }\n");
+                try self.w.writeAll("    pub fn clear(self: *@This()) void { self.len = 0; }\n");
+                try self.w.print("    pub inline fn asView(self: @This()) __AethelSoA_{s} {{\n        return .{{ .len = self.len", .{rec.name});
+                for (rec.fields) |f| {
+                    try self.w.writeAll(", .");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(" = if (self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(") |p| p[0..self.len] else &.{}");
+                }
+                try self.w.writeAll(" };\n    }\n");
+                try self.w.print("    pub inline fn mutView(self: *@This()) __AethelSoA_{s} {{\n        return self.asView();\n    }}\n", .{rec.name});
+                try self.w.print("    pub inline fn slice(self: @This(), lo: usize, hi: usize) __AethelSoA_{s} {{\n        return self.asView().slice(lo, hi);\n    }}\n", .{rec.name});
+                try self.w.writeAll("    pub fn deinit(self: @This()) void {\n        if (self.cap > 0) {\n");
+                for (rec.fields) |f| {
+                    try self.w.writeAll("            if (self.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(") |p| aethel_gpa.free(p[0..self.cap]);\n");
+                }
+                try self.w.writeAll("        }\n    }\n};\n");
+            },
+            .aosoa => |w| {
+                var all_c_abi = true;
+                for (rec.fields) |f| {
+                    const ok = switch (f.ty.*) {
+                        .int => |it| it.bits >= 8 and std.math.isPowerOfTwo(it.bits),
+                        .int_range => |ir| ir.synthesized.bits >= 8 and std.math.isPowerOfTwo(ir.synthesized.bits),
+                        .f32, .f64 => true,
+                        .record => true,
+                        else => false,
+                    };
+                    if (!ok) {
+                        all_c_abi = false;
+                        break;
+                    }
+                }
+                try self.w.print("const __AethelTile_{d}_{s} = {s} {{\n", .{
+                    w,
+                    rec.name,
+                    if (all_c_abi) "extern struct" else "struct",
+                });
+                for (rec.fields, 0..) |f, fi| {
+                    try self.w.writeAll("    ");
+                    try self.emitIdent(f.name);
+                    try self.w.print(": [{d}]", .{w});
+                    try self.emitTy(f.ty);
+                    try self.w.writeAll(if (fi == 0) " align(64),\n" else ",\n");
+                }
+                try self.w.writeAll("};\n");
+                try self.w.print("const __AethelAoSoA_{d}_{s} = struct {{\n", .{ w, rec.name });
+                try self.w.print("    tiles: []__AethelTile_{d}_{s},\n", .{ w, rec.name });
+                try self.w.writeAll("    base_elem: usize = 0,\n");
+                try self.w.writeAll("    len: usize,\n");
+                try self.w.writeAll("    pub inline fn slice(self: @This(), lo: usize, hi: usize) @This() {\n");
+                try self.w.writeAll("        return .{ .tiles = self.tiles, .base_elem = self.base_elem + lo, .len = hi - lo };\n    }\n");
+                try self.w.writeAll("    pub inline fn get(self: @This(), idx: usize) ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        const __a = self.base_elem + idx;\n");
+                try self.w.print("        const __t = &self.tiles[__a / {d}];\n", .{w});
+                try self.w.print("        const __l = __a % {d};\n", .{w});
+                try self.w.writeAll("        return .{ ");
+                for (rec.fields, 0..) |f, fi| {
+                    if (fi > 0) try self.w.writeAll(", ");
+                    try self.w.writeByte('.');
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(" = __t.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[__l]");
+                }
+                try self.w.writeAll(" };\n    }\n");
+                try self.w.writeAll("    pub inline fn set(self: @This(), idx: usize, v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") void {\n        const __a = self.base_elem + idx;\n");
+                try self.w.print("        const __t = &self.tiles[__a / {d}];\n", .{w});
+                try self.w.print("        const __l = __a % {d};\n", .{w});
+                for (rec.fields) |f| {
+                    try self.w.writeAll("        __t.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[__l] = v.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(";\n");
+                }
+                try self.w.writeAll("    }\n};\n");
+                try self.w.print("const __AethelDynAoSoA_{d}_{s} = struct {{\n", .{ w, rec.name });
+                try self.w.print("    tiles: ?[*]__AethelTile_{d}_{s} = null,\n", .{ w, rec.name });
+                try self.w.writeAll("    len: usize = 0,\n    tile_cap: usize = 0,\n");
+                try self.w.writeAll("    pub fn new() @This() { return .{}; }\n");
+                try self.w.writeAll("    pub fn withCapacity(req_cap: u64) @This() {\n        var self = @This(){};\n");
+                try self.w.print("        if (req_cap > 0) self.ensureTileCap((@as(usize, @intCast(req_cap)) + {d}) / {d});\n        return self;\n    }}\n", .{ w - 1, w });
+                try self.w.writeAll("    pub fn fromSlice(src: []const ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") @This() {\n        var self = @This(){};\n        if (src.len > 0) {\n");
+                try self.w.print("            self.ensureTileCap((src.len + {d}) / {d});\n", .{ w - 1, w });
+                try self.w.writeAll("            for (src, 0..) |item, k| self.set(k, item);\n            self.len = src.len;\n        }\n        return self;\n    }\n");
+                try self.w.writeAll("    fn ensureTileCap(self: *@This(), min_tcap: usize) void {\n");
+                try self.w.writeAll("        if (min_tcap <= self.tile_cap) return;\n");
+                try self.w.writeAll("        var new_tc: usize = if (self.tile_cap == 0) 1 else self.tile_cap * 2;\n");
+                try self.w.writeAll("        while (new_tc < min_tcap) new_tc *= 2;\n");
+                try self.w.print("        const new_mem = aethel_gpa.alloc(__AethelTile_{d}_{s}, new_tc) catch @panic(\"aethel: out of memory\");\n", .{ w, rec.name });
+                try self.w.writeAll("        if (self.tiles) |old_t| {\n            if (self.tile_cap > 0) {\n                @memcpy(new_mem[0..self.tile_cap], old_t[0..self.tile_cap]);\n                aethel_gpa.free(old_t[0..self.tile_cap]);\n            }\n        }\n");
+                try self.w.writeAll("        self.tiles = new_mem.ptr;\n        self.tile_cap = new_tc;\n    }\n");
+                try self.w.print("    pub fn reserve(self: *@This(), additional: u64) void {{\n        const need_elems = self.len + @as(usize, @intCast(additional));\n        if (need_elems > 0) self.ensureTileCap((need_elems + {d}) / {d});\n    }}\n", .{ w - 1, w });
+                try self.w.writeAll("    pub fn push(self: *@This(), v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") void {\n");
+                try self.w.print("        const need_tc = (self.len + 1 + {d}) / {d};\n", .{ w - 1, w });
+                try self.w.writeAll("        if (need_tc > self.tile_cap) self.ensureTileCap(need_tc);\n");
+                try self.w.writeAll("        self.set(self.len, v);\n        self.len += 1;\n    }\n");
+                try self.w.writeAll("    pub fn pop(self: *@This()) ?");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        if (self.len == 0) return null;\n        self.len -= 1;\n        return self.get(self.len);\n    }\n");
+                try self.w.writeAll("    pub inline fn get(self: @This(), idx: usize) ");
+                try self.emitIdent(rec.name);
+                try self.w.print(" {{\n        const __t = &self.tiles.?[idx / {d}];\n        const __l = idx % {d};\n        return .{{ ", .{ w, w });
+                for (rec.fields, 0..) |f, fi| {
+                    if (fi > 0) try self.w.writeAll(", ");
+                    try self.w.writeByte('.');
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(" = __t.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[__l]");
+                }
+                try self.w.writeAll(" };\n    }\n");
+                try self.w.writeAll("    pub fn getOpt(self: @This(), idx: u64) ?");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        const i: usize = @intCast(idx);\n        if (i >= self.len) return null;\n        return self.get(i);\n    }\n");
+                try self.w.writeAll("    pub inline fn set(self: @This(), idx: usize, v: ");
+                try self.emitIdent(rec.name);
+                try self.w.print(") void {{\n        const __t = &self.tiles.?[idx / {d}];\n        const __l = idx % {d};\n", .{ w, w });
+                for (rec.fields) |f| {
+                    try self.w.writeAll("        __t.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll("[__l] = v.");
+                    try self.emitIdent(f.name);
+                    try self.w.writeAll(";\n");
+                }
+                try self.w.writeAll("    }\n");
+                try self.w.writeAll("    pub fn setChecked(self: *@This(), idx: u64, v: ");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(") bool {\n        const i: usize = @intCast(idx);\n        if (i >= self.len) return false;\n        self.set(i, v);\n        return true;\n    }\n");
+                try self.w.writeAll("    pub fn swapRemove(self: *@This(), idx: u64) ?");
+                try self.emitIdent(rec.name);
+                try self.w.writeAll(" {\n        const i: usize = @intCast(idx);\n        if (i >= self.len) return null;\n        const removed = self.get(i);\n        self.len -= 1;\n        if (i != self.len) self.set(i, self.get(self.len));\n        return removed;\n    }\n");
+                try self.w.writeAll("    pub fn clear(self: *@This()) void { self.len = 0; }\n");
+                try self.w.print("    pub inline fn asView(self: @This()) __AethelAoSoA_{d}_{s} {{\n        return .{{ .tiles = if (self.tiles) |t| t[0..self.tile_cap] else &.{{}}, .base_elem = 0, .len = self.len }};\n    }}\n", .{ w, rec.name });
+                try self.w.print("    pub inline fn mutView(self: *@This()) __AethelAoSoA_{d}_{s} {{\n        return self.asView();\n    }}\n", .{ w, rec.name });
+                try self.w.print("    pub inline fn slice(self: @This(), lo: usize, hi: usize) __AethelAoSoA_{d}_{s} {{\n        return self.asView().slice(lo, hi);\n    }}\n", .{ w, rec.name });
+                try self.w.writeAll("    pub fn deinit(self: @This()) void {\n        if (self.tile_cap > 0) {\n            if (self.tiles) |t| aethel_gpa.free(t[0..self.tile_cap]);\n        }\n    }\n};\n");
+            },
+        }
+    }
+
     fn emitTypeDecl(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
         const td = decl.kind.type_decl;
         const name = self.checked.declCanonicalName(decl.span.start) orelse self.sourceOf(td.name);
@@ -539,38 +1548,67 @@ const Emitter = struct {
             .record => {
                 if (self.findCheckedRecordIndex(name)) |ridx| {
                     const rec = self.checked.records[ridx];
-                    try self.w.print("// Aethel verified layout: size={d} align={d} conflicts={d}\n", .{
+                    if (td.type_params.len > 0) {
+                        try self.w.writeAll("fn ");
+                        try self.emitIdent(name);
+                        try self.w.writeByte('(');
+                        for (td.type_params, 0..) |tp, ti| {
+                            if (ti > 0) try self.w.writeAll(", ");
+                            try self.w.print("comptime __T_{s}: type", .{self.sourceOf(tp)});
+                        }
+                        try self.w.writeAll(") type {\n    return struct {\n");
+                        for (rec.fields) |f| {
+                            try self.w.writeAll("        ");
+                            try self.emitIdent(f.name);
+                            try self.w.writeAll(": ");
+                            try self.emitTy(f.ty);
+                            try self.w.writeAll(",\n");
+                        }
+                        try self.w.writeAll("    };\n}\n");
+                        return;
+                    }
+                    try self.w.print("// Aethel verified layout: size={d} align={d} conflicts={d}{s}\n", .{
                         rec.record_layout.size,
                         rec.record_layout.alignment,
                         rec.conflicts.len,
+                        if (rec.is_flat_c) " (flat C-ABI)" else "",
                     });
-                    const has_bins = recordHasAnyBin(&rec);
-                    var can_assert_size = has_bins;
+                    const has_bins = !rec.is_flat_c and recordHasAnyBin(&rec);
+                    var can_assert_size = has_bins or rec.is_flat_c;
+                    var has_bool_field = false;
                     for (rec.fields) |f| {
                         switch (f.ty.*) {
-                            .int, .int_range, .f32, .f64, .bool => {},
+                            .int, .int_range, .f32, .f64 => {},
+                            .bool => {
+                                has_bool_field = true;
+                            },
                             else => can_assert_size = false,
                         }
                     }
+                    // Zig `extern struct` forbids `bool`; use `extern struct` when C-ABI primitive scalars/records only.
+                    const use_extern_struct = rec.is_flat_c and !has_bool_field;
+                    if (has_bool_field and rec.is_flat_c) can_assert_size = false;
 
-                    // Order physical fields by layout byte_offset ascending so hot fields & FFD bins lead cache line 0.
+                    // Order physical fields by layout byte_offset ascending unless @layout(flat).
                     const order: []usize = self.alloc.alloc(usize, rec.fields.len) catch &.{};
                     if (order.len == rec.fields.len) {
                         for (order, 0..) |*slot, i| slot.* = i;
-                        var a: usize = 0;
-                        while (a < order.len) : (a += 1) {
-                            var b: usize = a + 1;
-                            while (b < order.len) : (b += 1) {
-                                const fa = rec.record_layout.fields[order[a]];
-                                const fb = rec.record_layout.fields[order[b]];
-                                const swap = if (fb.byte_offset != fa.byte_offset)
-                                    fb.byte_offset < fa.byte_offset
-                                else
-                                    (fb.bit_offset orelse 0) < (fa.bit_offset orelse 0);
-                                if (swap) {
-                                    const tmp = order[a];
-                                    order[a] = order[b];
-                                    order[b] = tmp;
+                        if (!rec.is_flat_c) {
+                            var a: usize = 0;
+                            while (a < order.len) : (a += 1) {
+                                var b: usize = a + 1;
+                                while (b < order.len) : (b += 1) {
+                                    const fa = rec.record_layout.fields[order[a]];
+                                    const fb = rec.record_layout.fields[order[b]];
+                                    const swap = if (fb.byte_offset != fa.byte_offset)
+                                        fb.byte_offset < fa.byte_offset
+                                    else
+                                        (fb.bit_offset orelse 0) < (fa.bit_offset orelse 0);
+                                    if (swap) {
+                                        const tmp = order[a];
+                                        order[a] = order[b];
+                                        order[b] = tmp;
+                                    }
                                 }
                             }
                         }
@@ -579,12 +1617,13 @@ const Emitter = struct {
                     var emitted_bins = std.AutoHashMapUnmanaged(usize, void).empty;
                     try self.w.writeAll("const ");
                     try self.emitIdent(name);
-                    try self.w.writeAll(" = struct {\n");
+                    try self.w.writeAll(if (use_extern_struct) " = extern struct {\n" else " = struct {\n");
                     self.indent += 1;
                     const iter_len = if (order.len == rec.fields.len) order.len else rec.fields.len;
                     for (0..iter_len) |oi| {
                         const fi = if (order.len == rec.fields.len) order[oi] else oi;
-                        if (fieldBinByte(&rec, fi)) |bbyte| {
+                        if (!rec.is_flat_c and fieldBinByte(&rec, fi) != null) {
+                            const bbyte = fieldBinByte(&rec, fi).?;
                             if (emitted_bins.contains(bbyte)) continue;
                             emitted_bins.put(self.alloc, bbyte, {}) catch {};
                             try self.writeIndent();
@@ -628,9 +1667,14 @@ const Emitter = struct {
                         try self.w.writeAll("comptime {\n");
                         try self.w.writeAll("    if (@sizeOf(");
                         try self.emitIdent(name);
-                        try self.w.print(") > {d}) @compileError(\"packed record size exceeds verified layout\");\n", .{rec.record_layout.size});
+                        if (rec.is_flat_c) {
+                            try self.w.print(") != {d}) @compileError(\"flat C-ABI record size mismatch\");\n", .{rec.record_layout.size});
+                        } else {
+                            try self.w.print(") > {d}) @compileError(\"packed record size exceeds verified layout\");\n", .{rec.record_layout.size});
+                        }
                         try self.w.writeAll("}\n");
                     }
+                    try self.emitBackingHelpers(&rec);
                 }
             },
             .variants => {
@@ -832,6 +1876,339 @@ const Emitter = struct {
         return false;
     }
 
+    fn findPathBorrowFieldIndices(
+        self: *const Emitter,
+        ridx: usize,
+        pb_ty: *const sema.Ty,
+    ) []const usize {
+        const rec = &self.checked.records[ridx];
+        var list: std.ArrayList(usize) = .empty;
+        if (pb_ty.* == .path_borrow) {
+            for (pb_ty.path_borrow.paths) |fp| {
+                if (fp.len == 0) continue;
+                const fnm = self.sourceOf(fp[0]);
+                if (findRecordFieldIdx(rec, fnm)) |fi| {
+                    var dup = false;
+                    for (list.items) |prev| if (prev == fi) {
+                        dup = true;
+                    };
+                    if (!dup) list.append(self.alloc, fi) catch {};
+                }
+            }
+        }
+        if (list.items.len == 0) {
+            for (0..rec.fields.len) |fi| list.append(self.alloc, fi) catch {};
+        }
+        return list.toOwnedSlice(self.alloc) catch &.{};
+    }
+
+    fn emitCAbiParamSignature(
+        self: *Emitter,
+        pname: []const u8,
+        pty: *const sema.Ty,
+        first: *bool,
+    ) Io.Writer.Error!void {
+        if (pty.* == .slice or (pty.* == .view and pty.view.target.* == .slice)) {
+            const mutable = if (pty.* == .slice) pty.slice.mutable else (pty.view.mode == .exclusive and pty.view.target.slice.mutable);
+            const elem = if (pty.* == .slice) pty.slice.elem else pty.view.target.slice.elem;
+            if (!first.*) try self.w.writeAll(", ");
+            first.* = false;
+            try self.emitIdent(pname);
+            try self.w.writeAll("_ptr: [*]");
+            if (!mutable) try self.w.writeAll("const ");
+            try self.emitTy(elem);
+            try self.w.writeAll(", ");
+            try self.emitIdent(pname);
+            try self.w.writeAll("_len: usize");
+            return;
+        }
+        if (self.tyBackingKind(pty)) |bk| {
+            const rec = &self.checked.records[bk.ridx];
+            switch (bk.kind) {
+                .soa => {
+                    const fidxs = self.findPathBorrowFieldIndices(bk.ridx, pty);
+                    const is_mut = switch (pty.*) {
+                        .path_borrow => |pb| pb.mode == null or pb.mode.? == .exclusive,
+                        .view => |v| v.mode == .exclusive,
+                        .collection => true,
+                        else => false,
+                    };
+                    for (fidxs) |fi| {
+                        const f = rec.fields[fi];
+                        if (!first.*) try self.w.writeAll(", ");
+                        first.* = false;
+                        try self.w.print("{s}_{s}_ptr: [*]{s}", .{ pname, f.name, if (is_mut) "" else "const " });
+                        try self.emitTy(f.ty);
+                    }
+                    if (!first.*) try self.w.writeAll(", ");
+                    first.* = false;
+                    try self.w.print("{s}_len: usize", .{pname});
+                    return;
+                },
+                .aosoa => |w| {
+                    const is_mut = switch (pty.*) {
+                        .path_borrow => |pb| pb.mode == null or pb.mode.? == .exclusive,
+                        .view => |v| v.mode == .exclusive,
+                        .collection => true,
+                        else => false,
+                    };
+                    if (!first.*) try self.w.writeAll(", ");
+                    first.* = false;
+                    try self.w.print("{s}_tiles: [*]{s}__AethelTile_{d}_{s}, {s}_base: usize, {s}_len: usize", .{
+                        pname,
+                        if (is_mut) "" else "const ",
+                        w,
+                        rec.name,
+                        pname,
+                        pname,
+                    });
+                    return;
+                },
+                .aos_slice => {},
+            }
+        }
+        if (!first.*) try self.w.writeAll(", ");
+        first.* = false;
+        try self.emitIdent(pname);
+        try self.w.writeAll(": ");
+        try self.emitTy(pty);
+    }
+
+    fn emitExternalFnProto(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
+        const fd = decl.kind.fn_decl;
+        const fname = self.checked.declCanonicalName(decl.span.start) orelse self.sourceOf(fd.name);
+        const cf = self.findCheckedFn(fname) orelse return;
+        const ext_sym = cf.rust_sym orelse fname;
+        try self.w.print("// @external(rust) {s} -> {s}\n", .{ fname, ext_sym });
+        try self.w.writeAll("extern \"c\" fn ");
+        try self.emitIdent(ext_sym);
+        try self.w.writeByte('(');
+        var first = true;
+        for (fd.params, 0..) |p, pi| {
+            const pty = if (pi < cf.param_types.len) cf.param_types[pi] else continue;
+            try self.emitCAbiParamSignature(self.sourceOf(p.name), pty, &first);
+        }
+        try self.w.writeAll(") ");
+        try self.emitTy(cf.ret_type);
+        try self.w.writeAll(";\n\n");
+    }
+
+    fn emitInstanceDecl(self: *Emitter, inst: *const sema.CheckedInstance) Io.Writer.Error!void {
+        if (inst.is_external_rust) {
+            for (inst.methods) |cm| {
+                const esym = cm.ext_sym orelse continue;
+                try self.w.writeAll("extern \"c\" fn ");
+                try self.emitIdent(esym);
+                try self.w.writeByte('(');
+                var first = true;
+                for (cm.params, 0..) |pt, pi| {
+                    const pname = if (cm.ast_method != null and pi < cm.ast_method.?.params.len)
+                        self.sourceOf(cm.ast_method.?.params[pi].name)
+                    else
+                        "arg";
+                    try self.emitCAbiParamSignature(pname, pt, &first);
+                }
+                try self.w.writeAll(") ");
+                try self.emitTy(cm.ret);
+                try self.w.writeAll(";\n");
+            }
+        }
+
+        const is_generic = inst.type_params.len > 0 or inst.hkt_params.len > 0 or inst.constraints.len > 0;
+        var struct_buf: Io.Writer.Allocating = .init(self.alloc);
+        const outer_w = self.w;
+        if (is_generic) {
+            try outer_w.print("fn __Inst_{s}(", .{inst.name});
+            var comma = false;
+            for (inst.type_params) |tp| {
+                if (comma) try outer_w.writeAll(", ");
+                comma = true;
+                try outer_w.print("comptime __T_{s}: type", .{tp});
+            }
+            for (inst.hkt_params) |hp| {
+                if (comma) try outer_w.writeAll(", ");
+                comma = true;
+                try outer_w.print("comptime __F_{s}: fn (comptime type) type", .{hp});
+            }
+            for (0..inst.constraints.len) |ci| {
+                if (comma) try outer_w.writeAll(", ");
+                comma = true;
+                try outer_w.print("comptime __W_{d}: type", .{ci});
+            }
+            try outer_w.writeAll(") type {\n");
+            self.w = &struct_buf.writer;
+            try self.w.writeAll("    return struct {\n        const __InstSelf = @This();\n");
+            self.indent += 2;
+        } else {
+            try self.w.print("const __Inst_{s} = struct {{\n    const __InstSelf = @This();\n", .{inst.name});
+            self.indent += 1;
+        }
+
+        for (inst.methods) |cm| {
+            try self.writeIndent();
+            try self.w.writeAll("pub fn ");
+            try self.emitIdent(cm.local_name);
+            try self.w.writeByte('(');
+            var comma = false;
+            for (cm.type_params) |tp| {
+                if (comma) try self.w.writeAll(", ");
+                comma = true;
+                try self.w.print("comptime __T_{s}: type", .{tp});
+            }
+            const method_saved_w = self.w;
+            var msig_buf: Io.Writer.Allocating = .init(self.alloc);
+            self.w = &msig_buf.writer;
+            if (cm.synth == .monad_map or cm.synth == .monad_ap) {
+                for (cm.params, 0..) |pt, pi| {
+                    if (comma) try self.w.writeAll(", ");
+                    comma = true;
+                    try self.w.print("arg{d}: ", .{pi});
+                    if (pt.* == .fn_ty) try self.w.writeAll("anytype") else try self.emitTy(pt);
+                }
+                try self.w.writeAll(") ");
+                try self.emitTy(cm.ret);
+                try self.w.writeAll(" {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                if (cm.synth == .monad_map) {
+                    try self.w.print("return __InstSelf.bind(", .{});
+                    if (cm.type_params.len >= 2) {
+                        try self.w.print("__T_{s}, __T_{s}, ", .{ cm.type_params[0], cm.type_params[1] });
+                    }
+                    try self.w.writeAll("arg0, struct { f_cb: @TypeOf(arg1), pub fn call(s: @This(), x: ");
+                    if (cm.type_params.len >= 1) try self.w.print("__T_{s}", .{cm.type_params[0]}) else try self.w.writeAll("anytype");
+                    try self.w.writeAll(") ");
+                    try self.emitTy(cm.ret);
+                    try self.w.writeAll(" { return __InstSelf.pure(");
+                    if (cm.type_params.len >= 2) try self.w.print("__T_{s}, ", .{cm.type_params[1]}) else if (cm.type_params.len >= 1) try self.w.print("__T_{s}, ", .{cm.type_params[0]});
+                    try self.w.writeAll("aethelCall(s.f_cb, .{ x })); } }{ .f_cb = arg1 });\n");
+                } else {
+                    try self.w.writeAll("return __InstSelf.bind(");
+                    if (cm.type_params.len >= 2) {
+                        try self.w.print("__T_{s}, __T_{s}, ", .{ cm.type_params[0], cm.type_params[1] });
+                    }
+                    try self.w.writeAll("arg0, struct { mx_val: @TypeOf(arg1), pub fn call(s: @This(), f_fn: anytype) ");
+                    try self.emitTy(cm.ret);
+                    try self.w.writeAll(" { return __InstSelf.fmap(");
+                    if (cm.type_params.len >= 2) try self.w.print("__T_{s}, __T_{s}, ", .{ cm.type_params[0], cm.type_params[1] });
+                    try self.w.writeAll("s.mx_val, f_fn); } }{ .mx_val = arg1 });\n");
+                }
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+                self.w = method_saved_w;
+                try self.w.writeAll(msig_buf.written());
+                continue;
+            }
+            for (cm.params, 0..) |pt, pi| {
+                if (comma) try self.w.writeAll(", ");
+                comma = true;
+                const pname = if (cm.ast_method != null and pi < cm.ast_method.?.params.len)
+                    self.sourceOf(cm.ast_method.?.params[pi].name)
+                else
+                    std.fmt.allocPrint(self.alloc, "arg{d}", .{pi}) catch "arg";
+                try self.emitIdent(pname);
+                try self.w.writeAll(": ");
+                if (pt.* == .fn_ty) try self.w.writeAll("anytype") else try self.emitTy(pt);
+            }
+            try self.w.writeAll(") ");
+            try self.emitTy(cm.ret);
+            try self.w.writeAll(" {\n");
+            self.indent += 1;
+
+            var mbody_buf: Io.Writer.Allocating = .init(self.alloc);
+            self.w = &mbody_buf.writer;
+            if (cm.ext_sym) |esym| {
+                try self.writeIndent();
+                if (!isVoidTy(cm.ret)) try self.w.writeAll("return ");
+                try self.emitIdent(esym);
+                try self.w.writeByte('(');
+                for (cm.params, 0..) |_, pi| {
+                    if (pi > 0) try self.w.writeAll(", ");
+                    const pname = if (cm.ast_method != null and pi < cm.ast_method.?.params.len)
+                        self.sourceOf(cm.ast_method.?.params[pi].name)
+                    else
+                        std.fmt.allocPrint(self.alloc, "arg{d}", .{pi}) catch "arg";
+                    try self.emitIdent(pname);
+                }
+                try self.w.writeAll(");\n");
+            } else if (cm.ast_method) |im| {
+                const prev_ret = self.current_fn_ret;
+                self.current_fn_ret = cm.ret;
+                defer self.current_fn_ret = prev_ret;
+                const sv_mark = self.pushScopeVars();
+                defer self.popScopeVars(sv_mark);
+                for (im.params, 0..) |p, pi| {
+                    const pn = self.sourceOf(p.name);
+                    const pty: ?*const sema.Ty = if (pi < cm.params.len) cm.params[pi] else null;
+                    self.bindScopeVar(pn, pty, false);
+                    if (!self.blockMentionsIdent(&im.body, pn)) {
+                        try self.writeIndent();
+                        try self.w.writeAll("_ = ");
+                        try self.emitIdent(pn);
+                        try self.w.writeAll(";\n");
+                    }
+                }
+                try self.emitStmtsWithRest(im.body.stmts, im.body.tail);
+                if (im.body.tail) |tail| {
+                    if (isVoidTy(cm.ret)) {
+                        try self.emitTailStmt(tail);
+                    } else {
+                        try self.writeIndent();
+                        try self.w.writeAll("return ");
+                        try self.emitCoercedExpr(tail, cm.ret);
+                        try self.w.writeAll(";\n");
+                    }
+                }
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+
+            self.w = method_saved_w;
+            try self.w.writeAll(msig_buf.written());
+            for (cm.type_params) |tp| {
+                const tsym = std.fmt.allocPrint(self.alloc, "__T_{s}", .{tp}) catch continue;
+                if (std.mem.indexOf(u8, msig_buf.written(), tsym) == null and
+                    std.mem.indexOf(u8, mbody_buf.written(), tsym) == null)
+                {
+                    try self.writeIndent();
+                    try self.w.print("    _ = {s};\n", .{tsym});
+                }
+            }
+            try self.w.writeAll(mbody_buf.written());
+        }
+
+        if (is_generic) {
+            self.indent -= 2;
+            self.w = outer_w;
+            const sbody = struct_buf.written();
+            for (inst.type_params) |tp| {
+                const tsym = std.fmt.allocPrint(self.alloc, "__T_{s}", .{tp}) catch continue;
+                if (std.mem.indexOf(u8, sbody, tsym) == null) {
+                    try outer_w.print("    _ = {s};\n", .{tsym});
+                }
+            }
+            for (inst.hkt_params) |hp| {
+                const hsym = std.fmt.allocPrint(self.alloc, "__F_{s}", .{hp}) catch continue;
+                if (std.mem.indexOf(u8, sbody, hsym) == null) {
+                    try outer_w.print("    _ = {s};\n", .{hsym});
+                }
+            }
+            for (0..inst.constraints.len) |ci| {
+                const wsym = std.fmt.allocPrint(self.alloc, "__W_{d}", .{ci}) catch continue;
+                if (std.mem.indexOf(u8, sbody, wsym) == null) {
+                    try outer_w.print("    _ = {s};\n", .{wsym});
+                }
+            }
+            try outer_w.writeAll(sbody);
+            try outer_w.writeAll("    };\n}\n");
+        } else {
+            self.indent -= 1;
+            try self.w.writeAll("};\n");
+        }
+    }
+
     fn emitFnDecl(self: *Emitter, decl: *const ast.Decl) Io.Writer.Error!void {
         const fd = decl.kind.fn_decl;
         const fname = self.checked.declCanonicalName(decl.span.start) orelse self.sourceOf(fd.name);
@@ -853,13 +2230,28 @@ const Emitter = struct {
                 need_comma = true;
                 try self.w.print("comptime __T_{s}: type", .{tp});
             }
+            for (f.hkt_params) |hp| {
+                if (need_comma) try self.w.writeAll(", ");
+                need_comma = true;
+                try self.w.print("comptime __F_{s}: fn (comptime type) type", .{hp});
+            }
+            for (0..f.constraint_count) |wi| {
+                if (need_comma) try self.w.writeAll(", ");
+                need_comma = true;
+                try self.w.print("comptime __W_{d}: type", .{wi});
+            }
         }
+        var fn_sig_rest: Io.Writer.Allocating = .init(self.alloc);
+        const fn_outer_w = self.w;
+        self.w = &fn_sig_rest.writer;
         for (fd.params, 0..) |p, pi| {
             if (need_comma) try self.w.writeAll(", ");
             need_comma = true;
             const pty: ?*const sema.Ty = if (cf != null and pi < cf.?.param_types.len) cf.?.param_types[pi] else null;
             const pname = self.sourceOf(p.name);
-            const is_mut_by_val = p.mutable and !(pty != null and isPointerType(pty.?));
+            const is_owned = isOwnedDynamicTy(pty);
+            const has_mv = is_owned and self.stmtsMayMoveIdent(fd.body.stmts, fd.body.tail, pname);
+            const is_mut_by_val = (p.mutable or has_mv) and !(pty != null and isPointerType(pty.?));
             if (is_mut_by_val) {
                 try self.w.print("__param_{s}", .{pname});
             } else {
@@ -893,12 +2285,21 @@ const Emitter = struct {
         const sv_mark = self.pushScopeVars();
         defer self.popScopeVars(sv_mark);
 
+        var fn_body_buf: Io.Writer.Allocating = .init(self.alloc);
+        self.w = &fn_body_buf.writer;
         // Bind mutable by-value params to local `var` and silence genuinely unused parameter warnings.
         for (fd.params, 0..) |p, pi| {
             const pty: ?*const sema.Ty = if (cf != null and pi < cf.?.param_types.len) cf.?.param_types[pi] else null;
             const pname = self.sourceOf(p.name);
-            const is_mut_by_val = p.mutable and !(pty != null and isPointerType(pty.?));
-            self.bindScopeVar(pname, pty, is_mut_by_val or (pty != null and isPointerType(pty.?)));
+            const is_owned = isOwnedDynamicTy(pty);
+            const has_mv = is_owned and self.stmtsMayMoveIdent(fd.body.stmts, fd.body.tail, pname);
+            const is_mut_by_val = (p.mutable or has_mv) and !(pty != null and isPointerType(pty.?));
+            const is_var_or_ptr = is_mut_by_val or (pty != null and isPointerType(pty.?));
+            if (is_owned) {
+                self.bindOwnedScopeVar(pname, pty, is_var_or_ptr, has_mv);
+            } else {
+                self.bindScopeVar(pname, pty, is_var_or_ptr);
+            }
             if (is_mut_by_val) {
                 try self.writeIndent();
                 try self.w.writeAll("var ");
@@ -910,17 +2311,23 @@ const Emitter = struct {
                     try self.w.writeAll(": usize");
                 }
                 try self.w.print(" = __param_{s};\n", .{pname});
-                if (!self.blockMutatesOrBorrowsIdent(&fd.body, pname)) {
+                if (!has_mv and !self.blockMutatesOrBorrowsIdent(&fd.body, pname)) {
                     try self.writeIndent();
                     try self.w.writeAll("_ = &");
                     try self.emitIdent(pname);
                     try self.w.writeAll(";\n");
                 }
-            } else if (!self.blockMentionsIdent(&fd.body, pname)) {
+            } else if (!is_owned and !self.blockMentionsIdent(&fd.body, pname)) {
                 try self.writeIndent();
                 try self.w.writeAll("_ = ");
                 try self.emitIdent(pname);
                 try self.w.writeAll(";\n");
+            }
+            if (is_owned) {
+                try self.writeIndent();
+                try self.w.writeAll("defer ");
+                try self.emitIdent(pname);
+                try self.w.writeAll(".deinit();\n");
             }
         }
 
@@ -943,11 +2350,42 @@ const Emitter = struct {
         self.indent -= 1;
         try self.w.writeAll("}\n");
 
+        self.w = fn_outer_w;
+        try fn_outer_w.writeAll(fn_sig_rest.written());
+        if (cf) |f| {
+            for (f.type_params) |tp| {
+                const tsym = std.fmt.allocPrint(self.alloc, "__T_{s}", .{tp}) catch continue;
+                if (std.mem.indexOf(u8, fn_sig_rest.written(), tsym) == null and
+                    std.mem.indexOf(u8, fn_body_buf.written(), tsym) == null)
+                {
+                    try fn_outer_w.print("    _ = {s};\n", .{tsym});
+                }
+            }
+            for (f.hkt_params) |hp| {
+                const hsym = std.fmt.allocPrint(self.alloc, "__F_{s}", .{hp}) catch continue;
+                if (std.mem.indexOf(u8, fn_sig_rest.written(), hsym) == null and
+                    std.mem.indexOf(u8, fn_body_buf.written(), hsym) == null)
+                {
+                    try fn_outer_w.print("    _ = {s};\n", .{hsym});
+                }
+            }
+            for (0..f.constraint_count) |wi| {
+                const wsym = std.fmt.allocPrint(self.alloc, "__W_{d}", .{wi}) catch continue;
+                if (std.mem.indexOf(u8, fn_sig_rest.written(), wsym) == null and
+                    std.mem.indexOf(u8, fn_body_buf.written(), wsym) == null)
+                {
+                    try fn_outer_w.print("    _ = {s};\n", .{wsym});
+                }
+            }
+        }
+        try fn_outer_w.writeAll(fn_body_buf.written());
+
         if (is_main) {
             try self.w.writeByte('\n');
             try self.w.writeAll("pub fn main(init: std.process.Init) void {\n");
             try self.w.writeAll("    aethel_io = init.io;\n");
             try self.w.writeAll("    aethel_alloc = init.arena.allocator();\n");
+            try self.w.writeAll("    aethel_gpa = init.gpa;\n");
             if (ret_ty != null and ret_ty.?.isInteger() != null) {
                 try self.w.writeAll("    const status = aethel_main();\n");
                 try self.w.writeAll("    if (status != 0) std.process.exit(@intCast(status));\n");
@@ -1004,6 +2442,99 @@ const Emitter = struct {
                         {
                             const arr_id = self.nextLabel();
                             const elem_ty = if (lty.?.* == .collection) lty.?.collection.elem_ty else lty.?.slice.elem;
+                            if (self.tyBackingKind(lty.?)) |bk| {
+                                const rec = &self.checked.records[bk.ridx];
+                                const n_elems = ls.value.list.elems.len;
+                                try self.writeIndent();
+                                try self.w.print("const __init_{d} = [_]", .{arr_id});
+                                try self.emitTy(elem_ty);
+                                try self.w.writeAll("{ ");
+                                for (ls.value.list.elems, 0..) |el, ei| {
+                                    if (ei > 0) try self.w.writeAll(", ");
+                                    try self.emitCoercedExpr(el, elem_ty);
+                                }
+                                try self.w.writeAll(" };\n");
+                                switch (bk.kind) {
+                                    .soa => {
+                                        for (rec.fields) |f| {
+                                            try self.writeIndent();
+                                            if (n_elems == 0) {
+                                                try self.w.print("var __col_{d}_{s} = [0]", .{ arr_id, f.name });
+                                                try self.emitTy(f.ty);
+                                                try self.w.writeAll("{};\n");
+                                            } else {
+                                                try self.w.print("var __col_{d}_{s}: [{d}]", .{ arr_id, f.name, n_elems });
+                                                try self.emitTy(f.ty);
+                                                try self.w.print(" align(64) = blk_{d}_{s}: {{\n", .{ arr_id, f.name });
+                                                try self.writeIndent();
+                                                try self.w.print("    var __ca: [{d}]", .{n_elems});
+                                                try self.emitTy(f.ty);
+                                                try self.w.writeAll(" align(64) = undefined;\n");
+                                                try self.writeIndent();
+                                                try self.w.print("    for (0..{d}) |__k| __ca[__k] = __init_{d}[__k].", .{ n_elems, arr_id });
+                                                try self.emitIdent(f.name);
+                                                try self.w.writeAll(";\n");
+                                                try self.writeIndent();
+                                                try self.w.print("    break :blk_{d}_{s} __ca;\n", .{ arr_id, f.name });
+                                                try self.writeIndent();
+                                                try self.w.writeAll("};\n");
+                                            }
+                                        }
+                                        try self.writeIndent();
+                                        try self.w.writeAll("const ");
+                                        try self.emitIdent(vname);
+                                        try self.w.writeAll(": ");
+                                        try self.emitTy(lty.?);
+                                        try self.w.print(" = .{{ .len = {d}", .{n_elems});
+                                        for (rec.fields) |f| {
+                                            try self.w.writeAll(", .");
+                                            try self.emitIdent(f.name);
+                                            try self.w.print(" = __col_{d}_{s}[0..]", .{ arr_id, f.name });
+                                        }
+                                        try self.w.writeAll(" };\n");
+                                    },
+                                    .aosoa => |w| {
+                                        const n_tiles = @max(@as(usize, 1), (n_elems + w - 1) / w);
+                                        try self.writeIndent();
+                                        try self.w.print("var __tiles_{d}: [{d}]__AethelTile_{d}_{s} align(64) = blk_{d}: {{\n", .{ arr_id, n_tiles, w, rec.name, arr_id });
+                                        try self.writeIndent();
+                                        try self.w.print("    var __ts: [{d}]__AethelTile_{d}_{s} align(64) = undefined;\n", .{ n_tiles, w, rec.name });
+                                        if (n_elems > 0) {
+                                            try self.writeIndent();
+                                            try self.w.print("    for (0..{d}) |__k| {{\n", .{n_elems});
+                                            for (rec.fields) |f| {
+                                                try self.writeIndent();
+                                                try self.w.print("        __ts[__k / {d}].", .{w});
+                                                try self.emitIdent(f.name);
+                                                try self.w.print("[__k % {d}] = __init_{d}[__k].", .{ w, arr_id });
+                                                try self.emitIdent(f.name);
+                                                try self.w.writeAll(";\n");
+                                            }
+                                            try self.writeIndent();
+                                            try self.w.writeAll("    }\n");
+                                        }
+                                        try self.writeIndent();
+                                        try self.w.print("    break :blk_{d} __ts;\n", .{arr_id});
+                                        try self.writeIndent();
+                                        try self.w.writeAll("};\n");
+                                        try self.writeIndent();
+                                        try self.w.writeAll("const ");
+                                        try self.emitIdent(vname);
+                                        try self.w.writeAll(": ");
+                                        try self.emitTy(lty.?);
+                                        try self.w.print(" = .{{ .tiles = __tiles_{d}[0..], .base_elem = 0, .len = {d} }};\n", .{ arr_id, n_elems });
+                                    },
+                                    .aos_slice => unreachable,
+                                }
+                                self.bindScopeVar(vname, lty, false);
+                                if (!self.stmtsMentionIdent(rest_stmts, rest_tail, vname)) {
+                                    try self.writeIndent();
+                                    try self.w.writeAll("_ = ");
+                                    try self.emitIdent(vname);
+                                    try self.w.writeAll(";\n");
+                                }
+                                return;
+                            }
                             const needs_cache_align = blk: {
                                 if (lty.?.* == .collection) {
                                     if (lty.?.collection.elem_record) |ri| {
@@ -1044,40 +2575,63 @@ const Emitter = struct {
                             }
                             return;
                         }
+                        const eff_ty = lty orelse self.checked.exprType(ls.value);
+                        const is_owned = isOwnedDynamicTy(eff_ty);
+                        const has_mv = is_owned and self.stmtsMayMoveIdent(rest_stmts, rest_tail, vname);
+                        const emit_var = is_mut or has_mv;
                         try self.writeIndent();
-                        try self.w.writeAll(if (is_mut) "var " else "const ");
+                        try self.w.writeAll(if (emit_var) "var " else "const ");
                         try self.emitIdent(vname);
-                        if (lty) |ty| {
+                        if (eff_ty) |ty| {
                             if (ty.* != .err and ty.* != .fn_ty) {
                                 try self.w.writeAll(": ");
                                 try self.emitTy(ty);
                             }
                         }
                         try self.w.writeAll(" = ");
-                        if (lty) |ty| {
+                        if (eff_ty) |ty| {
                             try self.emitCoercedExpr(ls.value, ty);
                         } else {
                             try self.emitExpr(ls.value);
                         }
                         try self.w.writeAll(";\n");
-                        self.bindScopeVar(vname, lty orelse self.checked.exprType(ls.value), is_mut);
-                        if (is_mut) {
-                            if (!self.stmtsMutateOrBorrowIdent(rest_stmts, rest_tail, vname)) {
+                        if (is_owned) {
+                            self.bindOwnedScopeVar(vname, eff_ty, emit_var, has_mv);
+                            try self.writeIndent();
+                            try self.w.writeAll("defer ");
+                            try self.emitIdent(vname);
+                            try self.w.writeAll(".deinit();\n");
+                            if (emit_var and !has_mv and !self.stmtsMutateOrBorrowIdent(rest_stmts, rest_tail, vname)) {
                                 try self.writeIndent();
                                 try self.w.writeAll("_ = &");
                                 try self.emitIdent(vname);
                                 try self.w.writeAll(";\n");
                             }
-                        } else if (!self.stmtsMentionIdent(rest_stmts, rest_tail, vname)) {
-                            try self.writeIndent();
-                            try self.w.writeAll("_ = ");
-                            try self.emitIdent(vname);
-                            try self.w.writeAll(";\n");
+                        } else {
+                            self.bindScopeVar(vname, eff_ty, is_mut);
+                            if (is_mut) {
+                                if (!self.stmtsMutateOrBorrowIdent(rest_stmts, rest_tail, vname)) {
+                                    try self.writeIndent();
+                                    try self.w.writeAll("_ = &");
+                                    try self.emitIdent(vname);
+                                    try self.w.writeAll(";\n");
+                                }
+                            } else if (!self.stmtsMentionIdent(rest_stmts, rest_tail, vname)) {
+                                try self.writeIndent();
+                                try self.w.writeAll("_ = ");
+                                try self.emitIdent(vname);
+                                try self.w.writeAll(";\n");
+                            }
                         }
                     },
                     .wildcard => {
                         try self.writeIndent();
-                        if (self.isVoidExpr(ls.value)) {
+                        if (isOwnedDynamicTy(self.checked.exprType(ls.value))) {
+                            const dlbl = self.nextLabel();
+                            try self.w.print("{{ const __drop_{d} = ", .{dlbl});
+                            try self.emitExpr(ls.value);
+                            try self.w.print("; __drop_{d}.deinit(); }}\n", .{dlbl});
+                        } else if (self.isVoidExpr(ls.value)) {
                             try self.emitExpr(ls.value);
                             try self.w.writeAll(";\n");
                         } else {
@@ -1153,6 +2707,107 @@ const Emitter = struct {
                     if (self.lookupScopeVar(self.sourceOf(asg.target.ident))) |sv| break :blk sv.ty;
                     break :blk null;
                 } else null;
+                if (asg.target.* == .field and asg.target.field.target.* == .index) {
+                    const ix = asg.target.field.target.index;
+                    const ix_tty = self.checked.exprType(ix.target);
+                    const is_vec_tgt = self.isVecTyOrViewToVec(ix_tty);
+                    if (self.tyBackingKind(ix_tty)) |bk| {
+                        const fname = self.sourceOf(asg.target.field.name);
+                        switch (bk.kind) {
+                            .soa => {
+                                try self.writeIndent();
+                                if (is_vec_tgt) {
+                                    try self.w.writeByte('(');
+                                    try self.emitExpr(ix.target);
+                                    try self.w.writeAll(").mutView().");
+                                } else {
+                                    try self.emitExpr(ix.target);
+                                    try self.w.writeByte('.');
+                                }
+                                try self.emitIdent(fname);
+                                try self.w.writeByte('[');
+                                try self.emitSliceIndexExpr(ix.idx);
+                                try self.w.print("] {s} ", .{asg.op.symbol()});
+                                if (target_ty) |tt| try self.emitCoercedExpr(asg.value, tt) else try self.emitExpr(asg.value);
+                                try self.w.writeAll(";\n");
+                                return;
+                            },
+                            .aosoa => |w| {
+                                const albl = self.nextLabel();
+                                try self.writeIndent();
+                                if (is_vec_tgt) {
+                                    try self.w.print("{{ const __ac_{d} = (", .{albl});
+                                    try self.emitExpr(ix.target);
+                                    try self.w.print(").mutView(); const __aa_{d} = __ac_{d}.base_elem + ", .{ albl, albl });
+                                } else {
+                                    try self.w.print("{{ const __ac_{d} = &", .{albl});
+                                    try self.emitExpr(ix.target);
+                                    try self.w.print("; const __aa_{d} = __ac_{d}.base_elem + ", .{ albl, albl });
+                                }
+                                try self.emitSliceIndexExpr(ix.idx);
+                                try self.w.print("; __ac_{d}.tiles[__aa_{d} / {d}].", .{ albl, albl, w });
+                                try self.emitIdent(fname);
+                                try self.w.print("[__aa_{d} % {d}] {s} ", .{ albl, w, asg.op.symbol() });
+                                if (target_ty) |tt| try self.emitCoercedExpr(asg.value, tt) else try self.emitExpr(asg.value);
+                                try self.w.writeAll("; }\n");
+                                return;
+                            },
+                            .aos_slice => {},
+                        }
+                    } else if (is_vec_tgt) {
+                        const fname = self.sourceOf(asg.target.field.name);
+                        try self.writeIndent();
+                        try self.w.writeByte('(');
+                        try self.emitExpr(ix.target);
+                        try self.w.writeAll(").mutSlice()[");
+                        try self.emitSliceIndexExpr(ix.idx);
+                        try self.w.writeAll("].");
+                        try self.emitIdent(fname);
+                        try self.w.print(" {s} ", .{asg.op.symbol()});
+                        if (target_ty) |tt| try self.emitCoercedExpr(asg.value, tt) else try self.emitExpr(asg.value);
+                        try self.w.writeAll(";\n");
+                        return;
+                    }
+                }
+                if (asg.target.* == .index) {
+                    const ix = asg.target.index;
+                    const ix_tty = self.checked.exprType(ix.target);
+                    const has_bk = self.tyBackingKind(ix_tty) != null;
+                    const is_vec_tgt = self.isVecTyOrViewToVec(ix_tty);
+                    if (has_bk and asg.op == .assign) {
+                        try self.writeIndent();
+                        if (is_vec_tgt) try self.w.writeAll("_ = ");
+                        try self.emitExpr(ix.target);
+                        try self.w.writeAll(if (is_vec_tgt) ".setChecked(@intCast(" else ".set(");
+                        try self.emitSliceIndexExpr(ix.idx);
+                        try self.w.writeAll(if (is_vec_tgt) "), " else ", ");
+                        if (target_ty) |tt| try self.emitCoercedExpr(asg.value, tt) else try self.emitExpr(asg.value);
+                        try self.w.writeAll(");\n");
+                        return;
+                    } else if (!has_bk and is_vec_tgt) {
+                        try self.writeIndent();
+                        try self.w.writeByte('(');
+                        try self.emitExpr(ix.target);
+                        try self.w.writeAll(").mutSlice()[");
+                        try self.emitSliceIndexExpr(ix.idx);
+                        try self.w.print("] {s} ", .{asg.op.symbol()});
+                        if (target_ty) |tt| try self.emitCoercedExpr(asg.value, tt) else try self.emitExpr(asg.value);
+                        try self.w.writeAll(";\n");
+                        return;
+                    }
+                }
+                if (asg.target.* == .ident and asg.op == .assign and isOwnedDynamicTy(target_ty)) {
+                    const albl = self.nextLabel();
+                    try self.writeIndent();
+                    try self.w.print("{{ const __rasg_{d} = ", .{albl});
+                    try self.emitCoercedExpr(asg.value, target_ty.?);
+                    try self.w.writeAll("; ");
+                    try self.emitExpr(asg.target);
+                    try self.w.writeAll(".deinit(); ");
+                    try self.emitExpr(asg.target);
+                    try self.w.print(" = __rasg_{d}; }}\n", .{albl});
+                    return;
+                }
                 try self.writeIndent();
                 try self.emitExpr(asg.target);
                 try self.w.print(" {s} ", .{asg.op.symbol()});
@@ -1206,9 +2861,15 @@ const Emitter = struct {
             std.mem.eql(u8, self.sourceOf(expr.binary.right.call.callee.ident), "map_in_place");
     }
 
+    fn hasExternMarshaledArg(self: *const Emitter, pt: *const sema.Ty) bool {
+        if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) return true;
+        return self.tyBackingKind(pt) != null;
+    }
+
     fn isBlockLikeVoidExpr(self: *const Emitter, expr: *const ast.Expr) bool {
         return switch (expr.*) {
             .if_expr, .block, .view_expr, .fork_expr, .case_expr => true,
+            .using_expr => |ue| self.isBlockLikeVoidExpr(ue.target),
             .call => |c| blk: {
                 const resolved_name = self.checked.resolvedCallName(c.callee) orelse
                     if (c.callee.* == .ident) self.sourceOf(c.callee.ident) else null;
@@ -1216,7 +2877,7 @@ const Emitter = struct {
                     if (self.findCheckedFn(rn)) |cf| {
                         if (cf.has_extern_abi) {
                             for (cf.param_types) |pt| {
-                                if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) break :blk true;
+                                if (self.hasExternMarshaledArg(pt)) break :blk true;
                             }
                         }
                     }
@@ -1234,7 +2895,7 @@ const Emitter = struct {
                     if (self.findCheckedFn(rn)) |cf| {
                         if (cf.has_extern_abi) {
                             for (cf.param_types) |pt| {
-                                if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) break :blk true;
+                                if (self.hasExternMarshaledArg(pt)) break :blk true;
                             }
                         }
                     }
@@ -1262,6 +2923,11 @@ const Emitter = struct {
             } else {
                 try self.w.writeAll(";\n");
             }
+        } else if (isOwnedDynamicTy(self.checked.exprType(expr))) {
+            const dlbl = self.nextLabel();
+            try self.w.print("{{ const __drop_{d} = ", .{dlbl});
+            try self.emitExpr(expr);
+            try self.w.print("; __drop_{d}.deinit(); }}\n", .{dlbl});
         } else {
             try self.w.writeAll("_ = ");
             try self.emitExpr(expr);
@@ -1365,10 +3031,70 @@ const Emitter = struct {
             return;
         }
 
-        // Collection / slice iteration
+        // Collection / slice / Vec iteration
+        const iter_ty = self.checked.exprType(fs.iter);
+        const iter_bk = self.tyBackingKind(iter_ty);
+        const iter_is_vec = self.isVecTyOrViewToVec(iter_ty);
+        if (iter_bk != null) {
+            const flbl = self.nextLabel();
+            try self.writeIndent();
+            try self.w.print("const __fiter_{d} = ", .{flbl});
+            if (iter_is_vec) {
+                try self.w.writeByte('(');
+                try self.emitExpr(fs.iter);
+                try self.w.writeAll(").asView()");
+            } else {
+                try self.emitExpr(fs.iter);
+            }
+            try self.w.writeAll(";\n");
+            try self.writeIndent();
+            try self.w.print("for (0..__fiter_{d}.len) |__fk_{d}| {{\n", .{ flbl, flbl });
+            self.indent += 1;
+            const fsv_mark = self.pushScopeVars();
+            defer self.popScopeVars(fsv_mark);
+            switch (fs.pattern.*) {
+                .ident => |id| {
+                    const pn = self.sourceOf(id.name);
+                    try self.writeIndent();
+                    try self.w.writeAll("const ");
+                    try self.emitIdent(pn);
+                    try self.w.print(" = __fiter_{d}.get(__fk_{d});\n", .{ flbl, flbl });
+                    const it_inner: ?*const sema.Ty = if (iter_ty) |t| switch (t.*) {
+                        .view => |v| v.target,
+                        .path_borrow => |pb| pb.base,
+                        else => t,
+                    } else null;
+                    const el_ty: ?*const sema.Ty = if (it_inner) |t| switch (t.*) {
+                        .collection => |c| c.elem_ty,
+                        .vec => |v| v.elem_ty,
+                        else => null,
+                    } else null;
+                    self.bindScopeVar(pn, el_ty, false);
+                    if (!self.blockMentionsIdent(&fs.body, pn)) {
+                        try self.writeIndent();
+                        try self.w.writeAll("_ = ");
+                        try self.emitIdent(pn);
+                        try self.w.writeAll(";\n");
+                    }
+                },
+                else => {},
+            }
+            try self.emitStmtsWithRest(fs.body.stmts, fs.body.tail);
+            if (fs.body.tail) |t| try self.emitTailStmt(t);
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.w.writeAll("}\n");
+            return;
+        }
         try self.writeIndent();
         try self.w.writeAll("for (");
-        try self.emitExpr(fs.iter);
+        if (iter_is_vec) {
+            try self.w.writeByte('(');
+            try self.emitExpr(fs.iter);
+            try self.w.writeAll(").asSlice()");
+        } else {
+            try self.emitExpr(fs.iter);
+        }
         try self.w.writeAll(") |");
         const csv_mark = self.pushScopeVars();
         defer self.popScopeVars(csv_mark);
@@ -1378,9 +3104,14 @@ const Emitter = struct {
                 try self.emitIdent(pn);
                 try self.w.writeAll("| {\n");
                 self.indent += 1;
-                const it_ty = self.checked.exprType(fs.iter);
-                const el_ty: ?*const sema.Ty = if (it_ty) |t| switch (t.*) {
+                const it_inner: ?*const sema.Ty = if (iter_ty) |t| switch (t.*) {
+                    .view => |v| v.target,
+                    .path_borrow => |pb| pb.base,
+                    else => t,
+                } else null;
+                const el_ty: ?*const sema.Ty = if (it_inner) |t| switch (t.*) {
                     .collection => |c| c.elem_ty,
+                    .vec => |v| v.elem_ty,
                     .slice => |s| s.elem,
                     else => null,
                 } else null;
@@ -1418,9 +3149,126 @@ const Emitter = struct {
         return null;
     }
 
+    fn emitVecListLiteral(self: *Emitter, elems: []const *const ast.Expr, vec_ty: *const sema.Ty) Io.Writer.Error!void {
+        try self.emitTy(vec_ty);
+        if (elems.len == 0) {
+            try self.w.writeAll(".new()");
+            return;
+        }
+        const elem_ty = vec_ty.vec.elem_ty;
+        try self.w.writeAll(".fromSlice(&[_]");
+        try self.emitTy(elem_ty);
+        try self.w.writeAll("{ ");
+        for (elems, 0..) |el, ei| {
+            if (ei > 0) try self.w.writeAll(", ");
+            try self.emitCoercedExpr(el, elem_ty);
+        }
+        try self.w.writeAll(" })");
+    }
+
+    fn tryEmitMoveOwnedExpr(self: *Emitter, expr: *const ast.Expr, target: *const sema.Ty) Io.Writer.Error!bool {
+        switch (expr.*) {
+            .ident => |sp| {
+                const vname = self.sourceOf(sp);
+                if (self.lookupScopeVar(vname)) |sv| {
+                    if (sv.is_owned_dyn and sv.has_moved_flag) {
+                        const mlbl = self.nextLabel();
+                        try self.w.print("blk_{d}: {{ const __mv_{d} = ", .{ mlbl, mlbl });
+                        try self.emitIdent(vname);
+                        try self.w.writeAll("; ");
+                        try self.emitIdent(vname);
+                        try self.w.print(" = .{{}}; break :blk_{d} __mv_{d}; }}", .{ mlbl, mlbl });
+                        return true;
+                    }
+                }
+                return false;
+            },
+            .block => |*blk| {
+                if (blk.tail) |t| {
+                    if (self.exprIsDirectMoveAnyOwned(t)) {
+                        const mlbl = self.nextLabel();
+                        try self.w.print("blk_{d}: {{\n", .{mlbl});
+                        self.indent += 1;
+                        const bsv = self.pushScopeVars();
+                        defer self.popScopeVars(bsv);
+                        try self.emitStmtsWithRest(blk.stmts, blk.tail);
+                        try self.writeIndent();
+                        try self.w.print("break :blk_{d} ", .{mlbl});
+                        try self.emitCoercedExpr(t, target);
+                        try self.w.writeAll(";\n");
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeByte('}');
+                        return true;
+                    }
+                }
+                return false;
+            },
+            .if_expr => |ie| {
+                if (ie.else_branch) |eb| {
+                    const tt_moved = if (ie.then_block.tail) |tt| self.exprIsDirectMoveAnyOwned(tt) else false;
+                    if (tt_moved or self.exprIsDirectMoveAnyOwned(eb)) {
+                        const mlbl = self.nextLabel();
+                        try self.w.writeAll("if (");
+                        try self.emitExpr(ie.cond);
+                        try self.w.print(") blk_{d}: {{\n", .{mlbl});
+                        self.indent += 1;
+                        const tsv = self.pushScopeVars();
+                        try self.emitStmtsWithRest(ie.then_block.stmts, ie.then_block.tail);
+                        if (ie.then_block.tail) |tt| {
+                            try self.writeIndent();
+                            try self.w.print("break :blk_{d} ", .{mlbl});
+                            try self.emitCoercedExpr(tt, target);
+                            try self.w.writeAll(";\n");
+                        }
+                        self.popScopeVars(tsv);
+                        self.indent -= 1;
+                        try self.writeIndent();
+                        try self.w.writeAll("} else ");
+                        try self.emitCoercedExpr(eb, target);
+                        return true;
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn emitCoercedExpr(self: *Emitter, expr: *const ast.Expr, target: *const sema.Ty) Io.Writer.Error!void {
         if (target.* == .err) {
             try self.emitExpr(expr);
+            return;
+        }
+        if (target.* == .vec and expr.* == .list) {
+            try self.emitVecListLiteral(expr.list.elems, target);
+            return;
+        }
+        if (isOwnedDynamicTy(target)) {
+            if (try self.tryEmitMoveOwnedExpr(expr, target)) return;
+        }
+        const target_inner: *const sema.Ty = switch (target.*) {
+            .view => |v| v.target,
+            .path_borrow => |pb| pb.base,
+            else => target,
+        };
+        if ((target_inner.* == .collection or target_inner.* == .slice) and
+            self.isVecTyOrViewToVec(self.checked.exprType(expr)))
+        {
+            const use_mut = switch (target.*) {
+                .view => |v| v.mode == .exclusive,
+                .path_borrow => |pb| pb.mode == null or pb.mode.? == .exclusive,
+                .slice => |s| s.mutable,
+                .collection => false,
+                else => false,
+            };
+            try self.w.writeByte('(');
+            try self.emitExpr(expr);
+            if (self.tyBackingKind(target) != null) {
+                try self.w.writeAll(if (use_mut) ").mutView()" else ").asView()");
+            } else {
+                try self.w.writeAll(if (use_mut) ").mutSlice()" else ").asSlice()");
+            }
             return;
         }
         if (target.isInteger()) |target_int| {
@@ -1710,6 +3558,70 @@ const Emitter = struct {
                     }
                 }
                 const fname = var_name;
+                if (fld.target.* == .index) {
+                    const ix_tty = self.checked.exprType(fld.target.index.target);
+                    const is_vec_tgt = self.isVecTyOrViewToVec(ix_tty);
+                    if (self.tyBackingKind(ix_tty)) |bk| {
+                        switch (bk.kind) {
+                            .soa => {
+                                if (is_vec_tgt) {
+                                    try self.w.writeByte('(');
+                                    try self.emitExpr(fld.target.index.target);
+                                    try self.w.writeAll(").asView().");
+                                } else {
+                                    try self.emitExpr(fld.target.index.target);
+                                    try self.w.writeByte('.');
+                                }
+                                try self.emitIdent(fname);
+                                try self.w.writeByte('[');
+                                try self.emitSliceIndexExpr(fld.target.index.idx);
+                                try self.w.writeByte(']');
+                                return;
+                            },
+                            .aosoa => |w| {
+                                const albl = self.nextLabel();
+                                try self.w.print("blk_{d}: {{ const __ac_{d} = ", .{ albl, albl });
+                                if (is_vec_tgt) {
+                                    try self.w.writeByte('(');
+                                    try self.emitExpr(fld.target.index.target);
+                                    try self.w.writeAll(").asView()");
+                                } else {
+                                    try self.emitExpr(fld.target.index.target);
+                                }
+                                try self.w.print("; const __aa_{d} = __ac_{d}.base_elem + ", .{ albl, albl });
+                                try self.emitSliceIndexExpr(fld.target.index.idx);
+                                try self.w.print("; break :blk_{d} __ac_{d}.tiles[__aa_{d} / {d}].", .{ albl, albl, albl, w });
+                                try self.emitIdent(fname);
+                                try self.w.print("[__aa_{d} % {d}]; }}", .{ albl, w });
+                                return;
+                            },
+                            .aos_slice => {},
+                        }
+                    } else if (is_vec_tgt) {
+                        try self.w.writeByte('(');
+                        try self.emitExpr(fld.target.index.target);
+                        try self.w.writeAll(").asSlice()[");
+                        try self.emitSliceIndexExpr(fld.target.index.idx);
+                        try self.w.writeAll("].");
+                        try self.emitIdent(fname);
+                        return;
+                    }
+                }
+                if (std.mem.eql(u8, fname, "len")) {
+                    if (self.checked.exprType(fld.target)) |ftty| {
+                        const dinner: *const sema.Ty = switch (ftty.*) {
+                            .view => |v| v.target,
+                            .path_borrow => |pb| pb.base,
+                            else => ftty,
+                        };
+                        if (isOwnedDynamicTy(dinner)) {
+                            try self.w.writeAll("@as(u64, @intCast((");
+                            try self.emitExpr(fld.target);
+                            try self.w.writeAll(").len))");
+                            return;
+                        }
+                    }
+                }
                 if (self.checked.exprType(fld.target)) |tty| {
                     if (recordRecordIdxOfTy(tty)) |ridx| {
                         const rec = self.checked.records[ridx];
@@ -1728,6 +3640,42 @@ const Emitter = struct {
                 try self.emitIdent(fname);
             },
             .index => |ix| {
+                const ix_tty = self.checked.exprType(ix.target);
+                if (self.tyBackingKind(ix_tty) != null) {
+                    try self.emitExpr(ix.target);
+                    if (ix.idx.* == .binary and (ix.idx.binary.op == .range or ix.idx.binary.op == .range_eq)) {
+                        try self.w.writeAll(".slice(");
+                        try self.emitSliceIndexExpr(ix.idx.binary.left);
+                        try self.w.writeAll(", ");
+                        try self.emitSliceIndexExpr(ix.idx.binary.right);
+                        if (ix.idx.binary.op == .range_eq) try self.w.writeAll(" + 1");
+                        try self.w.writeByte(')');
+                    } else {
+                        try self.w.writeAll(".get(");
+                        try self.emitSliceIndexExpr(ix.idx);
+                        try self.w.writeByte(')');
+                    }
+                    return;
+                }
+                if (self.isVecTyOrViewToVec(ix_tty)) {
+                    if (ix.idx.* == .binary and (ix.idx.binary.op == .range or ix.idx.binary.op == .range_eq)) {
+                        try self.w.writeByte('(');
+                        try self.emitExpr(ix.target);
+                        try self.w.writeAll(").slice(");
+                        try self.emitSliceIndexExpr(ix.idx.binary.left);
+                        try self.w.writeAll(", ");
+                        try self.emitSliceIndexExpr(ix.idx.binary.right);
+                        if (ix.idx.binary.op == .range_eq) try self.w.writeAll(" + 1");
+                        try self.w.writeByte(')');
+                    } else {
+                        try self.w.writeByte('(');
+                        try self.emitExpr(ix.target);
+                        try self.w.writeAll(").asSlice()[");
+                        try self.emitSliceIndexExpr(ix.idx);
+                        try self.w.writeByte(']');
+                    }
+                    return;
+                }
                 try self.emitExpr(ix.target);
                 try self.w.writeByte('[');
                 if (ix.idx.* == .binary and (ix.idx.binary.op == .range or ix.idx.binary.op == .range_eq)) {
@@ -1766,8 +3714,13 @@ const Emitter = struct {
                 const raw_rname = if (rl.path.len > 0) self.sourceOf(rl.path[rl.path.len - 1]) else "Record";
                 const ridx = self.checked.resolvedRecordIdx(expr) orelse self.findCheckedRecordIndex(raw_rname);
                 const rname = if (ridx) |ri| self.checked.records[ri].name else raw_rname;
-                const has_bins = if (ridx) |ri| recordHasAnyBin(&self.checked.records[ri]) else false;
-                try self.emitIdent(rname);
+                const lit_ty = self.checked.exprType(expr);
+                const has_bins = if (ridx) |ri| (!self.checked.records[ri].is_flat_c and recordHasAnyBin(&self.checked.records[ri])) else false;
+                if (lit_ty != null and lit_ty.?.* == .applied and lit_ty.?.applied.args.len > 0) {
+                    try self.emitTy(lit_ty.?);
+                } else {
+                    try self.emitIdent(rname);
+                }
                 try self.w.writeAll("{ ");
                 if (has_bins) {
                     const rec = self.checked.records[ridx.?];
@@ -1857,6 +3810,10 @@ const Emitter = struct {
             },
             .list => |ls| {
                 const list_ty = self.checked.exprType(expr);
+                if (list_ty != null and list_ty.?.* == .vec) {
+                    try self.emitVecListLiteral(ls.elems, list_ty.?);
+                    return;
+                }
                 try self.w.writeAll("&[_]");
                 if (list_ty != null and list_ty.?.* == .slice) {
                     try self.emitTy(list_ty.?.slice.elem);
@@ -2080,6 +4037,7 @@ const Emitter = struct {
                     try self.w.writeByte('}');
                 }
             },
+            .using_expr => |ue| try self.emitExpr(ue.target),
             .todo_expr => |td| {
                 try self.w.writeAll("@panic(");
                 if (td.message) |m| try self.emitExpr(m) else try self.w.writeAll("\"todo\"");
@@ -2122,6 +4080,15 @@ const Emitter = struct {
                         );
                         return;
                     }
+                }
+                if (b.right.* == .using_expr) {
+                    const ue = b.right.using_expr;
+                    if (ue.target.* == .call) {
+                        try self.emitCall(ue.target, ue.target.call.callee, ue.target.call.args, b.left);
+                    } else {
+                        try self.emitCall(null, ue.target, &.{}, b.left);
+                    }
+                    return;
                 }
                 if (b.right.* == .call) {
                     try self.emitCall(b.right, b.right.call.callee, b.right.call.args, b.left);
@@ -2348,6 +4315,14 @@ const Emitter = struct {
             return;
         }
 
+        // 1a. std/* dynamic containers & string intrinsics
+        if (call_expr) |ce| {
+            if (self.checked.std_intrinsic_calls.get(ce)) |intr| {
+                try self.emitStdIntrinsicCall(intr, args, piped_recv);
+                return;
+            }
+        }
+
         // 1b. In-place collection pipeline (`fleet |> map_in_place(fn(e) { ... })`)
         if (callee.* == .ident and std.mem.eql(u8, self.sourceOf(callee.ident), "map_in_place") and
             piped_recv != null and args.len == 1 and args[0].value.* == .lambda)
@@ -2453,6 +4428,35 @@ const Emitter = struct {
             }
         }
 
+        const trait_res_opt: ?sema.CallTraitResolution = if (call_expr) |ce| self.checked.call_trait_resolutions.get(ce) else null;
+        if (trait_res_opt) |tres| {
+            if (tres.kind == .trait_method) {
+                const tm = tres.kind.trait_method;
+                try self.emitWitnessExpr(tm.witness);
+                try self.w.writeByte('.');
+                try self.emitIdent(tm.method_name);
+                try self.w.writeByte('(');
+                var emitted_any = false;
+                for (tres.type_args) |ta| {
+                    if (emitted_any) try self.w.writeAll(", ");
+                    emitted_any = true;
+                    try self.emitTy(ta);
+                }
+                if (piped_recv) |pr| {
+                    if (emitted_any) try self.w.writeAll(", ");
+                    emitted_any = true;
+                    try self.emitCallArg(pr, null);
+                }
+                for (args) |arg| {
+                    if (emitted_any) try self.w.writeAll(", ");
+                    emitted_any = true;
+                    try self.emitCallArg(arg.value, null);
+                }
+                try self.w.writeByte(')');
+                return;
+            }
+        }
+
         const resolved_name = self.checked.resolvedCallName(callee);
         const cf: ?*const sema.CheckedFunction = if (resolved_name) |rn|
             self.findCheckedFn(rn)
@@ -2494,17 +4498,17 @@ const Emitter = struct {
         }
 
         const total_offset: usize = if (piped_recv != null) 1 else 0;
-        var has_ffi_slices = false;
+        var has_ffi_marshaled = false;
         if (cf != null and cf.?.has_extern_abi) {
             for (cf.?.param_types) |pt| {
-                if (pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice)) {
-                    has_ffi_slices = true;
+                if (self.hasExternMarshaledArg(pt)) {
+                    has_ffi_marshaled = true;
                     break;
                 }
             }
         }
 
-        if (cf != null and cf.?.has_extern_abi and has_ffi_slices) {
+        if (cf != null and cf.?.has_extern_abi and has_ffi_marshaled) {
             const ret_void = isVoidTy(cf.?.ret_type);
             const lbl = self.nextLabel();
             if (ret_void) {
@@ -2513,8 +4517,7 @@ const Emitter = struct {
                 try self.w.print("blk_{d}: {{ ", .{lbl});
             }
             for (cf.?.param_types, 0..) |pt, pidx| {
-                const is_sl = pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice);
-                if (!is_sl) continue;
+                if (!self.hasExternMarshaledArg(pt)) continue;
                 const arg_val: *const ast.Expr = if (piped_recv != null and pidx == 0)
                     piped_recv.?
                 else if (pidx >= total_offset and (pidx - total_offset) < args.len)
@@ -2524,22 +4527,47 @@ const Emitter = struct {
                 try self.w.print("const __ffi_{d}_{d}: ", .{ lbl, pidx });
                 try self.emitTy(pt);
                 try self.w.writeAll(" = ");
-                try self.emitExpr(arg_val);
+                try self.emitCoercedExpr(arg_val, pt);
                 try self.w.writeAll("; ");
             }
             if (!ret_void) {
                 try self.w.print("break :blk_{d} ", .{lbl});
             }
-            try self.emitIdent(cf.?.name);
+            try self.emitIdent(cf.?.rust_sym orelse cf.?.name);
             try self.w.writeByte('(');
             var first_arg = true;
             for (cf.?.param_types, 0..) |pt, pidx| {
-                if (!first_arg) try self.w.writeAll(", ");
-                first_arg = false;
                 const is_sl = pt.* == .slice or (pt.* == .view and pt.view.target.* == .slice);
                 if (is_sl) {
+                    if (!first_arg) try self.w.writeAll(", ");
+                    first_arg = false;
                     try self.w.print("__ffi_{d}_{d}.ptr, __ffi_{d}_{d}.len", .{ lbl, pidx, lbl, pidx });
+                } else if (self.tyBackingKind(pt)) |bk| {
+                    switch (bk.kind) {
+                        .soa => {
+                            const fidxs = self.findPathBorrowFieldIndices(bk.ridx, pt);
+                            const rec = &self.checked.records[bk.ridx];
+                            for (fidxs) |fi| {
+                                if (!first_arg) try self.w.writeAll(", ");
+                                first_arg = false;
+                                try self.w.print("__ffi_{d}_{d}.", .{ lbl, pidx });
+                                try self.emitIdent(rec.fields[fi].name);
+                                try self.w.writeAll(".ptr");
+                            }
+                            if (!first_arg) try self.w.writeAll(", ");
+                            first_arg = false;
+                            try self.w.print("__ffi_{d}_{d}.len", .{ lbl, pidx });
+                        },
+                        .aosoa => {
+                            if (!first_arg) try self.w.writeAll(", ");
+                            first_arg = false;
+                            try self.w.print("__ffi_{d}_{d}.tiles.ptr, __ffi_{d}_{d}.base_elem, __ffi_{d}_{d}.len", .{ lbl, pidx, lbl, pidx, lbl, pidx });
+                        },
+                        .aos_slice => {},
+                    }
                 } else {
+                    if (!first_arg) try self.w.writeAll(", ");
+                    first_arg = false;
                     const arg_val: ?*const ast.Expr = if (piped_recv != null and pidx == 0)
                         piped_recv.?
                     else if (pidx >= total_offset and (pidx - total_offset) < args.len)
@@ -2556,7 +4584,7 @@ const Emitter = struct {
         }
 
         if (cf) |f| {
-            try self.emitIdent(f.name);
+            try self.emitIdent(if (f.has_extern_abi) (f.rust_sym orelse f.name) else f.name);
         } else {
             try self.emitExpr(callee);
         }
@@ -2575,6 +4603,27 @@ const Emitter = struct {
                 }
             }
         }
+        if (cf != null and (cf.?.hkt_params.len > 0 or cf.?.constraint_count > 0)) {
+            for (cf.?.hkt_params, 0..) |hp, hi| {
+                if (emitted_any) try self.w.writeAll(", ");
+                emitted_any = true;
+                const hn: ?[]const u8 = if (trait_res_opt != null and hi < trait_res_opt.?.hkt_args.len) trait_res_opt.?.hkt_args[hi] else hp;
+                try self.emitHKTTypeArg(hn);
+            }
+            if (trait_res_opt) |tres| {
+                for (tres.witnesses) |w| {
+                    if (emitted_any) try self.w.writeAll(", ");
+                    emitted_any = true;
+                    try self.emitWitnessExpr(w);
+                }
+            } else {
+                for (0..cf.?.constraint_count) |wi| {
+                    if (emitted_any) try self.w.writeAll(", ");
+                    emitted_any = true;
+                    try self.w.print("__W_{d}", .{wi});
+                }
+            }
+        }
         if (piped_recv) |pr| {
             if (emitted_any) try self.w.writeAll(", ");
             emitted_any = true;
@@ -2589,6 +4638,308 @@ const Emitter = struct {
             try self.emitCallArg(arg.value, param_ty);
         }
         try self.w.writeByte(')');
+    }
+
+    fn emitHKTTypeArg(self: *Emitter, hname: ?[]const u8) Io.Writer.Error!void {
+        const hn = hname orelse "Option";
+        if (std.mem.eql(u8, hn, "Option")) {
+            try self.w.writeAll("struct { fn apply(comptime __A: type) type { return ?__A; } }.apply");
+            return;
+        }
+        if (std.mem.eql(u8, hn, "f") or std.mem.eql(u8, hn, "g") or (hn.len > 0 and hn[0] >= 'a' and hn[0] <= 'z')) {
+            try self.w.print("__F_{s}", .{hn});
+            return;
+        }
+        try self.w.print("struct {{ fn apply(comptime __A: type) type {{ return {s}(__A); }} }}.apply", .{hn});
+    }
+
+    fn emitWitnessExpr(self: *Emitter, w: sema.ResolvedWitness) Io.Writer.Error!void {
+        switch (w) {
+            .param => |pidx| try self.w.print("__W_{d}", .{pidx}),
+            .concrete => |cw| {
+                const inst = self.checked.instances[cw.inst_idx];
+                try self.w.print("__Inst_{s}", .{inst.name});
+                const is_generic = inst.type_params.len > 0 or inst.hkt_params.len > 0 or inst.constraints.len > 0;
+                if (is_generic) {
+                    try self.w.writeByte('(');
+                    var comma = false;
+                    for (cw.type_args) |ta| {
+                        if (comma) try self.w.writeAll(", ");
+                        comma = true;
+                        try self.emitTy(ta);
+                    }
+                    for (inst.hkt_params) |hp| {
+                        if (comma) try self.w.writeAll(", ");
+                        comma = true;
+                        try self.emitHKTTypeArg(hp);
+                    }
+                    for (cw.sub_witnesses) |sw| {
+                        if (comma) try self.w.writeAll(", ");
+                        comma = true;
+                        try self.emitWitnessExpr(sw);
+                    }
+                    try self.w.writeByte(')');
+                }
+            },
+        }
+    }
+
+    fn emitStdIntrinsicRecv(
+        self: *Emitter,
+        args: []const ast.CallArg,
+        piped_recv: ?*const ast.Expr,
+    ) Io.Writer.Error!void {
+        const recv_expr = piped_recv orelse args[0].value;
+        try self.w.writeByte('(');
+        try self.emitExpr(recv_expr);
+        try self.w.writeByte(')');
+    }
+
+    fn emitStdIntrinsicCall(
+        self: *Emitter,
+        intr: sema.StdIntrinsicCall,
+        args: []const ast.CallArg,
+        piped_recv: ?*const ast.Expr,
+    ) Io.Writer.Error!void {
+        const roff: usize = if (piped_recv != null) 0 else 1;
+        const is_layout_vec = intr.container_ty.* == .vec and self.tyBackingKind(intr.container_ty) != null;
+        switch (intr.kind) {
+            .vec_new, .map_new, .set_new, .deque_new => {
+                try self.emitTy(intr.container_ty);
+                try self.w.writeAll(".new()");
+            },
+            .vec_with_capacity, .map_with_capacity, .set_with_capacity, .deque_with_capacity => {
+                try self.emitTy(intr.container_ty);
+                try self.w.writeAll(".withCapacity(@as(u64, @intCast(");
+                try self.emitExpr(args[0].value);
+                try self.w.writeAll(")))");
+            },
+            .vec_len, .map_len, .set_len, .deque_len => {
+                try self.w.writeAll("@as(u64, @intCast(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".len))");
+            },
+            .vec_capacity => {
+                if (self.tyBackingKind(intr.container_ty)) |bk| {
+                    switch (bk.kind) {
+                        .aosoa => |w| {
+                            try self.w.writeAll("@as(u64, @intCast(");
+                            try self.emitStdIntrinsicRecv(args, piped_recv);
+                            try self.w.print(".tile_cap * {d}))", .{w});
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+                try self.w.writeAll("@as(u64, @intCast(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".cap))");
+            },
+            .vec_is_empty, .map_is_empty, .set_is_empty, .deque_is_empty => {
+                try self.w.writeByte('(');
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".len == 0)");
+            },
+            .vec_push => {
+                const elem_ty = intr.container_ty.vec.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".push(");
+                try self.emitCoercedExpr(args[roff].value, elem_ty);
+                try self.w.writeByte(')');
+            },
+            .vec_pop => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".pop()");
+            },
+            .vec_get => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(if (is_layout_vec) ".getOpt(@as(u64, @intCast(" else ".get(@as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")))");
+            },
+            .vec_set => {
+                const elem_ty = intr.container_ty.vec.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(if (is_layout_vec) ".setChecked(@as(u64, @intCast(" else ".set(@as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")), ");
+                try self.emitCoercedExpr(args[roff + 1].value, elem_ty);
+                try self.w.writeByte(')');
+            },
+            .vec_swap_remove => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".swapRemove(@as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")))");
+            },
+            .vec_reserve => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".reserve(@as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")))");
+            },
+            .vec_clear, .map_clear, .set_clear, .deque_clear => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".clear()");
+            },
+            .vec_as_slice => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".asSlice()");
+            },
+            .vec_as_collection => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(if (is_layout_vec) ".asView()" else ".asSlice()");
+            },
+            .map_insert => {
+                const kv = intr.container_ty.map;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".insert(");
+                try self.emitCoercedExpr(args[roff].value, kv.key_ty);
+                try self.w.writeAll(", ");
+                try self.emitCoercedExpr(args[roff + 1].value, kv.val_ty);
+                try self.w.writeByte(')');
+            },
+            .map_put => {
+                const kv = intr.container_ty.map;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".put(");
+                try self.emitCoercedExpr(args[roff].value, kv.key_ty);
+                try self.w.writeAll(", ");
+                try self.emitCoercedExpr(args[roff + 1].value, kv.val_ty);
+                try self.w.writeByte(')');
+            },
+            .map_get => {
+                const kv = intr.container_ty.map;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".get(");
+                try self.emitCoercedExpr(args[roff].value, kv.key_ty);
+                try self.w.writeByte(')');
+            },
+            .map_contains => {
+                const kv = intr.container_ty.map;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".contains(");
+                try self.emitCoercedExpr(args[roff].value, kv.key_ty);
+                try self.w.writeByte(')');
+            },
+            .map_remove => {
+                const kv = intr.container_ty.map;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".remove(");
+                try self.emitCoercedExpr(args[roff].value, kv.key_ty);
+                try self.w.writeByte(')');
+            },
+            .set_insert => {
+                const et = intr.container_ty.set.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".insert(");
+                try self.emitCoercedExpr(args[roff].value, et);
+                try self.w.writeByte(')');
+            },
+            .set_contains => {
+                const et = intr.container_ty.set.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".contains(");
+                try self.emitCoercedExpr(args[roff].value, et);
+                try self.w.writeByte(')');
+            },
+            .set_remove => {
+                const et = intr.container_ty.set.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".remove(");
+                try self.emitCoercedExpr(args[roff].value, et);
+                try self.w.writeByte(')');
+            },
+            .deque_push_back => {
+                const et = intr.container_ty.deque.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".pushBack(");
+                try self.emitCoercedExpr(args[roff].value, et);
+                try self.w.writeByte(')');
+            },
+            .deque_push_front => {
+                const et = intr.container_ty.deque.elem_ty;
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".pushFront(");
+                try self.emitCoercedExpr(args[roff].value, et);
+                try self.w.writeByte(')');
+            },
+            .deque_pop_front => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".popFront()");
+            },
+            .deque_pop_back => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".popBack()");
+            },
+            .deque_get => {
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".get(@as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")))");
+            },
+            .str_len => {
+                try self.w.writeAll("@as(u64, @intCast(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".len))");
+            },
+            .str_is_empty => {
+                try self.w.writeByte('(');
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(".len == 0)");
+            },
+            .str_eq => {
+                try self.w.writeAll("std.mem.eql(u8, ");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", ");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeByte(')');
+            },
+            .str_concat => {
+                try self.w.writeAll("aethelConcat(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", ");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeByte(')');
+            },
+            .str_starts_with => {
+                try self.w.writeAll("aethelStrStartsWith(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", ");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeByte(')');
+            },
+            .str_ends_with => {
+                try self.w.writeAll("aethelStrEndsWith(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", ");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeByte(')');
+            },
+            .str_contains => {
+                try self.w.writeAll("aethelStrContains(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", ");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeByte(')');
+            },
+            .str_byte_at => {
+                try self.w.writeAll("aethelStrByteAt(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", @as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")))");
+            },
+            .str_slice_bytes => {
+                try self.w.writeAll("aethelStrSlice(");
+                try self.emitStdIntrinsicRecv(args, piped_recv);
+                try self.w.writeAll(", @as(u64, @intCast(");
+                try self.emitExpr(args[roff].value);
+                try self.w.writeAll(")), @as(u64, @intCast(");
+                try self.emitExpr(args[roff + 1].value);
+                try self.w.writeAll(")))");
+            },
+        }
     }
 
     fn emitCallArg(self: *Emitter, val: *const ast.Expr, expected: ?*const sema.Ty) Io.Writer.Error!void {
@@ -3679,6 +6030,7 @@ const Emitter = struct {
                 for (fk.branches) |*br| if (self.blockMentionsIdent(br, name)) break :blk true;
                 break :blk false;
             },
+            .using_expr => |ue| self.exprMentionsIdent(ue.target, name),
             .todo_expr => |td| if (td.message) |m| self.exprMentionsIdent(m, name) else false,
             .panic_expr => |pn| if (pn.message) |m| self.exprMentionsIdent(m, name) else false,
             else => false,
@@ -3716,6 +6068,169 @@ const Emitter = struct {
         };
     }
 
+    fn isMutatingStdIntrinsic(kind: sema.StdIntrinsicKind) bool {
+        return switch (kind) {
+            .vec_push,
+            .vec_pop,
+            .vec_set,
+            .vec_swap_remove,
+            .vec_reserve,
+            .vec_clear,
+            .map_insert,
+            .map_put,
+            .map_remove,
+            .map_clear,
+            .set_insert,
+            .set_remove,
+            .set_clear,
+            .deque_push_back,
+            .deque_push_front,
+            .deque_pop_front,
+            .deque_pop_back,
+            .deque_clear,
+            => true,
+            else => false,
+        };
+    }
+
+    fn stmtsMayMoveIdent(self: *const Emitter, stmts: []const ast.Stmt, tail: ?*const ast.Expr, name: []const u8) bool {
+        for (stmts) |*st| {
+            if (self.stmtMayMoveIdent(st, name)) return true;
+        }
+        if (tail) |t| {
+            if (self.exprIsDirectMoveOf(t, name) or self.exprMayMoveIdent(t, name)) return true;
+        }
+        return false;
+    }
+
+    fn blockMayMoveIdent(self: *const Emitter, blk: *const ast.Block, name: []const u8) bool {
+        return self.stmtsMayMoveIdent(blk.stmts, blk.tail, name);
+    }
+
+    fn exprIsDirectMoveOf(self: *const Emitter, expr: *const ast.Expr, name: []const u8) bool {
+        return switch (expr.*) {
+            .ident => |sp| std.mem.eql(u8, self.sourceOf(sp), name),
+            .block => |*b| if (b.tail) |t| self.exprIsDirectMoveOf(t, name) else false,
+            .if_expr => |ie| (if (ie.then_block.tail) |tt| self.exprIsDirectMoveOf(tt, name) else false) or
+                (if (ie.else_branch) |eb| self.exprIsDirectMoveOf(eb, name) else false),
+            else => false,
+        };
+    }
+
+    fn exprIsDirectMoveAnyOwned(self: *const Emitter, expr: *const ast.Expr) bool {
+        return switch (expr.*) {
+            .ident => |sp| blk: {
+                if (self.lookupScopeVar(self.sourceOf(sp))) |sv| {
+                    break :blk sv.is_owned_dyn and sv.has_moved_flag;
+                }
+                break :blk false;
+            },
+            .block => |*b| if (b.tail) |t| self.exprIsDirectMoveAnyOwned(t) else false,
+            .if_expr => |ie| (if (ie.then_block.tail) |tt| self.exprIsDirectMoveAnyOwned(tt) else false) or
+                (if (ie.else_branch) |eb| self.exprIsDirectMoveAnyOwned(eb) else false),
+            else => false,
+        };
+    }
+
+    fn stmtMayMoveIdent(self: *const Emitter, stmt: *const ast.Stmt, name: []const u8) bool {
+        return switch (stmt.*) {
+            .let_stmt => |ls| self.exprIsDirectMoveOf(ls.value, name) or self.exprMayMoveIdent(ls.value, name),
+            .use_stmt => |us| self.exprMayMoveIdent(us.expr, name),
+            .assign_stmt => |asg| self.exprIsDirectMoveOf(asg.value, name) or self.exprMayMoveIdent(asg.value, name),
+            .return_stmt => |rs| if (rs.value) |v| self.exprIsDirectMoveOf(v, name) or self.exprMayMoveIdent(v, name) else false,
+            .while_stmt => |ws| self.exprMayMoveIdent(ws.cond, name) or self.blockMayMoveIdent(&ws.body, name),
+            .for_stmt => |fs| self.exprMayMoveIdent(fs.iter, name) or self.blockMayMoveIdent(&fs.body, name),
+            .expr_stmt => |es| self.exprIsDirectMoveOf(es.expr, name) or self.exprMayMoveIdent(es.expr, name),
+        };
+    }
+
+    fn callArgConsumesByValue(self: *const Emitter, call_expr: *const ast.Expr, callee: *const ast.Expr, idx: usize, piped: bool) bool {
+        if (self.checked.std_intrinsic_calls.get(call_expr)) |_| {
+            return idx > 0 or (piped and idx == 0);
+        }
+        const cn_opt = self.checked.resolvedCallName(callee) orelse
+            if (callee.* == .ident) self.sourceOf(callee.ident) else null;
+        if (cn_opt) |cn| {
+            if (self.findCheckedFn(cn)) |cf| {
+                if (idx < cf.param_types.len) {
+                    const pt = cf.param_types[idx];
+                    return !isPointerType(pt) and isOwnedDynamicTy(pt);
+                }
+            }
+        }
+        if (callee.* == .upper_ident) {
+            const un = self.sourceOf(callee.upper_ident);
+            if (std.mem.eql(u8, un, "Some") or std.mem.eql(u8, un, "Ok") or std.mem.eql(u8, un, "Err")) return true;
+        }
+        return false;
+    }
+
+    fn exprMayMoveIdent(self: *const Emitter, expr: *const ast.Expr, name: []const u8) bool {
+        return switch (expr.*) {
+            .unary => |u| self.exprMayMoveIdent(u.operand, name),
+            .binary => |b| blk: {
+                if (b.op == .pipe and b.right.* == .call) {
+                    if (self.checked.std_intrinsic_calls.get(b.right) == null and
+                        self.callArgConsumesByValue(b.right, b.right.call.callee, 0, false) and
+                        self.exprIsDirectMoveOf(b.left, name))
+                    {
+                        break :blk true;
+                    }
+                    if (b.right.call.callee.* == .ident and
+                        std.mem.eql(u8, self.sourceOf(b.right.call.callee.ident), "map_in_place") and
+                        self.exprIsDirectMoveOf(b.left, name) and
+                        isOwnedDynamicTy(self.checked.exprType(b.left)))
+                    {
+                        // Non-fold pipe returning Vec moves base through __raw unless discarded;
+                        // check only when consumed as value (handled by parent), so inspect args only.
+                    }
+                }
+                break :blk self.exprMayMoveIdent(b.left, name) or self.exprMayMoveIdent(b.right, name);
+            },
+            .call => |c| blk: {
+                const is_intr = self.checked.std_intrinsic_calls.get(expr) != null;
+                for (c.args, 0..) |a, ai| {
+                    if (is_intr and ai == 0) {
+                        if (self.exprMayMoveIdent(a.value, name)) break :blk true;
+                        continue;
+                    }
+                    if (self.callArgConsumesByValue(expr, c.callee, ai, false) and self.exprIsDirectMoveOf(a.value, name)) {
+                        break :blk true;
+                    }
+                    if (self.exprMayMoveIdent(a.value, name)) break :blk true;
+                }
+                break :blk false;
+            },
+            .record_lit => |rl| blk: {
+                for (rl.fields) |rf| {
+                    if (rf.value) |v| {
+                        if (self.exprIsDirectMoveOf(v, name) or self.exprMayMoveIdent(v, name)) break :blk true;
+                    } else if (std.mem.eql(u8, self.sourceOf(rf.name), name)) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .tuple => |tp| blk: {
+                for (tp.elems) |el| if (self.exprIsDirectMoveOf(el, name) or self.exprMayMoveIdent(el, name)) break :blk true;
+                break :blk false;
+            },
+            .list => |ls| blk: {
+                for (ls.elems) |el| if (self.exprIsDirectMoveOf(el, name) or self.exprMayMoveIdent(el, name)) break :blk true;
+                break :blk false;
+            },
+            .block => |*blk| self.blockMayMoveIdent(blk, name),
+            .if_expr => |ie| self.exprMayMoveIdent(ie.cond, name) or
+                self.blockMayMoveIdent(&ie.then_block, name) or
+                (if (ie.else_branch) |eb| self.exprMayMoveIdent(eb, name) else false),
+            .case_expr => |ce| blk: {
+                for (ce.arms) |arm| if (self.exprMayMoveIdent(arm.body, name)) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
     fn exprMutatesOrBorrowsIdent(self: *const Emitter, expr: *const ast.Expr, name: []const u8) bool {
         return switch (expr.*) {
             .unary => |u| (u.op == .addr_of and blk: {
@@ -3724,13 +6239,28 @@ const Emitter = struct {
             }) or self.exprMutatesOrBorrowsIdent(u.operand, name),
             .binary => |b| blk: {
                 if (b.op == .pipe and b.right.* == .call) {
-                    const cn_opt = self.checked.resolvedCallName(b.right.call.callee) orelse
-                        if (b.right.call.callee.* == .ident) self.sourceOf(b.right.call.callee.ident) else null;
-                    if (cn_opt) |cn| {
-                        if (self.findCheckedFn(cn)) |cf| {
-                            if (cf.param_types.len > 0 and isPointerType(cf.param_types[0])) {
-                                if (self.rootIdentOf(b.left)) |rn| {
-                                    if (std.mem.eql(u8, rn, name)) break :blk true;
+                    if (self.checked.std_intrinsic_calls.get(b.right)) |intr| {
+                        if (isMutatingStdIntrinsic(intr.kind)) {
+                            if (self.rootIdentOf(b.left)) |rn| {
+                                if (std.mem.eql(u8, rn, name)) break :blk true;
+                            }
+                        }
+                    } else {
+                        if (b.right.call.callee.* == .ident and
+                            std.mem.eql(u8, self.sourceOf(b.right.call.callee.ident), "map_in_place"))
+                        {
+                            if (self.rootIdentOf(b.left)) |rn| {
+                                if (std.mem.eql(u8, rn, name)) break :blk true;
+                            }
+                        }
+                        const cn_opt = self.checked.resolvedCallName(b.right.call.callee) orelse
+                            if (b.right.call.callee.* == .ident) self.sourceOf(b.right.call.callee.ident) else null;
+                        if (cn_opt) |cn| {
+                            if (self.findCheckedFn(cn)) |cf| {
+                                if (cf.param_types.len > 0 and isPointerType(cf.param_types[0])) {
+                                    if (self.rootIdentOf(b.left)) |rn| {
+                                        if (std.mem.eql(u8, rn, name)) break :blk true;
+                                    }
                                 }
                             }
                         }
@@ -3739,14 +6269,22 @@ const Emitter = struct {
                 break :blk self.exprMutatesOrBorrowsIdent(b.left, name) or self.exprMutatesOrBorrowsIdent(b.right, name);
             },
             .call => |c| blk: {
-                const cn_opt = self.checked.resolvedCallName(c.callee) orelse
-                    if (c.callee.* == .ident) self.sourceOf(c.callee.ident) else null;
-                if (cn_opt) |cn| {
-                    if (self.findCheckedFn(cn)) |cf| {
-                        for (c.args, 0..) |a, ai| {
-                            if (ai < cf.param_types.len and isPointerType(cf.param_types[ai])) {
-                                if (self.rootIdentOf(a.value)) |rn| {
-                                    if (std.mem.eql(u8, rn, name)) break :blk true;
+                if (self.checked.std_intrinsic_calls.get(expr)) |intr| {
+                    if (isMutatingStdIntrinsic(intr.kind) and c.args.len > 0) {
+                        if (self.rootIdentOf(c.args[0].value)) |rn| {
+                            if (std.mem.eql(u8, rn, name)) break :blk true;
+                        }
+                    }
+                } else {
+                    const cn_opt = self.checked.resolvedCallName(c.callee) orelse
+                        if (c.callee.* == .ident) self.sourceOf(c.callee.ident) else null;
+                    if (cn_opt) |cn| {
+                        if (self.findCheckedFn(cn)) |cf| {
+                            for (c.args, 0..) |a, ai| {
+                                if (ai < cf.param_types.len and isPointerType(cf.param_types[ai])) {
+                                    if (self.rootIdentOf(a.value)) |rn| {
+                                        if (std.mem.eql(u8, rn, name)) break :blk true;
+                                    }
                                 }
                             }
                         }
@@ -3779,6 +6317,7 @@ const Emitter = struct {
                 for (fk.branches) |*br| if (self.blockMutatesOrBorrowsIdent(br, name)) break :blk true;
                 break :blk false;
             },
+            .using_expr => |ue| self.exprMutatesOrBorrowsIdent(ue.target, name),
             else => false,
         };
     }
@@ -4376,7 +6915,7 @@ const Emitter = struct {
             const c = cur.binary.right.call;
             if (c.callee.* == .ident and std.mem.eql(u8, self.sourceOf(c.callee.ident), "fold") and c.args.len == 2) {
                 const l_ty = self.checked.exprType(cur.binary.left);
-                if (l_ty != null and (l_ty.?.* == .collection or l_ty.?.* == .slice or l_ty.?.* == .view or l_ty.?.* == .path_borrow)) {
+                if (l_ty != null and (l_ty.?.* == .collection or l_ty.?.* == .vec or l_ty.?.* == .slice or l_ty.?.* == .view or l_ty.?.* == .path_borrow)) {
                     fold_init = c.args[0].value;
                     fold_arg = c.args[1].value;
                     cur = cur.binary.left;
@@ -4479,15 +7018,18 @@ const Emitter = struct {
         if (recv_ty) |rt| {
             const ridx_opt: ?usize = switch (rt.*) {
                 .collection => |c| c.elem_record,
+                .vec => |v| v.elem_record,
                 .slice => |s| if (s.elem.* == .record) s.elem.record else null,
                 .view => |v| switch (v.target.*) {
                     .collection => |c| c.elem_record,
+                    .vec => |vc| vc.elem_record,
                     .slice => |s| if (s.elem.* == .record) s.elem.record else null,
                     .record => |ri| ri,
                     else => null,
                 },
                 .path_borrow => |pb| switch (pb.base.*) {
                     .collection => |c| c.elem_record,
+                    .vec => |vc| vc.elem_record,
                     .slice => |s| if (s.elem.* == .record) s.elem.record else null,
                     .record => |ri| ri,
                     else => null,
@@ -4534,10 +7076,43 @@ const Emitter = struct {
             });
         }
 
+        const elem_bk: ?BackingKind = if (elem_ridx_opt) |ri|
+            (if (ri < self.checked.records.len) recordBackingKind(&self.checked.records[ri]) else null)
+        else
+            null;
+        const is_phys_soa = elem_bk != null and elem_bk.? == .soa;
+        const is_phys_aosoa = elem_bk != null and elem_bk.? == .aosoa;
+        const is_vec_base = self.isVecTyOrViewToVec(recv_ty);
+        const returns_vec_raw = is_vec_base and !is_fold and need_value;
+
         try self.writeIndent();
-        try self.w.print("const __col_{d} = ", .{id});
-        try self.emitExpr(pipe.base);
-        try self.w.writeAll(";\n");
+        if (returns_vec_raw) {
+            try self.w.print("var __raw_{d} = ", .{id});
+            try self.emitCoercedExpr(pipe.base, recv_ty.?);
+            try self.w.writeAll(";\n");
+            try self.writeIndent();
+            try self.w.print("const __col_{d} = __raw_{d}.", .{ id, id });
+            if (is_phys_soa or is_phys_aosoa) {
+                try self.w.writeAll(if (pipe.map_stages.len > 0) "mutView()" else "asView()");
+            } else {
+                try self.w.writeAll(if (pipe.map_stages.len > 0) "mutSlice()" else "asSlice()");
+            }
+            try self.w.writeAll(";\n");
+        } else if (is_vec_base) {
+            try self.w.print("const __col_{d} = (", .{id});
+            try self.emitExpr(pipe.base);
+            try self.w.writeAll(").");
+            if (is_phys_soa or is_phys_aosoa) {
+                try self.w.writeAll(if (pipe.map_stages.len > 0) "mutView()" else "asView()");
+            } else {
+                try self.w.writeAll(if (pipe.map_stages.len > 0) "mutSlice()" else "asSlice()");
+            }
+            try self.w.writeAll(";\n");
+        } else {
+            try self.w.print("const __col_{d} = ", .{id});
+            try self.emitExpr(pipe.base);
+            try self.w.writeAll(";\n");
+        }
 
         if (is_fold) {
             try self.writeIndent();
@@ -4571,6 +7146,11 @@ const Emitter = struct {
 
             try self.writeIndent();
             try self.w.print("var __tile_{d}: usize = 0;\n", .{id});
+            if (is_phys_aosoa) {
+                try self.writeIndent();
+                try self.w.print("if (__col_{d}.base_elem % {d} == 0) {{\n", .{ id, tw });
+                self.indent += 1;
+            }
             try self.writeIndent();
             try self.w.print("while (__tile_{d} + {d} <= __col_{d}.len) : (__tile_{d} += {d}) {{\n", .{ id, tw, id, id, tw });
             self.indent += 1;
@@ -4584,22 +7164,28 @@ const Emitter = struct {
                     try self.w.print(": @Vector({d}, ", .{tw});
                     try self.emitTy(sf.ty);
                     if (sf.read) {
-                        const ld_lbl = self.nextLabel();
-                        try self.w.print(") = blk_{d}: {{\n", .{ld_lbl});
-                        self.indent += 1;
-                        try self.writeIndent();
-                        try self.w.print("var __buf_{d}: [{d}]", .{ ld_lbl, tw });
-                        try self.emitTy(sf.ty);
-                        try self.w.writeAll(" align(64) = undefined;\n");
-                        try self.writeIndent();
-                        try self.w.print("inline for (0..{d}) |__li| __buf_{d}[__li] = __col_{d}[__tile_{d} + __li].", .{ tw, ld_lbl, id, id });
-                        try self.emitIdent(sf.name);
-                        try self.w.writeAll(";\n");
-                        try self.writeIndent();
-                        try self.w.print("break :blk_{d} __buf_{d};\n", .{ ld_lbl, ld_lbl });
-                        self.indent -= 1;
-                        try self.writeIndent();
-                        try self.w.writeAll("};\n");
+                        if (is_phys_aosoa) {
+                            try self.w.print(") = __col_{d}.tiles[(__col_{d}.base_elem + __tile_{d}) / {d}].", .{ id, id, id, tw });
+                            try self.emitIdent(sf.name);
+                            try self.w.writeAll(";\n");
+                        } else {
+                            const ld_lbl = self.nextLabel();
+                            try self.w.print(") = blk_{d}: {{\n", .{ld_lbl});
+                            self.indent += 1;
+                            try self.writeIndent();
+                            try self.w.print("var __buf_{d}: [{d}]", .{ ld_lbl, tw });
+                            try self.emitTy(sf.ty);
+                            try self.w.writeAll(" align(64) = undefined;\n");
+                            try self.writeIndent();
+                            try self.w.print("inline for (0..{d}) |__li| __buf_{d}[__li] = __col_{d}[__tile_{d} + __li].", .{ tw, ld_lbl, id, id });
+                            try self.emitIdent(sf.name);
+                            try self.w.writeAll(";\n");
+                            try self.writeIndent();
+                            try self.w.print("break :blk_{d} __buf_{d};\n", .{ ld_lbl, ld_lbl });
+                            self.indent -= 1;
+                            try self.writeIndent();
+                            try self.w.writeAll("};\n");
+                        }
                     } else {
                         try self.w.writeAll(") = undefined;\n");
                     }
@@ -4686,27 +7272,51 @@ const Emitter = struct {
                     }
                 }
 
-                try self.writeIndent();
-                try self.w.print("inline for (0..{d}) |__li| {{\n", .{tw});
-                self.indent += 1;
-                for (simd_fields) |sf| {
-                    if (!sf.written) continue;
+                if (is_phys_aosoa) {
+                    for (simd_fields) |sf| {
+                        if (!sf.written) continue;
+                        try self.writeIndent();
+                        try self.w.print("__col_{d}.tiles[(__col_{d}.base_elem + __tile_{d}) / {d}].", .{ id, id, id, tw });
+                        try self.emitIdent(sf.name);
+                        try self.w.print(" = @as([{d}]", .{tw});
+                        try self.emitTy(sf.ty);
+                        try self.w.print(", __vec_{d}_", .{id});
+                        try self.emitIdent(sf.name);
+                        try self.w.writeAll(");\n");
+                    }
+                    if (is_fold) {
+                        try self.writeIndent();
+                        try self.w.print("inline for (0..{d}) |__li| {{\n", .{tw});
+                        try self.writeIndent();
+                        try self.w.print("    __acc_{d} = aethelCall(", .{id});
+                        try self.emitExpr(pipe.fold_arg.?);
+                        try self.w.print(", .{{ __acc_{d}, __col_{d}.get(__tile_{d} + __li) }});\n", .{ id, id, id });
+                        try self.writeIndent();
+                        try self.w.writeAll("}\n");
+                    }
+                } else {
                     try self.writeIndent();
-                    try self.w.print("__col_{d}[__tile_{d} + __li].", .{ id, id });
-                    try self.emitIdent(sf.name);
-                    try self.w.print(" = __vec_{d}_", .{id});
-                    try self.emitIdent(sf.name);
-                    try self.w.writeAll("[__li];\n");
-                }
-                if (is_fold) {
+                    try self.w.print("inline for (0..{d}) |__li| {{\n", .{tw});
+                    self.indent += 1;
+                    for (simd_fields) |sf| {
+                        if (!sf.written) continue;
+                        try self.writeIndent();
+                        try self.w.print("__col_{d}[__tile_{d} + __li].", .{ id, id });
+                        try self.emitIdent(sf.name);
+                        try self.w.print(" = __vec_{d}_", .{id});
+                        try self.emitIdent(sf.name);
+                        try self.w.writeAll("[__li];\n");
+                    }
+                    if (is_fold) {
+                        try self.writeIndent();
+                        try self.w.print("__acc_{d} = aethelCall(", .{id});
+                        try self.emitExpr(pipe.fold_arg.?);
+                        try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d} + __li] }});\n", .{ id, id, id });
+                    }
+                    self.indent -= 1;
                     try self.writeIndent();
-                    try self.w.print("__acc_{d} = aethelCall(", .{id});
-                    try self.emitExpr(pipe.fold_arg.?);
-                    try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d} + __li] }});\n", .{ id, id, id });
+                    try self.w.writeAll("}\n");
                 }
-                self.indent -= 1;
-                try self.writeIndent();
-                try self.w.writeAll("}\n");
             } else {
                 try self.writeIndent();
                 try self.w.print("var __lane_{d}: usize = 0;\n", .{id});
@@ -4722,10 +7332,19 @@ const Emitter = struct {
                     const lsv = self.pushScopeVars();
                     defer self.popScopeVars(lsv);
                     self.bindScopeVar(elem_param, elem_ptr_ty, true);
-                    try self.writeIndent();
-                    try self.w.writeAll("const ");
-                    try self.emitIdent(elem_param);
-                    try self.w.print(" = &__col_{d}[__tile_{d} + __lane_{d}];\n", .{ id, id, id });
+                    if (is_phys_aosoa) {
+                        try self.writeIndent();
+                        try self.w.print("var __el_{d} = __col_{d}.get(__tile_{d} + __lane_{d});\n", .{ id, id, id, id });
+                        try self.writeIndent();
+                        try self.w.writeAll("const ");
+                        try self.emitIdent(elem_param);
+                        try self.w.print(" = &__el_{d};\n", .{id});
+                    } else {
+                        try self.writeIndent();
+                        try self.w.writeAll("const ");
+                        try self.emitIdent(elem_param);
+                        try self.w.print(" = &__col_{d}[__tile_{d} + __lane_{d}];\n", .{ id, id, id });
+                    }
                     if (!self.blockMentionsIdent(&lam.body, elem_param)) {
                         try self.writeIndent();
                         try self.w.writeAll("_ = ");
@@ -4734,6 +7353,10 @@ const Emitter = struct {
                     }
                     try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
                     if (lam.body.tail) |t| try self.emitTailStmt(t);
+                    if (is_phys_aosoa) {
+                        try self.writeIndent();
+                        try self.w.print("__col_{d}.set(__tile_{d} + __lane_{d}, __el_{d});\n", .{ id, id, id, id });
+                    }
                     self.indent -= 1;
                     try self.writeIndent();
                     try self.w.writeAll("}\n");
@@ -4742,7 +7365,11 @@ const Emitter = struct {
                     try self.writeIndent();
                     try self.w.print("__acc_{d} = aethelCall(", .{id});
                     try self.emitExpr(pipe.fold_arg.?);
-                    try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d} + __lane_{d}] }});\n", .{ id, id, id, id });
+                    if (is_phys_aosoa) {
+                        try self.w.print(", .{{ __acc_{d}, __col_{d}.get(__tile_{d} + __lane_{d}) }});\n", .{ id, id, id, id });
+                    } else {
+                        try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d} + __lane_{d}] }});\n", .{ id, id, id, id });
+                    }
                 }
                 self.indent -= 1;
                 try self.writeIndent();
@@ -4752,6 +7379,11 @@ const Emitter = struct {
             self.indent -= 1;
             try self.writeIndent();
             try self.w.writeAll("}\n");
+            if (is_phys_aosoa) {
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.w.writeAll("}\n");
+            }
             try self.writeIndent();
             try self.w.print("while (__tile_{d} < __col_{d}.len) : (__tile_{d} += 1) {{\n", .{ id, id, id });
             self.indent += 1;
@@ -4764,10 +7396,19 @@ const Emitter = struct {
                 const tsv = self.pushScopeVars();
                 defer self.popScopeVars(tsv);
                 self.bindScopeVar(elem_param, elem_ptr_ty, true);
-                try self.writeIndent();
-                try self.w.writeAll("const ");
-                try self.emitIdent(elem_param);
-                try self.w.print(" = &__col_{d}[__tile_{d}];\n", .{ id, id });
+                if (is_phys_aosoa) {
+                    try self.writeIndent();
+                    try self.w.print("var __el_{d} = __col_{d}.get(__tile_{d});\n", .{ id, id, id });
+                    try self.writeIndent();
+                    try self.w.writeAll("const ");
+                    try self.emitIdent(elem_param);
+                    try self.w.print(" = &__el_{d};\n", .{id});
+                } else {
+                    try self.writeIndent();
+                    try self.w.writeAll("const ");
+                    try self.emitIdent(elem_param);
+                    try self.w.print(" = &__col_{d}[__tile_{d}];\n", .{ id, id });
+                }
                 if (!self.blockMentionsIdent(&lam.body, elem_param)) {
                     try self.writeIndent();
                     try self.w.writeAll("_ = ");
@@ -4776,6 +7417,10 @@ const Emitter = struct {
                 }
                 try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
                 if (lam.body.tail) |t| try self.emitTailStmt(t);
+                if (is_phys_aosoa) {
+                    try self.writeIndent();
+                    try self.w.print("__col_{d}.set(__tile_{d}, __el_{d});\n", .{ id, id, id });
+                }
                 self.indent -= 1;
                 try self.writeIndent();
                 try self.w.writeAll("}\n");
@@ -4784,7 +7429,11 @@ const Emitter = struct {
                 try self.writeIndent();
                 try self.w.print("__acc_{d} = aethelCall(", .{id});
                 try self.emitExpr(pipe.fold_arg.?);
-                try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d}] }});\n", .{ id, id, id });
+                if (is_phys_aosoa) {
+                    try self.w.print(", .{{ __acc_{d}, __col_{d}.get(__tile_{d}) }});\n", .{ id, id, id });
+                } else {
+                    try self.w.print(", .{{ __acc_{d}, __col_{d}[__tile_{d}] }});\n", .{ id, id, id });
+                }
             }
             self.indent -= 1;
             try self.writeIndent();
@@ -4804,10 +7453,19 @@ const Emitter = struct {
                 const msv = self.pushScopeVars();
                 defer self.popScopeVars(msv);
                 self.bindScopeVar(elem_param, elem_ptr_ty, true);
-                try self.writeIndent();
-                try self.w.writeAll("const ");
-                try self.emitIdent(elem_param);
-                try self.w.print(" = &__col_{d}[__idx_{d}];\n", .{ id, id });
+                if (is_phys_soa) {
+                    try self.writeIndent();
+                    try self.w.print("var __el_{d} = __col_{d}.get(__idx_{d});\n", .{ id, id, id });
+                    try self.writeIndent();
+                    try self.w.writeAll("const ");
+                    try self.emitIdent(elem_param);
+                    try self.w.print(" = &__el_{d};\n", .{id});
+                } else {
+                    try self.writeIndent();
+                    try self.w.writeAll("const ");
+                    try self.emitIdent(elem_param);
+                    try self.w.print(" = &__col_{d}[__idx_{d}];\n", .{ id, id });
+                }
                 if (!self.blockMentionsIdent(&lam.body, elem_param)) {
                     try self.writeIndent();
                     try self.w.writeAll("_ = ");
@@ -4816,6 +7474,10 @@ const Emitter = struct {
                 }
                 try self.emitStmtsWithRest(lam.body.stmts, lam.body.tail);
                 if (lam.body.tail) |t| try self.emitTailStmt(t);
+                if (is_phys_soa) {
+                    try self.writeIndent();
+                    try self.w.print("__col_{d}.set(__idx_{d}, __el_{d});\n", .{ id, id, id });
+                }
                 self.indent -= 1;
                 try self.writeIndent();
                 try self.w.writeAll("}\n");
@@ -4824,7 +7486,11 @@ const Emitter = struct {
                 try self.writeIndent();
                 try self.w.print("__acc_{d} = aethelCall(", .{id});
                 try self.emitExpr(pipe.fold_arg.?);
-                try self.w.print(", .{{ __acc_{d}, __col_{d}[__idx_{d}] }});\n", .{ id, id, id });
+                if (is_phys_soa) {
+                    try self.w.print(", .{{ __acc_{d}, __col_{d}.get(__idx_{d}) }});\n", .{ id, id, id });
+                } else {
+                    try self.w.print(", .{{ __acc_{d}, __col_{d}[__idx_{d}] }});\n", .{ id, id, id });
+                }
             }
             self.indent -= 1;
             try self.writeIndent();
@@ -4834,6 +7500,9 @@ const Emitter = struct {
         if (is_fold) {
             try self.writeIndent();
             try self.w.print("break :blk_{d} __acc_{d};\n", .{ id, id });
+        } else if (returns_vec_raw) {
+            try self.writeIndent();
+            try self.w.print("break :blk_{d} __raw_{d};\n", .{ id, id });
         } else if (returns_val) {
             try self.writeIndent();
             try self.w.print("break :blk_{d} __col_{d};\n", .{ id, id });

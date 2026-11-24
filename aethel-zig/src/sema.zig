@@ -58,8 +58,34 @@ pub const Ty = union(enum) {
     record: usize,
     adt: usize,
     opaque_ty: usize,
+    applied: struct {
+        kind: AppliedKind,
+        decl_idx: usize,
+        args: []const *const Ty,
+        brand_inst: ?[]const u8 = null,
+
+        pub const AppliedKind = enum { record, adt, opaque_ty };
+    },
+    hkt_app: struct {
+        ctor: []const u8,
+        arg: *const Ty,
+    },
     collection: struct {
         elem_record: ?usize,
+        elem_ty: *const Ty,
+    },
+    vec: struct {
+        elem_record: ?usize,
+        elem_ty: *const Ty,
+    },
+    map: struct {
+        key_ty: *const Ty,
+        val_ty: *const Ty,
+    },
+    set: struct {
+        elem_ty: *const Ty,
+    },
+    deque: struct {
         elem_ty: *const Ty,
     },
     view: struct {
@@ -94,8 +120,16 @@ pub const Ty = union(enum) {
         return switch (self) {
             .int, .int_range, .f32, .f64, .bool, .unit, .type_var, .err => true,
             .string => true,
-            .opaque_ty, .collection, .view, .path_borrow, .slice => false,
+            .opaque_ty, .collection, .vec, .map, .set, .deque, .view, .path_borrow, .slice => false,
             .record, .adt => true,
+            .applied => |ap| blk: {
+                if (ap.kind == .opaque_ty) break :blk false;
+                for (ap.args) |el| {
+                    if (!el.isCopyable()) break :blk false;
+                }
+                break :blk true;
+            },
+            .hkt_app => true,
             .tuple => |elems| blk: {
                 for (elems) |el| {
                     if (!el.isCopyable()) break :blk false;
@@ -138,10 +172,26 @@ pub const Ty = union(enum) {
             .record => |id| id == b.record,
             .adt => |id| id == b.adt,
             .opaque_ty => |id| id == b.opaque_ty,
+            .applied => |aa| blk: {
+                const ab = b.applied;
+                if (aa.kind != ab.kind or aa.decl_idx != ab.decl_idx or aa.args.len != ab.args.len) break :blk false;
+                if (aa.brand_inst != null and ab.brand_inst != null and !std.mem.eql(u8, aa.brand_inst.?, ab.brand_inst.?)) {
+                    break :blk false;
+                }
+                for (aa.args, ab.args) |ea, eb| {
+                    if (!ea.eql(eb.*)) break :blk false;
+                }
+                break :blk true;
+            },
+            .hkt_app => |ha| std.mem.eql(u8, ha.ctor, b.hkt_app.ctor) and ha.arg.eql(b.hkt_app.arg.*),
             .type_var => |n| std.mem.eql(u8, n, b.type_var),
             .option => |inner| inner.eql(b.option.*),
             .slice => |sa| sa.mutable == b.slice.mutable and sa.elem.eql(b.slice.elem.*),
             .collection => |ca| ca.elem_ty.eql(b.collection.elem_ty.*),
+            .vec => |va| va.elem_ty.eql(b.vec.elem_ty.*),
+            .map => |ma| ma.key_ty.eql(b.map.key_ty.*) and ma.val_ty.eql(b.map.val_ty.*),
+            .set => |sa| sa.elem_ty.eql(b.set.elem_ty.*),
+            .deque => |da| da.elem_ty.eql(b.deque.elem_ty.*),
             .view => |va| va.mode == b.view.mode and va.target.eql(b.view.target.*),
             .path_borrow => |pa| pa.base.eql(b.path_borrow.base.*),
             .result => |ra| ra.ok.eql(b.result.ok.*) and ra.err.eql(b.result.err.*),
@@ -182,6 +232,7 @@ pub const CheckedRecord = struct {
     collection_layout: ?layout.CollectionLayout,
     hot_fields: []const bool = &.{},
     auto_layout_decision: ?layout.AutoLayoutDecision = null,
+    is_flat_c: bool = false,
 };
 
 pub const CheckedADTVariant = struct {
@@ -314,6 +365,8 @@ pub const CheckedFunction = struct {
     name: []const u8,
     span: ast.Span,
     type_params: []const []const u8 = &.{},
+    hkt_params: []const []const u8 = &.{},
+    constraint_count: usize = 0,
     param_types: []const *const Ty,
     ret_type: *const Ty,
     reads: []const FieldAccessEffect,
@@ -321,10 +374,105 @@ pub const CheckedFunction = struct {
     preserves: []const usize,
     target_record: ?usize,
     has_extern_abi: bool,
+    rust_sym: ?[]const u8 = null,
     perm_trace: []const PermTraceOp,
     disjoint_certs: []const DisjointCertEmit,
     decreases_certs: []const law_verifier.DecreasesCertEmit = &.{},
     returned_origin: ?usize,
+};
+
+pub const CheckedTraitParam = struct {
+    name: []const u8,
+    arity: u8,
+};
+
+pub const ResolvedConstraint = struct {
+    trait_idx: usize,
+    args: []const *const Ty,
+    hkt_arg_names: []const ?[]const u8,
+};
+
+pub const CheckedTraitMethod = struct {
+    name: []const u8,
+    params: []const *const Ty,
+    ret: *const Ty,
+};
+
+pub const CheckedTraitLaw = struct {
+    name: []const u8,
+    span: ast.Span,
+};
+
+pub const CheckedTrait = struct {
+    name: []const u8,
+    local_name: []const u8,
+    params: []const CheckedTraitParam,
+    supers: []const ResolvedConstraint,
+    methods: []const CheckedTraitMethod,
+    laws: []const CheckedTraitLaw,
+};
+
+pub const CheckedInstanceMethod = struct {
+    local_name: []const u8,
+    params: []const *const Ty,
+    ret: *const Ty,
+    type_params: []const []const u8,
+    hkt_params: []const []const u8 = &.{},
+    ast_method: ?ast.InstanceMethod = null,
+    synth: law_verifier.SynthMethodKind = .none,
+    ext_sym: ?[]const u8 = null,
+};
+
+pub const CheckedInstance = struct {
+    name: []const u8,
+    local_name: []const u8,
+    module_id: usize,
+    is_pub: bool,
+    is_default: bool,
+    is_external_rust: bool,
+    rust_target: ?[]const u8,
+    rust_sym: ?[]const u8,
+    trait_idx: usize,
+    target_tys: []const *const Ty,
+    target_hkt_names: []const ?[]const u8,
+    type_params: []const []const u8,
+    hkt_params: []const []const u8 = &.{},
+    constraints: []const ResolvedConstraint,
+    methods: []const CheckedInstanceMethod,
+    span: ast.Span,
+};
+
+pub const ForeignContract = struct {
+    aethel_name: []const u8,
+    rust_target: ?[]const u8 = null,
+    rust_sym: []const u8,
+    trait_name: ?[]const u8 = null,
+    span: ast.Span,
+};
+
+pub const ResolvedWitness = union(enum) {
+    concrete: struct {
+        inst_idx: usize,
+        type_args: []const *const Ty,
+        hkt_args: []const ?[]const u8,
+        sub_witnesses: []const ResolvedWitness,
+    },
+    param: usize,
+};
+
+pub const CallTraitResolution = struct {
+    kind: Kind,
+    witnesses: []const ResolvedWitness,
+    type_args: []const *const Ty,
+    hkt_args: []const ?[]const u8 = &.{},
+
+    pub const Kind = union(enum) {
+        constrained_fn: []const u8,
+        trait_method: struct {
+            method_name: []const u8,
+            witness: ResolvedWitness,
+        },
+    };
 };
 
 pub const LawVerdict = enum {
@@ -347,12 +495,73 @@ pub const CheckedLaw = struct {
     symbolic_certs: []const law_verifier.SymbolicLawCert = &.{},
 };
 
+pub const StdIntrinsicKind = enum {
+    vec_new,
+    vec_with_capacity,
+    vec_len,
+    vec_capacity,
+    vec_is_empty,
+    vec_push,
+    vec_pop,
+    vec_get,
+    vec_set,
+    vec_swap_remove,
+    vec_reserve,
+    vec_clear,
+    vec_as_slice,
+    vec_as_collection,
+    map_new,
+    map_with_capacity,
+    map_len,
+    map_is_empty,
+    map_insert,
+    map_put,
+    map_get,
+    map_contains,
+    map_remove,
+    map_clear,
+    set_new,
+    set_with_capacity,
+    set_len,
+    set_is_empty,
+    set_insert,
+    set_contains,
+    set_remove,
+    set_clear,
+    deque_new,
+    deque_with_capacity,
+    deque_len,
+    deque_is_empty,
+    deque_push_back,
+    deque_push_front,
+    deque_pop_front,
+    deque_pop_back,
+    deque_get,
+    deque_clear,
+    str_len,
+    str_is_empty,
+    str_eq,
+    str_concat,
+    str_starts_with,
+    str_ends_with,
+    str_contains,
+    str_byte_at,
+    str_slice_bytes,
+};
+
+pub const StdIntrinsicCall = struct {
+    kind: StdIntrinsicKind,
+    container_ty: *const Ty,
+    recv_is_ptr: bool = false,
+};
+
 pub const CheckedModule = struct {
     arena: std.heap.ArenaAllocator,
     source: [:0]const u8,
     records: []const CheckedRecord,
     adts: []const CheckedADT,
     collections: []const CheckedCollection,
+    dyn_vecs: []const CheckedCollection = &.{},
     functions: []const CheckedFunction,
     laws: []const CheckedLaw,
     diagnostics: []const SemaDiagnostic,
@@ -365,6 +574,12 @@ pub const CheckedModule = struct {
     resolved_idents: std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = .empty,
     resolved_records: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty,
     alias_types: std.StringHashMapUnmanaged(*const Ty) = .empty,
+    traits: []const CheckedTrait = &.{},
+    instances: []const CheckedInstance = &.{},
+    foreign_contracts: []const ForeignContract = &.{},
+    type_decl_params: std.AutoHashMapUnmanaged(usize, []const []const u8) = .empty,
+    call_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Expr, CallTraitResolution) = .empty,
+    std_intrinsic_calls: std.AutoHashMapUnmanaged(*const ast.Expr, StdIntrinsicCall) = .empty,
 
     pub fn deinit(self: *CheckedModule) void {
         self.arena.deinit();
@@ -430,16 +645,68 @@ const FnSig = struct {
     is_pub: bool = true,
     span: ast.Span,
     type_params: []const []const u8 = &.{},
+    hkt_params: []const []const u8 = &.{},
+    constraints: []const ResolvedConstraint = &.{},
     params: []const *const Ty,
     param_auths: []const ?[]const usize,
     ret: *const Ty,
     target_record: ?usize,
     is_extern: bool,
+    has_body: bool = true,
+    rust_target: ?[]const u8 = null,
+    rust_sym: ?[]const u8 = null,
     decl_index: ?usize,
     param_reads: std.ArrayList(ParamFieldEffect) = .empty,
     param_writes: std.ArrayList(ParamFieldEffect) = .empty,
     call_links: std.ArrayList(CallLink) = .empty,
     returned_origin: ?usize = null,
+};
+
+const TraitMethodDef = struct {
+    name: []const u8,
+    sig: ast.TraitMethodSig,
+    param_names: []const []const u8,
+    params: []const *const Ty,
+    ret: *const Ty,
+    type_params: []const []const u8,
+};
+
+const TraitLawDef = struct {
+    law: ast.TraitLaw,
+    owner_trait_idx: usize,
+};
+
+const TraitDef = struct {
+    name: []const u8,
+    local_name: []const u8,
+    module_id: usize = 0,
+    is_pub: bool = true,
+    span: ast.Span,
+    decl_ast: ast.Decl.Kind,
+    params: []const CheckedTraitParam,
+    supers: []const ResolvedConstraint,
+    methods: []const TraitMethodDef,
+    laws: []const ast.TraitLaw,
+};
+
+const InstanceDef = struct {
+    name: []const u8,
+    local_name: []const u8,
+    module_id: usize = 0,
+    is_pub: bool = true,
+    is_default: bool = false,
+    is_external_rust: bool = false,
+    rust_target: ?[]const u8 = null,
+    rust_sym: ?[]const u8 = null,
+    span: ast.Span,
+    decl_ast: ast.Decl.Kind,
+    trait_idx: usize,
+    target_tys: []const *const Ty,
+    target_hkt_names: []const ?[]const u8,
+    type_params: []const []const u8,
+    hkt_params: []const []const u8,
+    constraints: []const ResolvedConstraint,
+    methods: []const CheckedInstanceMethod,
 };
 
 const ConstEntry = struct {
@@ -566,6 +833,7 @@ const Analyzer = struct {
     active_fork_start: ?usize = null,
 
     checked_collections: std.ArrayList(CheckedCollection),
+    checked_dyn_vecs: std.ArrayList(CheckedCollection) = .empty,
     checked_functions: std.ArrayList(CheckedFunction),
     checked_laws: std.ArrayList(CheckedLaw),
 
@@ -573,6 +841,15 @@ const Analyzer = struct {
     let_types: std.AutoHashMapUnmanaged(usize, *const Ty),
     const_types: std.StringHashMapUnmanaged(*const Ty),
     call_type_args: std.AutoHashMapUnmanaged(*const ast.Expr, []const *const Ty) = .empty,
+    std_intrinsic_calls: std.AutoHashMapUnmanaged(*const ast.Expr, StdIntrinsicCall) = .empty,
+    trait_defs: std.ArrayList(TraitDef) = .empty,
+    instance_defs: std.ArrayList(InstanceDef) = .empty,
+    foreign_contracts: std.ArrayList(ForeignContract) = .empty,
+    type_decl_params: std.AutoHashMapUnmanaged(usize, []const []const u8) = .empty,
+    call_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Expr, CallTraitResolution) = .empty,
+    active_hkt_params: std.ArrayList([]const u8) = .empty,
+    active_constraints: []const ResolvedConstraint = &.{},
+    active_using_stack: std.ArrayList([]const usize) = .empty,
     current_fn_ret: ?*const Ty,
     inferred_return_origin: ?usize = null,
     current_decreases_certs: ?*std.ArrayList(law_verifier.DecreasesCertEmit) = null,
@@ -595,6 +872,11 @@ const Analyzer = struct {
         simd_loop_seen: bool = false,
         hot_fields: []bool = &.{},
         observed_collection_len: ?usize = null,
+        is_flat_c: bool = false,
+        is_packed_attr: bool = false,
+        used_in_dyn_vec: bool = false,
+        type_params: []const []const u8 = &.{},
+        constraints: []const ResolvedConstraint = &.{},
     };
 
     const ADTDef = struct {
@@ -605,6 +887,8 @@ const Analyzer = struct {
         span: ast.Span,
         variants: []VariantInfo,
         max_payload_bits: u16,
+        type_params: []const []const u8 = &.{},
+        constraints: []const ResolvedConstraint = &.{},
     };
 
     const VariantInfo = struct {
@@ -776,6 +1060,46 @@ const Analyzer = struct {
         return null;
     }
 
+    fn findTraitInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?usize {
+        for (self.trait_defs.items, 0..) |t, idx| {
+            if (t.module_id == mod_id and std.mem.eql(u8, t.local_name, local_name)) return idx;
+        }
+        return null;
+    }
+
+    fn findTraitIndex(self: *const Analyzer, name: []const u8) ?usize {
+        for (self.trait_defs.items, 0..) |t, idx| {
+            if (std.mem.eql(u8, t.name, name) or std.mem.eql(u8, t.local_name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findInstanceIndex(self: *const Analyzer, name: []const u8) ?usize {
+        for (self.instance_defs.items, 0..) |inst, idx| {
+            if (std.mem.eql(u8, inst.name, name) or std.mem.eql(u8, inst.local_name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn resolveVisibleTraitIndex(self: *Analyzer, name: []const u8, err_span: ast.Span) ?usize {
+        if (self.findTraitInModule(self.current_module_id, name)) |ti| return ti;
+        if (self.memberImportTarget(self.current_module_id, name)) |target_mod| {
+            if (self.findTraitInModule(target_mod, name)) |ti| {
+                if (!self.trait_defs.items[ti].is_pub and target_mod != self.current_module_id) {
+                    self.addError(.visibility_error, err_span, "cannot access private trait from imported module");
+                }
+                return ti;
+            }
+        }
+        if (self.findTraitIndex(name)) |ti| {
+            if (self.module_slices.len > 0 and self.trait_defs.items[ti].module_id != self.current_module_id and !self.trait_defs.items[ti].is_pub) {
+                self.addError(.visibility_error, err_span, "cannot access private trait");
+            }
+            return ti;
+        }
+        return null;
+    }
+
     fn findOpaqueInModule(self: *const Analyzer, mod_id: usize, local_name: []const u8) ?usize {
         for (self.opaque_defs.items, 0..) |o, idx| {
             if (o.module_id == mod_id and std.mem.eql(u8, o.local_name, local_name)) return idx;
@@ -925,15 +1249,21 @@ const Analyzer = struct {
                         .record => |fields| {
                             var col_lay: ?layout.CollectionLayout = null;
                             var auto_req = false;
+                            var is_flat = false;
+                            var is_packed = false;
                             for (decl.attrs) |attr| {
                                 if (attr.payload == .layout) {
-                                    if (attr.payload.layout == .auto) {
-                                        auto_req = true;
-                                    } else {
-                                        col_lay = try self.resolveLayoutAttr(attr.span, attr.payload.layout);
+                                    switch (attr.payload.layout) {
+                                        .auto => auto_req = true,
+                                        .flat => is_flat = true,
+                                        .@"packed" => is_packed = true,
+                                        else => col_lay = try self.resolveLayoutAttr(attr.span, attr.payload.layout),
                                     }
                                 }
                             }
+                            var tps = try self.alloc.alloc([]const u8, td.type_params.len);
+                            for (td.type_params, 0..) |tp, ti| tps[ti] = tp.slice(self.source);
+                            if (tps.len > 0) try self.type_decl_params.put(self.alloc, self.record_defs.items.len, tps);
                             const fslice = try self.alloc.alloc(CheckedField, fields.len);
                             const hslice = try self.alloc.alloc(bool, fields.len);
                             @memset(hslice, false);
@@ -949,9 +1279,14 @@ const Analyzer = struct {
                                 .decl_ast = decl.kind,
                                 .auto_layout_requested = auto_req,
                                 .hot_fields = hslice,
+                                .is_flat_c = is_flat,
+                                .is_packed_attr = is_packed,
+                                .type_params = tps,
                             });
                         },
                         .variants => |variants| {
+                            var tps = try self.alloc.alloc([]const u8, td.type_params.len);
+                            for (td.type_params, 0..) |tp, ti| tps[ti] = tp.slice(self.source);
                             const vslice = try self.alloc.alloc(VariantInfo, variants.len);
                             try self.adt_defs.append(self.alloc, .{
                                 .name = cname,
@@ -961,9 +1296,35 @@ const Analyzer = struct {
                                 .span = decl.span,
                                 .variants = vslice,
                                 .max_payload_bits = 0,
+                                .type_params = tps,
                             });
                         },
                     }
+                },
+                .trait_decl => |tr| {
+                    const local_name = tr.name.slice(self.source);
+                    if (self.findTraitInModule(mod_id, local_name) != null) {
+                        self.addError(.duplicate_decl, tr.name, "duplicate trait declaration");
+                        continue;
+                    }
+                    const cname = try self.canonicalName(mod_id, local_name, false);
+                    try self.decl_canonical_names.put(self.alloc, decl.span.start, cname);
+                    var tparams = try self.alloc.alloc(CheckedTraitParam, tr.params.len);
+                    for (tr.params, 0..) |tp, ti| {
+                        tparams[ti] = .{ .name = tp.name.slice(self.source), .arity = tp.arity };
+                    }
+                    try self.trait_defs.append(self.alloc, .{
+                        .name = cname,
+                        .local_name = local_name,
+                        .module_id = mod_id,
+                        .is_pub = decl.is_pub,
+                        .span = decl.span,
+                        .decl_ast = decl.kind,
+                        .params = tparams,
+                        .supers = &.{},
+                        .methods = &.{},
+                        .laws = tr.laws,
+                    });
                 },
                 else => {},
             }
@@ -974,7 +1335,7 @@ const Analyzer = struct {
         return switch (spec) {
             .aos => .aos,
             .soa => .soa,
-            .auto, .@"packed" => null,
+            .auto, .@"packed", .flat => null,
             .aosoa => |tile_expr| blk: {
                 var width: usize = 8;
                 if (tile_expr) |te| {
@@ -1009,12 +1370,25 @@ const Analyzer = struct {
             },
             .slice => |sl| try self.collectTypeVars(sl.elem, list),
             .collection => |c| try self.collectTypeVars(c.elem_ty, list),
+            .vec => |v| try self.collectTypeVars(v.elem_ty, list),
+            .map => |m| {
+                try self.collectTypeVars(m.key_ty, list);
+                try self.collectTypeVars(m.val_ty, list);
+            },
+            .set => |s| try self.collectTypeVars(s.elem_ty, list),
+            .deque => |d| try self.collectTypeVars(d.elem_ty, list),
             .view => |v| try self.collectTypeVars(v.target, list),
             .path_borrow => |pb| try self.collectTypeVars(pb.base, list),
             .tuple => |elems| for (elems) |el| try self.collectTypeVars(el, list),
             .fn_ty => |ft| {
                 for (ft.params) |pt| try self.collectTypeVars(pt, list);
                 try self.collectTypeVars(ft.ret, list);
+            },
+            .applied => |ap| {
+                for (ap.args) |el| try self.collectTypeVars(el, list);
+            },
+            .hkt_app => |ha| {
+                try self.collectTypeVars(ha.arg, list);
             },
             else => {},
         }
@@ -1027,6 +1401,10 @@ const Analyzer = struct {
             .result => |res| containsUnresolvedTypeVar(res.ok, subst) or containsUnresolvedTypeVar(res.err, subst),
             .slice => |sl| containsUnresolvedTypeVar(sl.elem, subst),
             .collection => |c| containsUnresolvedTypeVar(c.elem_ty, subst),
+            .vec => |v| containsUnresolvedTypeVar(v.elem_ty, subst),
+            .map => |m| containsUnresolvedTypeVar(m.key_ty, subst) or containsUnresolvedTypeVar(m.val_ty, subst),
+            .set => |s| containsUnresolvedTypeVar(s.elem_ty, subst),
+            .deque => |d| containsUnresolvedTypeVar(d.elem_ty, subst),
             .view => |v| containsUnresolvedTypeVar(v.target, subst),
             .path_borrow => |pb| containsUnresolvedTypeVar(pb.base, subst),
             .tuple => |elems| blk: {
@@ -1037,6 +1415,11 @@ const Analyzer = struct {
                 for (ft.params) |pt| if (containsUnresolvedTypeVar(pt, subst)) break :blk true;
                 break :blk containsUnresolvedTypeVar(ft.ret, subst);
             },
+            .applied => |ap| blk: {
+                for (ap.args) |el| if (containsUnresolvedTypeVar(el, subst)) break :blk true;
+                break :blk false;
+            },
+            .hkt_app => |ha| containsUnresolvedTypeVar(ha.arg, subst),
             else => false,
         };
     }
@@ -1076,8 +1459,30 @@ const Analyzer = struct {
                 return try self.unifyType(fs.elem, actual.slice.elem, subst);
             },
             .collection => |fc| {
-                if (actual.* != .collection) return false;
-                return try self.unifyType(fc.elem_ty, actual.collection.elem_ty, subst);
+                if (actual.* == .collection) {
+                    return try self.unifyType(fc.elem_ty, actual.collection.elem_ty, subst);
+                }
+                if (actual.* == .vec) {
+                    return try self.unifyType(fc.elem_ty, actual.vec.elem_ty, subst);
+                }
+                return false;
+            },
+            .vec => |fv| {
+                if (actual.* != .vec) return false;
+                return try self.unifyType(fv.elem_ty, actual.vec.elem_ty, subst);
+            },
+            .map => |fm| {
+                if (actual.* != .map) return false;
+                return (try self.unifyType(fm.key_ty, actual.map.key_ty, subst)) and
+                    (try self.unifyType(fm.val_ty, actual.map.val_ty, subst));
+            },
+            .set => |fs| {
+                if (actual.* != .set) return false;
+                return try self.unifyType(fs.elem_ty, actual.set.elem_ty, subst);
+            },
+            .deque => |fd| {
+                if (actual.* != .deque) return false;
+                return try self.unifyType(fd.elem_ty, actual.deque.elem_ty, subst);
             },
             .view => |fv| {
                 if (actual.* == .view) {
@@ -1110,6 +1515,53 @@ const Analyzer = struct {
                 }
                 return try self.unifyType(ff.ret, actual.fn_ty.ret, subst);
             },
+            .applied => |fa| {
+                if (actual.* != .applied or fa.kind != actual.applied.kind or fa.decl_idx != actual.applied.decl_idx or fa.args.len != actual.applied.args.len) return false;
+                for (fa.args, actual.applied.args) |fe, ae| {
+                    if (!try self.unifyType(fe, ae, subst)) return false;
+                }
+                return true;
+            },
+            .hkt_app => |fha| {
+                const hkt_key = try std.fmt.allocPrint(self.alloc, "__hkt__{s}", .{fha.ctor});
+                switch (actual.*) {
+                    .option => |ai| {
+                        if (subst.get(hkt_key)) |prev| {
+                            if (prev.* != .option) return false;
+                        } else {
+                            try subst.put(self.alloc, hkt_key, try self.allocTy(.{ .option = try self.allocTy(.err) }));
+                        }
+                        if (ai.* == .err) return true;
+                        return try self.unifyType(fha.arg, ai, subst);
+                    },
+                    .applied => |ap| {
+                        if (ap.args.len != 1) return false;
+                        if (subst.get(hkt_key)) |prev| {
+                            if (prev.* != .applied or prev.applied.kind != ap.kind or prev.applied.decl_idx != ap.decl_idx) return false;
+                        } else {
+                            try subst.put(self.alloc, hkt_key, try self.allocTy(.{ .applied = .{
+                                .kind = ap.kind,
+                                .decl_idx = ap.decl_idx,
+                                .args = &.{},
+                                .brand_inst = ap.brand_inst,
+                            } }));
+                        }
+                        return try self.unifyType(fha.arg, ap.args[0], subst);
+                    },
+                    .hkt_app => |aha| {
+                        if (subst.get(hkt_key)) |prev| {
+                            if (prev.* != .hkt_app or !std.mem.eql(u8, prev.hkt_app.ctor, aha.ctor)) return false;
+                        } else {
+                            try subst.put(self.alloc, hkt_key, try self.allocTy(.{ .hkt_app = .{
+                                .ctor = aha.ctor,
+                                .arg = try self.allocTy(.err),
+                            } }));
+                        }
+                        return try self.unifyType(fha.arg, aha.arg, subst);
+                    },
+                    else => return false,
+                }
+            },
             else => return formal.eql(actual.*),
         }
     }
@@ -1141,6 +1593,29 @@ const Analyzer = struct {
                     .elem_record = recordOfType(sub),
                     .elem_ty = sub,
                 } });
+            },
+            .vec => |v| {
+                const sub = try self.substituteType(v.elem_ty, subst);
+                return if (sub == v.elem_ty) ty else try self.allocTy(.{ .vec = .{
+                    .elem_record = recordOfType(sub),
+                    .elem_ty = sub,
+                } });
+            },
+            .map => |m| {
+                const sk = try self.substituteType(m.key_ty, subst);
+                const sv = try self.substituteType(m.val_ty, subst);
+                return if (sk == m.key_ty and sv == m.val_ty) ty else try self.allocTy(.{ .map = .{
+                    .key_ty = sk,
+                    .val_ty = sv,
+                } });
+            },
+            .set => |s| {
+                const sub = try self.substituteType(s.elem_ty, subst);
+                return if (sub == s.elem_ty) ty else try self.allocTy(.{ .set = .{ .elem_ty = sub } });
+            },
+            .deque => |d| {
+                const sub = try self.substituteType(d.elem_ty, subst);
+                return if (sub == d.elem_ty) ty else try self.allocTy(.{ .deque = .{ .elem_ty = sub } });
             },
             .view => |v| {
                 const sub = try self.substituteType(v.target, subst);
@@ -1178,12 +1653,679 @@ const Analyzer = struct {
                 if (sret != ft.ret) changed = true;
                 return if (!changed) ty else try self.allocTy(.{ .fn_ty = .{ .params = ps, .ret = sret, .is_once = ft.is_once } });
             },
+            .applied => |ap| {
+                const out = try self.alloc.alloc(*const Ty, ap.args.len);
+                var changed = false;
+                for (ap.args, 0..) |el, i| {
+                    out[i] = try self.substituteType(el, subst);
+                    if (out[i] != el) changed = true;
+                }
+                return if (!changed) ty else try self.allocTy(.{ .applied = .{
+                    .kind = ap.kind,
+                    .decl_idx = ap.decl_idx,
+                    .args = out,
+                    .brand_inst = ap.brand_inst,
+                } });
+            },
+            .hkt_app => |ha| {
+                const sarg = try self.substituteType(ha.arg, subst);
+                const hkt_key = std.fmt.allocPrint(self.alloc, "__hkt__{s}", .{ha.ctor}) catch return ty;
+                if (subst.get(hkt_key)) |ctor_ty| {
+                    switch (ctor_ty.*) {
+                        .option => return try self.allocTy(.{ .option = sarg }),
+                        .applied => |ap| return try self.allocTy(.{ .applied = .{
+                            .kind = ap.kind,
+                            .decl_idx = ap.decl_idx,
+                            .args = try self.alloc.dupe(*const Ty, &.{sarg}),
+                            .brand_inst = ap.brand_inst,
+                        } }),
+                        .hkt_app => |nha| return try self.allocTy(.{ .hkt_app = .{ .ctor = nha.ctor, .arg = sarg } }),
+                        else => {},
+                    }
+                }
+                return if (sarg == ha.arg) ty else try self.allocTy(.{ .hkt_app = .{ .ctor = ha.ctor, .arg = sarg } });
+            },
             else => return ty,
         }
     }
 
+    const ExternalRustSpec = struct {
+        target: ?[]const u8 = null,
+        sym: []const u8,
+        span: ast.Span,
+    };
+
+    fn stripStringQuotes(s: []const u8) []const u8 {
+        if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
+            return s[1 .. s.len - 1];
+        }
+        return s;
+    }
+
+    fn parseExternalRustAttr(self: *Analyzer, attrs: []const ast.Attribute, fallback_name: []const u8) ?ExternalRustSpec {
+        for (attrs) |attr| {
+            const aname = attr.name.slice(self.source);
+            if (!std.mem.eql(u8, aname, "external")) continue;
+            if (attr.payload != .args or attr.payload.args.len == 0) {
+                self.addError(.invalid_ffi_type, attr.span, "@external requires target language, e.g. @external(rust, \"symbol\")");
+                return null;
+            }
+            const lang_expr = attr.payload.args[0];
+            const lang = switch (lang_expr.*) {
+                .ident => |sp| sp.slice(self.source),
+                .string_lit => |sp| stripStringQuotes(sp.slice(self.source)),
+                else => "",
+            };
+            if (!std.mem.eql(u8, lang, "rust")) {
+                self.addError(.invalid_ffi_type, attr.span, "unsupported @external target (strictly Rust -> Aethel interop via @external(rust, ...))");
+                return null;
+            }
+            if (attr.payload.args.len == 1) {
+                return .{ .target = null, .sym = fallback_name, .span = attr.span };
+            }
+            if (attr.payload.args.len == 2) {
+                const sym = switch (attr.payload.args[1].*) {
+                    .string_lit => |sp| stripStringQuotes(sp.slice(self.source)),
+                    .ident => |sp| sp.slice(self.source),
+                    else => fallback_name,
+                };
+                return .{ .target = null, .sym = sym, .span = attr.span };
+            }
+            const tgt = switch (attr.payload.args[1].*) {
+                .string_lit => |sp| stripStringQuotes(sp.slice(self.source)),
+                .ident, .upper_ident => |sp| sp.slice(self.source),
+                else => "",
+            };
+            const sym = switch (attr.payload.args[2].*) {
+                .string_lit => |sp| stripStringQuotes(sp.slice(self.source)),
+                .ident => |sp| sp.slice(self.source),
+                else => fallback_name,
+            };
+            return .{ .target = tgt, .sym = sym, .span = attr.span };
+        }
+        return null;
+    }
+
+    fn resolveTypeWithHKT(self: *Analyzer, ty_ast: *const ast.TypeExpr) std.mem.Allocator.Error!*const Ty {
+        return try self.resolveType(ty_ast);
+    }
+
+    fn hktArgNameFromTypeExpr(self: *Analyzer, ty_ast: *const ast.TypeExpr) ?[]const u8 {
+        return switch (ty_ast.*) {
+            .named => |n| if (n.path.len > 0) blk: {
+                const head = n.path[n.path.len - 1].slice(self.source);
+                if (std.mem.eql(u8, head, "Option")) break :blk "Option";
+                if (self.findRecordInModule(self.current_module_id, head)) |ri| break :blk self.record_defs.items[ri].name;
+                if (self.findADTInModule(self.current_module_id, head)) |ai| break :blk self.adt_defs.items[ai].name;
+                if (self.findRecordIndex(head)) |ri| break :blk self.record_defs.items[ri].name;
+                if (self.findADTIndex(head)) |ai| break :blk self.adt_defs.items[ai].name;
+                break :blk head;
+            } else null,
+            .type_var => |tv| tv.name.slice(self.source),
+            else => null,
+        };
+    }
+
+    fn resolveTraitConstraint(self: *Analyzer, tc: ast.TraitConstraint) std.mem.Allocator.Error!?ResolvedConstraint {
+        if (tc.path.len == 0) return null;
+        const tname = tc.path[tc.path.len - 1].slice(self.source);
+        const ti = self.resolveVisibleTraitIndex(tname, tc.span) orelse {
+            self.addError(.unknown_type, tc.span, "unknown trait in constraint");
+            return null;
+        };
+        const tr = self.trait_defs.items[ti];
+        const args = try self.alloc.alloc(*const Ty, tc.args.len);
+        const hkts = try self.alloc.alloc(?[]const u8, tc.args.len);
+        for (tc.args, 0..) |a, ai| {
+            const is_hkt = ai < tr.params.len and tr.params[ai].arity >= 1;
+            if (is_hkt) {
+                const hname = self.hktArgNameFromTypeExpr(a);
+                hkts[ai] = hname;
+                args[ai] = try self.allocTy(.{ .type_var = hname orelse "_" });
+            } else {
+                hkts[ai] = null;
+                args[ai] = try self.resolveType(a);
+            }
+        }
+        return .{ .trait_idx = ti, .args = args, .hkt_arg_names = hkts };
+    }
+
+    fn traitHasSuper(self: *const Analyzer, sub_idx: usize, target_idx: usize) bool {
+        if (sub_idx == target_idx) return true;
+        if (sub_idx >= self.trait_defs.items.len) return false;
+        for (self.trait_defs.items[sub_idx].supers) |sup| {
+            if (self.traitHasSuper(sup.trait_idx, target_idx)) return true;
+        }
+        return false;
+    }
+
+    const RequiredTraitMethod = struct {
+        owner_trait_idx: usize,
+        def: TraitMethodDef,
+    };
+
+    fn collectTraitAndSuperMethods(
+        self: *const Analyzer,
+        trait_idx: usize,
+        out: *std.ArrayList(RequiredTraitMethod),
+    ) std.mem.Allocator.Error!void {
+        if (trait_idx >= self.trait_defs.items.len) return;
+        const tr = self.trait_defs.items[trait_idx];
+        for (tr.supers) |sup| {
+            try self.collectTraitAndSuperMethods(sup.trait_idx, out);
+        }
+        for (tr.methods) |m| {
+            var exists = false;
+            for (out.items) |prev| {
+                if (std.mem.eql(u8, prev.def.name, m.name)) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) try out.append(self.alloc, .{ .owner_trait_idx = trait_idx, .def = m });
+        }
+    }
+
+    fn collectTraitAndSuperLaws(
+        self: *const Analyzer,
+        trait_idx: usize,
+        out: *std.ArrayList(TraitLawDef),
+    ) std.mem.Allocator.Error!void {
+        if (trait_idx >= self.trait_defs.items.len) return;
+        const tr = self.trait_defs.items[trait_idx];
+        for (tr.supers) |sup| {
+            try self.collectTraitAndSuperLaws(sup.trait_idx, out);
+        }
+        for (tr.laws) |lw| {
+            try out.append(self.alloc, .{ .law = lw, .owner_trait_idx = trait_idx });
+        }
+    }
+
+    fn buildTraitSubstMap(
+        self: *Analyzer,
+        trait_idx: usize,
+        target_tys: []const *const Ty,
+        target_hkts: []const ?[]const u8,
+    ) std.mem.Allocator.Error!std.StringHashMapUnmanaged(*const Ty) {
+        var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+        if (trait_idx >= self.trait_defs.items.len) return subst;
+        const tr = self.trait_defs.items[trait_idx];
+        for (tr.params, 0..) |tp, pi| {
+            if (tp.arity == 0) {
+                if (pi < target_tys.len) {
+                    try subst.put(self.alloc, tp.name, target_tys[pi]);
+                }
+            } else {
+                const hn = if (pi < target_hkts.len) target_hkts[pi] else null;
+                if (hn) |cname| {
+                    const hkey = try std.fmt.allocPrint(self.alloc, "__hkt__{s}", .{tp.name});
+                    if (std.mem.eql(u8, cname, "Option")) {
+                        try subst.put(self.alloc, hkey, try self.allocTy(.{ .option = try self.allocTy(.err) }));
+                    } else if (self.findRecordIndex(cname)) |ri| {
+                        try subst.put(self.alloc, hkey, try self.allocTy(.{ .applied = .{ .kind = .record, .decl_idx = ri, .args = &.{} } }));
+                    } else if (self.findADTIndex(cname)) |ai| {
+                        try subst.put(self.alloc, hkey, try self.allocTy(.{ .applied = .{ .kind = .adt, .decl_idx = ai, .args = &.{} } }));
+                    } else {
+                        try subst.put(self.alloc, hkey, try self.allocTy(.{ .hkt_app = .{ .ctor = cname, .arg = try self.allocTy(.err) } }));
+                    }
+                }
+            }
+        }
+        return subst;
+    }
+
+    fn instanceTargetsOverlap(self: *Analyzer, prev: InstanceDef, target_tys: []const *const Ty, target_hkts: []const ?[]const u8) bool {
+        if (prev.target_tys.len != target_tys.len) return false;
+        var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+        for (prev.target_tys, target_tys, 0..) |pt, nt, i| {
+            const ph = if (i < prev.target_hkt_names.len) prev.target_hkt_names[i] else null;
+            const nh = if (i < target_hkts.len) target_hkts[i] else null;
+            if (ph != null or nh != null) {
+                if (ph == null or nh == null) return false;
+                if (!std.mem.eql(u8, ph.?, nh.?)) return false;
+            } else {
+                if (!(self.unifyType(pt, nt, &subst) catch false)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn registerInstanceDecl(
+        self: *Analyzer,
+        decl: ast.Decl,
+        decl_idx: usize,
+        inst: anytype,
+    ) std.mem.Allocator.Error!void {
+        _ = decl_idx;
+        var inst_cs: std.ArrayList(ResolvedConstraint) = .empty;
+        const hkt_mark = self.active_hkt_params.items.len;
+        defer self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+        var inst_hkts: std.ArrayList([]const u8) = .empty;
+
+        for (inst.constraints) |tc| {
+            if (try self.resolveTraitConstraint(tc)) |rc| {
+                try inst_cs.append(self.alloc, rc);
+                const tr = self.trait_defs.items[rc.trait_idx];
+                for (rc.hkt_arg_names, 0..) |hn_opt, hi| {
+                    if (hi < tr.params.len and tr.params[hi].arity >= 1) {
+                        if (hn_opt) |hn| {
+                            var is_concrete = std.mem.eql(u8, hn, "Option") or std.mem.eql(u8, hn, "Result");
+                            if (!is_concrete and hn.len > 0 and hn[0] >= 'A' and hn[0] <= 'Z') is_concrete = true;
+                            if (!is_concrete) {
+                                try inst_hkts.append(self.alloc, hn);
+                                try self.active_hkt_params.append(self.alloc, hn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const tref = (try self.resolveTraitConstraint(inst.trait_ref)) orelse return;
+        const tr = self.trait_defs.items[tref.trait_idx];
+        const raw_local = if (inst.name) |nm|
+            nm.slice(self.source)
+        else
+            try std.fmt.allocPrint(self.alloc, "__default_{s}_{d}", .{ tr.local_name, self.instance_defs.items.len });
+        const cname = try self.canonicalName(self.current_module_id, raw_local, false);
+        try self.decl_canonical_names.put(self.alloc, decl.span.start, cname);
+        if (self.findInstanceIndex(cname) != null) {
+            self.addError(.duplicate_decl, decl.span, "duplicate instance declaration name");
+            return;
+        }
+
+        if (inst.is_default) {
+            for (self.instance_defs.items) |prev| {
+                if (prev.is_default and prev.trait_idx == tref.trait_idx and self.instanceTargetsOverlap(prev, tref.args, tref.hkt_arg_names)) {
+                    self.addError(.duplicate_decl, decl.span, "ambiguous default instances for trait; only one default instance is permitted per type");
+                    break;
+                }
+            }
+        }
+
+        const ext_spec = self.parseExternalRustAttr(decl.attrs, raw_local);
+        if (ext_spec) |es| {
+            try self.foreign_contracts.append(self.alloc, .{
+                .aethel_name = cname,
+                .rust_target = es.target orelse tref.hkt_arg_names[0],
+                .rust_sym = es.sym,
+                .trait_name = tr.name,
+                .span = es.span,
+            });
+        }
+
+        var tparams: std.ArrayList([]const u8) = .empty;
+        for (tref.args, 0..) |ta, ti| {
+            if (ti < tr.params.len and tr.params[ti].arity == 0) {
+                try self.collectTypeVars(ta, &tparams);
+            }
+        }
+        for (inst_cs.items) |rc| {
+            const ctr = self.trait_defs.items[rc.trait_idx];
+            for (rc.args, 0..) |ca, ci| {
+                if (ci < ctr.params.len and ctr.params[ci].arity == 0) {
+                    try self.collectTypeVars(ca, &tparams);
+                }
+            }
+        }
+
+        var trait_subst = try self.buildTraitSubstMap(tref.trait_idx, tref.args, tref.hkt_arg_names);
+        var req_methods: std.ArrayList(RequiredTraitMethod) = .empty;
+        try self.collectTraitAndSuperMethods(tref.trait_idx, &req_methods);
+
+        var has_pure = false;
+        var has_bind = false;
+        for (inst.methods) |im| {
+            const mname = im.name.slice(self.source);
+            if (std.mem.eql(u8, mname, "pure")) has_pure = true;
+            if (std.mem.eql(u8, mname, "bind")) has_bind = true;
+        }
+
+        var checked_methods: std.ArrayList(CheckedInstanceMethod) = .empty;
+        for (req_methods.items) |req| {
+            var matched_ast: ?ast.InstanceMethod = null;
+            for (inst.methods) |im| {
+                if (std.mem.eql(u8, im.name.slice(self.source), req.def.name)) {
+                    matched_ast = im;
+                    break;
+                }
+            }
+
+            const ptypes = try self.alloc.alloc(*const Ty, req.def.params.len);
+            for (req.def.params, 0..) |rp, pi| {
+                ptypes[pi] = try self.substituteType(rp, &trait_subst);
+            }
+            const rty = try self.substituteType(req.def.ret, &trait_subst);
+
+            if (matched_ast) |im| {
+                const esym: ?[]const u8 = if (ext_spec != null)
+                    try std.fmt.allocPrint(self.alloc, "__aethel_ext_{s}_{s}", .{ cname, req.def.name })
+                else
+                    null;
+                if (ext_spec != null) {
+                    for (ptypes, im.params) |pt, ip| self.validateRustFFIType(ip.span, pt);
+                    self.validateRustFFIType(im.span, rty);
+                }
+                try checked_methods.append(self.alloc, .{
+                    .local_name = req.def.name,
+                    .params = ptypes,
+                    .ret = rty,
+                    .type_params = req.def.type_params,
+                    .ast_method = im,
+                    .synth = .none,
+                    .ext_sym = esym,
+                });
+            } else if (ext_spec != null) {
+                const esym = try std.fmt.allocPrint(self.alloc, "__aethel_ext_{s}_{s}", .{ cname, req.def.name });
+                for (ptypes) |pt| self.validateRustFFIType(decl.span, pt);
+                self.validateRustFFIType(decl.span, rty);
+                try checked_methods.append(self.alloc, .{
+                    .local_name = req.def.name,
+                    .params = ptypes,
+                    .ret = rty,
+                    .type_params = req.def.type_params,
+                    .ast_method = null,
+                    .synth = .none,
+                    .ext_sym = esym,
+                });
+            } else if (has_pure and has_bind and (std.mem.eql(u8, req.def.name, "fmap") or std.mem.eql(u8, req.def.name, "map"))) {
+                try checked_methods.append(self.alloc, .{
+                    .local_name = req.def.name,
+                    .params = ptypes,
+                    .ret = rty,
+                    .type_params = req.def.type_params,
+                    .ast_method = null,
+                    .synth = .monad_map,
+                });
+            } else if (has_pure and has_bind and std.mem.eql(u8, req.def.name, "ap")) {
+                try checked_methods.append(self.alloc, .{
+                    .local_name = req.def.name,
+                    .params = ptypes,
+                    .ret = rty,
+                    .type_params = req.def.type_params,
+                    .ast_method = null,
+                    .synth = .monad_ap,
+                });
+            } else {
+                // Delegate supertrait method from a unique default instance of owner_trait_idx if present.
+                var found_super: ?CheckedInstanceMethod = null;
+                for (self.instance_defs.items) |prev| {
+                    if (prev.is_default and prev.trait_idx == req.owner_trait_idx and self.instanceTargetsOverlap(prev, tref.args, tref.hkt_arg_names)) {
+                        for (prev.methods) |pm| {
+                            if (std.mem.eql(u8, pm.local_name, req.def.name)) {
+                                found_super = pm;
+                                break;
+                            }
+                        }
+                    }
+                    if (found_super != null) break;
+                }
+                if (found_super) |sm| {
+                    try checked_methods.append(self.alloc, sm);
+                } else {
+                    const msg = try std.fmt.allocPrint(self.alloc, "instance '{s}' is missing required method '{s}'", .{ raw_local, req.def.name });
+                    self.addError(.type_mismatch, decl.span, msg);
+                }
+            }
+        }
+
+        try self.instance_defs.append(self.alloc, .{
+            .name = cname,
+            .local_name = raw_local,
+            .module_id = self.current_module_id,
+            .is_pub = decl.is_pub,
+            .is_default = inst.is_default,
+            .is_external_rust = ext_spec != null,
+            .rust_target = if (ext_spec) |es| (es.target orelse tref.hkt_arg_names[0]) else null,
+            .rust_sym = if (ext_spec) |es| es.sym else null,
+            .span = decl.span,
+            .decl_ast = decl.kind,
+            .trait_idx = tref.trait_idx,
+            .target_tys = tref.args,
+            .target_hkt_names = tref.hkt_arg_names,
+            .type_params = try tparams.toOwnedSlice(self.alloc),
+            .hkt_params = try inst_hkts.toOwnedSlice(self.alloc),
+            .constraints = try inst_cs.toOwnedSlice(self.alloc),
+            .methods = try checked_methods.toOwnedSlice(self.alloc),
+        });
+    }
+
+    fn instanceMatchesRequirement(
+        self: *Analyzer,
+        inst_idx: usize,
+        req_trait_idx: usize,
+        target_tys: []const *const Ty,
+        target_hkts: []const ?[]const u8,
+        out_subst: *std.StringHashMapUnmanaged(*const Ty),
+    ) bool {
+        const inst = self.instance_defs.items[inst_idx];
+        if (!self.traitHasSuper(inst.trait_idx, req_trait_idx)) return false;
+        if (inst.target_tys.len != target_tys.len) return false;
+        for (inst.target_tys, target_tys, 0..) |pat, actual, i| {
+            const ih = if (i < inst.target_hkt_names.len) inst.target_hkt_names[i] else null;
+            const th = if (i < target_hkts.len) target_hkts[i] else null;
+            if (ih != null or th != null) {
+                if (ih == null or th == null) return false;
+                if (!std.mem.eql(u8, ih.?, th.?)) return false;
+            } else {
+                if (!(self.unifyType(pat, actual, out_subst) catch false)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn instantiateConstraintWitness(
+        self: *Analyzer,
+        inst_idx: usize,
+        subst: *const std.StringHashMapUnmanaged(*const Ty),
+        span: ast.Span,
+        emit_error: bool,
+    ) ?ResolvedWitness {
+        const inst = self.instance_defs.items[inst_idx];
+        var targs = self.alloc.alloc(*const Ty, inst.type_params.len) catch return null;
+        for (inst.type_params, 0..) |tp, ti| {
+            targs[ti] = subst.get(tp) orelse (self.allocTy(.{ .type_var = tp }) catch return null);
+        }
+        var subs = self.alloc.alloc(ResolvedWitness, inst.constraints.len) catch return null;
+        for (inst.constraints, 0..) |c, ci| {
+            var sargs = self.alloc.alloc(*const Ty, c.args.len) catch return null;
+            for (c.args, 0..) |a, ai| {
+                sargs[ai] = self.substituteType(a, subst) catch a;
+            }
+            subs[ci] = self.resolveTraitWitness(c.trait_idx, sargs, c.hkt_arg_names, span, emit_error) orelse return null;
+        }
+        return .{ .concrete = .{
+            .inst_idx = inst_idx,
+            .type_args = targs,
+            .hkt_args = inst.target_hkt_names,
+            .sub_witnesses = subs,
+        } };
+    }
+
+    fn resolveTraitWitness(
+        self: *Analyzer,
+        trait_idx: usize,
+        target_tys: []const *const Ty,
+        target_hkts: []const ?[]const u8,
+        span: ast.Span,
+        emit_error: bool,
+    ) ?ResolvedWitness {
+        // 1. Explicit `using` overrides in lexical stack (supports direct + supertrait forgetful functor).
+        var ui = self.active_using_stack.items.len;
+        while (ui > 0) {
+            ui -= 1;
+            for (self.active_using_stack.items[ui]) |u_inst_idx| {
+                var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+                if (self.instanceMatchesRequirement(u_inst_idx, trait_idx, target_tys, target_hkts, &subst)) {
+                    return self.instantiateConstraintWitness(u_inst_idx, &subst, span, emit_error);
+                }
+            }
+        }
+
+        // 2. Active `with` dictionary parameters in the current generic fn/instance.
+        for (self.active_constraints, 0..) |ac, pi| {
+            if (!self.traitHasSuper(ac.trait_idx, trait_idx)) continue;
+            if (ac.args.len != target_tys.len) continue;
+            var all_match = true;
+            for (ac.args, target_tys, 0..) |aa, ta, ai| {
+                const ah = if (ai < ac.hkt_arg_names.len) ac.hkt_arg_names[ai] else null;
+                const th = if (ai < target_hkts.len) target_hkts[ai] else null;
+                if (ah != null or th != null) {
+                    if (ah == null or th == null or !std.mem.eql(u8, ah.?, th.?)) {
+                        all_match = false;
+                        break;
+                    }
+                } else if (!aa.eql(ta.*)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) return .{ .param = pi };
+        }
+
+        // 3. Open-universe visible `default instance` (exact trait first, then forgetful subtraits `<=`).
+        const MatchItem = struct { idx: usize, subst: std.StringHashMapUnmanaged(*const Ty) };
+        var matches: std.ArrayList(MatchItem) = .empty;
+        for (self.instance_defs.items, 0..) |inst, idx| {
+            if (!inst.is_default or inst.trait_idx != trait_idx) continue;
+            var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+            if (self.instanceMatchesRequirement(idx, trait_idx, target_tys, target_hkts, &subst)) {
+                matches.append(self.alloc, .{ .idx = idx, .subst = subst }) catch {};
+            }
+        }
+        if (matches.items.len == 0) {
+            for (self.instance_defs.items, 0..) |inst, idx| {
+                if (!inst.is_default or inst.trait_idx == trait_idx) continue;
+                var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+                if (self.instanceMatchesRequirement(idx, trait_idx, target_tys, target_hkts, &subst)) {
+                    matches.append(self.alloc, .{ .idx = idx, .subst = subst }) catch {};
+                }
+            }
+        }
+        if (matches.items.len == 1) {
+            return self.instantiateConstraintWitness(matches.items[0].idx, &matches.items[0].subst, span, emit_error);
+        }
+        if (matches.items.len > 1) {
+            if (emit_error) self.addError(.borrow_conflict, span, "ambiguous default instances satisfy trait constraint; use 'using' to select one");
+            return null;
+        }
+        if (emit_error) self.addError(.type_mismatch, span, "no matching default instance found for trait constraint");
+        return null;
+    }
+
+    fn checkTraitLawsWellTyped(self: *Analyzer, span: ast.Span, tr: anytype) std.mem.Allocator.Error!void {
+        _ = span;
+        const tidx = self.findTraitInModule(self.current_module_id, tr.name.slice(self.source)) orelse return;
+        const tdef = self.trait_defs.items[tidx];
+        const prev_constraints = self.active_constraints;
+        const hkt_mark = self.active_hkt_params.items.len;
+        for (tdef.params) |tp| {
+            if (tp.arity >= 1) try self.active_hkt_params.append(self.alloc, tp.name);
+        }
+        var cs_buf: [1]ResolvedConstraint = undefined;
+        const p_args = try self.alloc.alloc(*const Ty, tdef.params.len);
+        const p_hkts = try self.alloc.alloc(?[]const u8, tdef.params.len);
+        for (tdef.params, 0..) |tp, pi| {
+            p_args[pi] = try self.allocTy(.{ .type_var = tp.name });
+            p_hkts[pi] = if (tp.arity >= 1) tp.name else null;
+        }
+        cs_buf[0] = .{ .trait_idx = tidx, .args = p_args, .hkt_arg_names = p_hkts };
+        self.active_constraints = &cs_buf;
+        defer {
+            self.active_constraints = prev_constraints;
+            self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+        }
+
+        for (tr.laws) |lw| {
+            try self.pushScope();
+            defer self.popScope();
+            for (lw.params) |p| {
+                const pty = if (p.ty) |t| try self.resolveType(t) else try self.allocTy(.err);
+                try self.scopes.append(self.alloc, .{
+                    .name = p.name.slice(self.source),
+                    .ty = pty,
+                    .range = pty.rangeOf(),
+                    .mutable = p.mutable,
+                    .moved = false,
+                    .authorized_paths = null,
+                    .decl_span = p.span,
+                });
+            }
+            for (lw.clauses) |cl| {
+                switch (cl) {
+                    .when => |wh| _ = try self.checkExpr(wh.expr, try self.allocTy(.bool)),
+                    .always => |a| _ = try self.checkExpr(a.expr, try self.allocTy(.bool)),
+                    .never => |n| _ = try self.checkExpr(n.expr, try self.allocTy(.bool)),
+                    .expr => |e| _ = try self.checkExpr(e.expr, try self.allocTy(.bool)),
+                    .preserves => {},
+                }
+            }
+        }
+    }
+
+    fn checkInstanceBodies(self: *Analyzer, span: ast.Span, inst_ast: anytype) std.mem.Allocator.Error!void {
+        _ = span;
+        var matched_inst: ?*const InstanceDef = null;
+        for (self.instance_defs.items) |*id| {
+            if (id.module_id == self.current_module_id and id.decl_ast == .instance_decl and id.span.start == self.findDeclStartByAst(inst_ast)) {
+                matched_inst = id;
+                break;
+            }
+        }
+        const idef = matched_inst orelse return;
+        if (idef.is_external_rust) return;
+
+        const prev_constraints = self.active_constraints;
+        const hkt_mark = self.active_hkt_params.items.len;
+        self.active_constraints = idef.constraints;
+        for (idef.hkt_params) |hp| try self.active_hkt_params.append(self.alloc, hp);
+        defer {
+            self.active_constraints = prev_constraints;
+            self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+        }
+
+        for (idef.methods) |cm| {
+            const im = cm.ast_method orelse continue;
+            try self.pushScope();
+            defer self.popScope();
+
+            for (im.params, 0..) |p, pi| {
+                const pty = if (pi < cm.params.len) cm.params[pi] else try self.allocTy(.err);
+                try self.scopes.append(self.alloc, .{
+                    .name = p.name.slice(self.source),
+                    .ty = pty,
+                    .range = pty.rangeOf(),
+                    .mutable = p.mutable,
+                    .moved = false,
+                    .authorized_paths = null,
+                    .decl_span = p.span,
+                    .is_param = true,
+                    .param_index = pi,
+                });
+            }
+
+            const prev_ret = self.current_fn_ret;
+            self.current_fn_ret = cm.ret;
+            defer self.current_fn_ret = prev_ret;
+
+            const body_res = try self.checkBlock(&im.body, cm.ret, im.ret != null);
+            if (!cm.ret.eql(.unit) and (im.body.tail != null or im.body.stmts.len == 0)) {
+                try self.checkAssignmentValue(im.body.span, cm.ret, body_res);
+            }
+        }
+    }
+
+    fn findDeclStartByAst(self: *const Analyzer, inst_ast: anytype) usize {
+        for (self.module.decls) |decl| {
+            if (decl.kind == .instance_decl and decl.kind.instance_decl.trait_ref.span.start == inst_ast.trait_ref.span.start) {
+                return decl.span.start;
+            }
+        }
+        return 0;
+    }
+
     fn resolveAllTypeSignatures(self: *Analyzer) std.mem.Allocator.Error!void {
-        // Resolve type aliases first so records/functions can reference aliases in any order.
+        // Resolve type aliases first so records/functions/traits can reference aliases in any order.
         for (self.module.decls) |decl| {
             self.current_module_id = self.moduleIdOfSpan(decl.span);
             if (decl.kind == .type_decl and decl.kind.type_decl.body == .alias) {
@@ -1201,16 +2343,82 @@ const Analyzer = struct {
             }
         }
 
-        // Resolve record fields and ADT variants.
+        // Resolve trait supertraits & method signatures before instances and functions.
+        for (self.module.decls) |decl| {
+            self.current_module_id = self.moduleIdOfSpan(decl.span);
+            if (decl.kind != .trait_decl) continue;
+            const tr = decl.kind.trait_decl;
+            const local_name = tr.name.slice(self.source);
+            const tidx = self.findTraitInModule(self.current_module_id, local_name) orelse continue;
+
+            const hkt_mark = self.active_hkt_params.items.len;
+            defer self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+            for (self.trait_defs.items[tidx].params) |tp| {
+                if (tp.arity >= 1) try self.active_hkt_params.append(self.alloc, tp.name);
+            }
+
+            var sups: std.ArrayList(ResolvedConstraint) = .empty;
+            for (tr.supers) |sc| {
+                if (try self.resolveTraitConstraint(sc)) |rc| {
+                    try sups.append(self.alloc, rc);
+                }
+            }
+            var mdefs: std.ArrayList(TraitMethodDef) = .empty;
+            for (tr.methods) |msig| {
+                const mname = msig.name.slice(self.source);
+                const ptypes = try self.alloc.alloc(*const Ty, msig.params.len);
+                const pnames = try self.alloc.alloc([]const u8, msig.params.len);
+                var tparams: std.ArrayList([]const u8) = .empty;
+                for (msig.params, 0..) |p, pi| {
+                    pnames[pi] = p.name.slice(self.source);
+                    ptypes[pi] = if (p.ty) |t| try self.resolveType(t) else try self.allocTy(.err);
+                    try self.collectTypeVars(ptypes[pi], &tparams);
+                }
+                const rty = if (msig.ret) |rt| try self.resolveType(rt) else try self.allocTy(.unit);
+                try self.collectTypeVars(rty, &tparams);
+                // Filter out trait-level parameters (they are fixed by the trait instance itself).
+                var extra_tparams: std.ArrayList([]const u8) = .empty;
+                for (tparams.items) |tv| {
+                    var is_trait_param = false;
+                    for (self.trait_defs.items[tidx].params) |tp| {
+                        if (std.mem.eql(u8, tp.name, tv)) {
+                            is_trait_param = true;
+                            break;
+                        }
+                    }
+                    if (!is_trait_param) try extra_tparams.append(self.alloc, tv);
+                }
+                try mdefs.append(self.alloc, .{
+                    .name = mname,
+                    .sig = msig,
+                    .param_names = pnames,
+                    .params = ptypes,
+                    .ret = rty,
+                    .type_params = try extra_tparams.toOwnedSlice(self.alloc),
+                });
+            }
+            self.trait_defs.items[tidx].supers = try sups.toOwnedSlice(self.alloc);
+            self.trait_defs.items[tidx].methods = try mdefs.toOwnedSlice(self.alloc);
+        }
+
+        // Resolve record fields, ADT variants, and type_decl constraints.
         for (self.module.decls) |decl| {
             self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
                 .type_decl => |td| {
                     const name = td.name.slice(self.source);
+                    var cs_list: std.ArrayList(ResolvedConstraint) = .empty;
+                    for (td.constraints) |tc| {
+                        if (try self.resolveTraitConstraint(tc)) |rc| {
+                            try cs_list.append(self.alloc, rc);
+                        }
+                    }
+                    const cs_slice = try cs_list.toOwnedSlice(self.alloc);
                     switch (td.body) {
                         .alias => {},
                         .record => |fields| {
                             if (self.findRecordInModule(self.current_module_id, name)) |ridx| {
+                                self.record_defs.items[ridx].constraints = cs_slice;
                                 for (fields, 0..) |rf, fi| {
                                     const fty = try self.resolveType(rf.ty);
                                     const info = self.typeBitInfo(fty);
@@ -1226,6 +2434,7 @@ const Analyzer = struct {
                         },
                         .variants => |variants| {
                             if (self.findADTInModule(self.current_module_id, name)) |aidx| {
+                                self.adt_defs.items[aidx].constraints = cs_slice;
                                 var max_pay: u16 = 0;
                                 for (variants, 0..) |v, vi| {
                                     const fts = try self.alloc.alloc(*const Ty, v.fields.len);
@@ -1254,7 +2463,7 @@ const Analyzer = struct {
             }
         }
 
-        // Resolve function & extern signatures.
+        // Resolve function, extern, and instance signatures.
         for (self.module.decls, 0..) |decl, decl_idx| {
             self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
@@ -1266,6 +2475,45 @@ const Analyzer = struct {
                     }
                     const cname = try self.canonicalName(self.current_module_id, local_name, false);
                     try self.decl_canonical_names.put(self.alloc, decl.span.start, cname);
+
+                    var fn_cs: std.ArrayList(ResolvedConstraint) = .empty;
+                    const hkt_mark = self.active_hkt_params.items.len;
+                    defer self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+                    var fn_hkts: std.ArrayList([]const u8) = .empty;
+                    for (fd.constraints) |tc| {
+                        if (try self.resolveTraitConstraint(tc)) |rc| {
+                            try fn_cs.append(self.alloc, rc);
+                            const tr = self.trait_defs.items[rc.trait_idx];
+                            for (rc.hkt_arg_names, 0..) |hn_opt, hi| {
+                                if (hi < tr.params.len and tr.params[hi].arity >= 1) {
+                                    if (hn_opt) |hn| {
+                                        var is_concrete_ctor = std.mem.eql(u8, hn, "Option") or std.mem.eql(u8, hn, "Result");
+                                        if (!is_concrete_ctor and hn.len > 0 and hn[0] >= 'A' and hn[0] <= 'Z') is_concrete_ctor = true;
+                                        if (!is_concrete_ctor) {
+                                            var seen_h = false;
+                                            for (fn_hkts.items) |prev| if (std.mem.eql(u8, prev, hn)) {
+                                                seen_h = true;
+                                            };
+                                            if (!seen_h) {
+                                                try fn_hkts.append(self.alloc, hn);
+                                                try self.active_hkt_params.append(self.alloc, hn);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    const ext_spec = self.parseExternalRustAttr(decl.attrs, local_name);
+                    if (!fd.has_body and ext_spec == null) {
+                        self.addError(.invalid_ffi_type, fd.name, "bodyless function requires @external(rust, ...) attribute");
+                    }
+
+                    const prev_c_fn = self.active_constraints;
+                    self.active_constraints = fn_cs.items;
+                    defer self.active_constraints = prev_c_fn;
+
                     const ptypes = try self.alloc.alloc(*const Ty, fd.params.len);
                     const pauths = try self.alloc.alloc(?[]const usize, fd.params.len);
                     var target_rec: ?usize = null;
@@ -1274,11 +2522,32 @@ const Analyzer = struct {
                         ptypes[pi] = rty;
                         pauths[pi] = try self.extractAuthorizedPaths(p.span, rty);
                         if (target_rec == null) target_rec = recordOfType(rty);
+                        if (ext_spec != null) self.validateRustFFIType(p.span, rty);
                     }
                     const rty = if (fd.ret) |rt| try self.resolveType(rt) else try self.allocTy(.unit);
+                    if (ext_spec != null) self.validateRustFFIType(fd.name, rty);
+
                     var tparams: std.ArrayList([]const u8) = .empty;
                     for (ptypes) |pt| try self.collectTypeVars(pt, &tparams);
                     try self.collectTypeVars(rty, &tparams);
+                    for (fn_cs.items) |rc| {
+                        const tr = self.trait_defs.items[rc.trait_idx];
+                        for (rc.args, 0..) |ca, ci| {
+                            if (ci < tr.params.len and tr.params[ci].arity == 0) {
+                                try self.collectTypeVars(ca, &tparams);
+                            }
+                        }
+                    }
+
+                    if (ext_spec) |es| {
+                        try self.foreign_contracts.append(self.alloc, .{
+                            .aethel_name = cname,
+                            .rust_target = es.target,
+                            .rust_sym = es.sym,
+                            .span = es.span,
+                        });
+                    }
+
                     try self.fn_sigs.append(self.alloc, .{
                         .name = cname,
                         .local_name = local_name,
@@ -1286,11 +2555,16 @@ const Analyzer = struct {
                         .is_pub = decl.is_pub,
                         .span = fd.name,
                         .type_params = try tparams.toOwnedSlice(self.alloc),
+                        .hkt_params = try fn_hkts.toOwnedSlice(self.alloc),
+                        .constraints = try fn_cs.toOwnedSlice(self.alloc),
                         .params = ptypes,
                         .param_auths = pauths,
                         .ret = rty,
                         .target_record = target_rec,
-                        .is_extern = false,
+                        .is_extern = ext_spec != null,
+                        .has_body = fd.has_body,
+                        .rust_target = if (ext_spec) |es| es.target else null,
+                        .rust_sym = if (ext_spec) |es| es.sym else null,
                         .decl_index = decl_idx,
                     });
                 },
@@ -1311,6 +2585,12 @@ const Analyzer = struct {
                         }
                         const rty = if (ef.ret) |rt| try self.resolveType(rt) else try self.allocTy(.unit);
                         self.validateRustFFIType(ef.span, rty);
+                        try self.foreign_contracts.append(self.alloc, .{
+                            .aethel_name = name,
+                            .rust_target = null,
+                            .rust_sym = name,
+                            .span = ef.span,
+                        });
                         try self.fn_sigs.append(self.alloc, .{
                             .name = name,
                             .local_name = name,
@@ -1322,13 +2602,49 @@ const Analyzer = struct {
                             .ret = rty,
                             .target_record = null,
                             .is_extern = true,
+                            .has_body = false,
+                            .rust_sym = name,
                             .decl_index = null,
                         });
                     }
                 },
+                .instance_decl => |inst| {
+                    try self.registerInstanceDecl(decl, decl_idx, inst);
+                },
                 else => {},
             }
         }
+    }
+
+    fn isFlatCABIScalarOrRecord(self: *Analyzer, span: ast.Span, ty: *const Ty, depth: u8) bool {
+        if (depth > 8) return false;
+        return switch (ty.*) {
+            .bool, .f32, .f64, .opaque_ty, .err => true,
+            .int => |it| blk: {
+                if (it.bits != 8 and it.bits != 16 and it.bits != 32 and it.bits != 64 and it.bits != 128) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI scalar integer must be ABI byte width (8, 16, 32, 64, or 128 bits)");
+                    break :blk false;
+                }
+                break :blk true;
+            },
+            .int_range => {
+                self.addError(.invalid_ffi_type, span, "Rust FFI flat struct forbids sub-byte Int(...) range fields; use fixed-width scalars (u8..u128, i8..i128)");
+                return false;
+            },
+            .record => |ridx| blk: {
+                const rdef = &self.record_defs.items[ridx];
+                if (rdef.is_packed_attr) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI forbids @layout(packed) records; use @layout(flat), @layout(soa), or @layout(aosoa(W))");
+                    break :blk false;
+                }
+                for (rdef.fields) |f| {
+                    if (!self.isFlatCABIScalarOrRecord(span, f.ty, depth + 1)) break :blk false;
+                }
+                rdef.is_flat_c = true;
+                break :blk true;
+            },
+            else => false,
+        };
     }
 
     fn validateRustFFIType(self: *Analyzer, span: ast.Span, ty: *const Ty) void {
@@ -1352,16 +2668,56 @@ const Analyzer = struct {
             .int_range => {
                 self.addError(.invalid_ffi_type, span, "Rust FFI boundary requires explicit fixed-width scalar instead of symbolic Int range");
             },
+            .record => |ridx| {
+                const rdef = &self.record_defs.items[ridx];
+                if (!rdef.is_flat_c) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI record parameter requires @layout(flat) for deterministic C-ABI layout");
+                    return;
+                }
+                _ = self.isFlatCABIScalarOrRecord(span, ty, 0);
+            },
+            .collection => |c| {
+                if (c.elem_record) |ridx| {
+                    const rdef = &self.record_defs.items[ridx];
+                    const has_phys_col = rdef.collection_layout != null and (rdef.collection_layout.? == .soa or rdef.collection_layout.? == .aosoa);
+                    if (!rdef.is_flat_c and !has_phys_col) {
+                        self.addError(.invalid_ffi_type, span, "Rust FFI Collection requires @layout(flat), @layout(soa), or @layout(aosoa(W)) element record");
+                        return;
+                    }
+                    const was_flat = rdef.is_flat_c;
+                    const rec_ty = self.allocTy(.{ .record = ridx }) catch return;
+                    _ = self.isFlatCABIScalarOrRecord(span, rec_ty, 0);
+                    rdef.is_flat_c = was_flat;
+                } else {
+                    self.validateRustFFIType(span, c.elem_ty);
+                }
+            },
+            .path_borrow => |pb| {
+                if (pb.base.* == .collection) {
+                    self.validateRustFFIType(span, pb.base);
+                    return;
+                }
+                if (recordOfType(pb.base)) |ridx| {
+                    const rdef = &self.record_defs.items[ridx];
+                    if (!rdef.is_flat_c) {
+                        self.addError(.invalid_ffi_type, span, "Rust FFI record borrow requires @layout(flat)");
+                        return;
+                    }
+                    _ = self.isFlatCABIScalarOrRecord(span, pb.base, 0);
+                    return;
+                }
+                self.addError(.invalid_ffi_type, span, "Rust FFI path borrow must target a flat Collection or @layout(flat) record");
+            },
             .view => |v| {
                 if (v.target.* == .opaque_ty) return;
-                if (v.target.* == .slice) {
+                if (v.target.* == .slice or v.target.* == .collection or v.target.* == .record) {
                     self.validateRustFFIType(span, v.target);
                     return;
                 }
-                self.addError(.invalid_ffi_type, span, "Rust FFI view must wrap an opaque RustOwn handle or C-ABI slice");
+                self.addError(.invalid_ffi_type, span, "Rust FFI view must wrap an opaque handle, C-ABI slice, flat record, or flat Collection");
             },
             else => {
-                self.addError(.invalid_ffi_type, span, "unsupported composite type across Rust C-ABI FFI boundary; use scalars, slices, or opaque handles");
+                self.addError(.invalid_ffi_type, span, "unsupported composite type across Rust C-ABI FFI boundary; use scalars, flat structs, slices, collections, or opaque handles");
             },
         }
     }
@@ -1369,10 +2725,31 @@ const Analyzer = struct {
     fn recordOfType(ty: *const Ty) ?usize {
         return switch (ty.*) {
             .record => |idx| idx,
+            .applied => |ap| if (ap.kind == .record) ap.decl_idx else null,
             .collection => |c| c.elem_record,
+            .vec => |v| v.elem_record,
             .view => |v| v.target_record orelse recordOfType(v.target),
             .path_borrow => |pb| recordOfType(pb.base),
             else => null,
+        };
+    }
+
+    fn isHashableEqKey(ty: *const Ty) bool {
+        return switch (ty.*) {
+            .int, .int_range, .bool, .string, .unit, .type_var, .err => true,
+            .record, .adt => true,
+            .applied => |ap| blk: {
+                if (ap.kind == .opaque_ty) break :blk false;
+                for (ap.args) |el| if (!isHashableEqKey(el)) break :blk false;
+                break :blk true;
+            },
+            .option => |inner| isHashableEqKey(inner),
+            .result => |res| isHashableEqKey(res.ok) and isHashableEqKey(res.err),
+            .tuple => |elems| blk: {
+                for (elems) |el| if (!isHashableEqKey(el)) break :blk false;
+                break :blk true;
+            },
+            else => false,
         };
     }
 
@@ -1452,8 +2829,71 @@ const Analyzer = struct {
                 for (rf) |f| approx += @max(@as(usize, 1), (f.bits + 7) / 8);
                 return .{ .bits = 0, .signed = false, .size = approx, .alignment = 8, .packable = false };
             },
+            .applied => |ap| switch (ap.kind) {
+                .record => {
+                    const rty = Ty{ .record = ap.decl_idx };
+                    return self.typeBitInfo(&rty);
+                },
+                .adt => {
+                    const aty = Ty{ .adt = ap.decl_idx };
+                    return self.typeBitInfo(&aty);
+                },
+                .opaque_ty => return .{ .bits = 64, .signed = false, .size = 8, .alignment = 8, .packable = false },
+            },
             else => return .{ .bits = 64, .signed = false, .size = 8, .alignment = 8, .packable = false },
         }
+    }
+
+    fn isHKTActive(self: *const Analyzer, name: []const u8) bool {
+        for (self.active_hkt_params.items) |h| {
+            if (std.mem.eql(u8, h, name)) return true;
+        }
+        return false;
+    }
+
+    fn resolveBrandForConstraints(self: *Analyzer, cs: []const ResolvedConstraint, subst: *const std.StringHashMapUnmanaged(*const Ty), span: ast.Span) ?[]const u8 {
+        if (cs.len == 0) return null;
+        const c = cs[0];
+        var sub_args = self.alloc.alloc(*const Ty, c.args.len) catch return null;
+        for (c.args, 0..) |a, i| {
+            sub_args[i] = self.substituteType(a, subst) catch a;
+        }
+        const w = self.resolveTraitWitness(c.trait_idx, sub_args, c.hkt_arg_names, span, false) orelse return null;
+        return switch (w) {
+            .concrete => |cw| self.instance_defs.items[cw.inst_idx].name,
+            .param => |pidx| std.fmt.allocPrint(self.alloc, "__param_{d}", .{pidx}) catch null,
+        };
+    }
+
+    fn makeAppliedOrNominal(
+        self: *Analyzer,
+        kind: @TypeOf(@as(Ty, undefined).applied).AppliedKind,
+        idx: usize,
+        raw_args: []const *const ast.TypeExpr,
+        tparams: []const []const u8,
+        cs: []const ResolvedConstraint,
+        span: ast.Span,
+    ) std.mem.Allocator.Error!*const Ty {
+        if (raw_args.len == 0 and tparams.len == 0 and cs.len == 0) {
+            return switch (kind) {
+                .record => try self.allocTy(.{ .record = idx }),
+                .adt => try self.allocTy(.{ .adt = idx }),
+                .opaque_ty => try self.allocTy(.{ .opaque_ty = idx }),
+            };
+        }
+        const args = try self.alloc.alloc(*const Ty, raw_args.len);
+        var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+        for (raw_args, 0..) |ra, i| {
+            args[i] = try self.resolveType(ra);
+            if (i < tparams.len) try subst.put(self.alloc, tparams[i], args[i]);
+        }
+        const brand = self.resolveBrandForConstraints(cs, &subst, span);
+        return try self.allocTy(.{ .applied = .{
+            .kind = kind,
+            .decl_idx = idx,
+            .args = args,
+            .brand_inst = brand,
+        } });
     }
 
     fn resolveType(self: *Analyzer, ty_ast: *const ast.TypeExpr) std.mem.Allocator.Error!*const Ty {
@@ -1490,6 +2930,11 @@ const Analyzer = struct {
                 if (n.path.len == 0) return try self.allocTy(.err);
                 const head_name = n.path[n.path.len - 1].slice(self.source);
 
+                if (n.path.len == 1 and n.args.len == 1 and self.isHKTActive(head_name)) {
+                    const inner = try self.resolveType(n.args[0]);
+                    return try self.allocTy(.{ .hkt_app = .{ .ctor = head_name, .arg = inner } });
+                }
+
                 if (std.mem.eql(u8, head_name, "String")) return try self.allocTy(.string);
                 if (std.mem.eql(u8, head_name, "Option")) {
                     const elem = if (n.args.len > 0) try self.resolveType(n.args[0]) else try self.allocTy(.err);
@@ -1504,6 +2949,43 @@ const Analyzer = struct {
                     const elem = if (n.args.len > 0) try self.resolveType(n.args[0]) else try self.allocTy(.err);
                     return try self.allocTy(.{ .collection = .{
                         .elem_record = recordOfType(elem),
+                        .elem_ty = elem,
+                    } });
+                }
+                if (std.mem.eql(u8, head_name, "Vec")) {
+                    const elem = if (n.args.len > 0) try self.resolveType(n.args[0]) else try self.allocTy(.err);
+                    const ridx_opt = recordOfType(elem);
+                    if (ridx_opt) |ri| {
+                        self.record_defs.items[ri].used_in_dyn_vec = true;
+                    }
+                    return try self.allocTy(.{ .vec = .{
+                        .elem_record = ridx_opt,
+                        .elem_ty = elem,
+                    } });
+                }
+                if (std.mem.eql(u8, head_name, "Map")) {
+                    const key_ty = if (n.args.len > 0) try self.resolveType(n.args[0]) else try self.allocTy(.err);
+                    const val_ty = if (n.args.len > 1) try self.resolveType(n.args[1]) else try self.allocTy(.err);
+                    if (!isHashableEqKey(key_ty)) {
+                        self.addError(.type_mismatch, n.span, "Map key type must satisfy deterministic Eq and Hash (floats, views, and mutable handles are not valid keys)");
+                    }
+                    return try self.allocTy(.{ .map = .{
+                        .key_ty = key_ty,
+                        .val_ty = val_ty,
+                    } });
+                }
+                if (std.mem.eql(u8, head_name, "Set")) {
+                    const elem = if (n.args.len > 0) try self.resolveType(n.args[0]) else try self.allocTy(.err);
+                    if (!isHashableEqKey(elem)) {
+                        self.addError(.type_mismatch, n.span, "Set element type must satisfy deterministic Eq and Hash (floats, views, and mutable handles are not valid elements)");
+                    }
+                    return try self.allocTy(.{ .set = .{
+                        .elem_ty = elem,
+                    } });
+                }
+                if (std.mem.eql(u8, head_name, "Deque")) {
+                    const elem = if (n.args.len > 0) try self.resolveType(n.args[0]) else try self.allocTy(.err);
+                    return try self.allocTy(.{ .deque = .{
                         .elem_ty = elem,
                     } });
                 }
@@ -1529,13 +3011,15 @@ const Analyzer = struct {
                             if (!self.record_defs.items[ridx].is_pub and target_mod != self.current_module_id) {
                                 self.addError(.visibility_error, n.span, "cannot use private record type from imported module");
                             }
-                            return try self.allocTy(.{ .record = ridx });
+                            const rdef = self.record_defs.items[ridx];
+                            return try self.makeAppliedOrNominal(.record, ridx, n.args, rdef.type_params, rdef.constraints, n.span);
                         }
                         if (self.findADTInModule(target_mod, tname)) |aidx| {
                             if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
                                 self.addError(.visibility_error, n.span, "cannot use private type from imported module");
                             }
-                            return try self.allocTy(.{ .adt = aidx });
+                            const adef = self.adt_defs.items[aidx];
+                            return try self.makeAppliedOrNominal(.adt, aidx, n.args, adef.type_params, adef.constraints, n.span);
                         }
                         if (self.findOpaqueInModule(target_mod, tname)) |oidx| {
                             if (!self.opaque_defs.items[oidx].is_pub and target_mod != self.current_module_id) {
@@ -1556,10 +3040,12 @@ const Analyzer = struct {
                 }
 
                 if (self.findRecordInModule(self.current_module_id, head_name)) |ridx| {
-                    return try self.allocTy(.{ .record = ridx });
+                    const rdef = self.record_defs.items[ridx];
+                    return try self.makeAppliedOrNominal(.record, ridx, n.args, rdef.type_params, rdef.constraints, n.span);
                 }
                 if (self.findADTInModule(self.current_module_id, head_name)) |aidx| {
-                    return try self.allocTy(.{ .adt = aidx });
+                    const adef = self.adt_defs.items[aidx];
+                    return try self.makeAppliedOrNominal(.adt, aidx, n.args, adef.type_params, adef.constraints, n.span);
                 }
                 if (self.findOpaqueInModule(self.current_module_id, head_name)) |oidx| {
                     return try self.allocTy(.{ .opaque_ty = oidx });
@@ -1572,13 +3058,15 @@ const Analyzer = struct {
                         if (!self.record_defs.items[ridx].is_pub and target_mod != self.current_module_id) {
                             self.addError(.visibility_error, n.span, "cannot import private record type");
                         }
-                        return try self.allocTy(.{ .record = ridx });
+                        const rdef = self.record_defs.items[ridx];
+                        return try self.makeAppliedOrNominal(.record, ridx, n.args, rdef.type_params, rdef.constraints, n.span);
                     }
                     if (self.findADTInModule(target_mod, head_name)) |aidx| {
                         if (!self.adt_defs.items[aidx].is_pub and target_mod != self.current_module_id) {
                             self.addError(.visibility_error, n.span, "cannot import private type");
                         }
-                        return try self.allocTy(.{ .adt = aidx });
+                        const adef = self.adt_defs.items[aidx];
+                        return try self.makeAppliedOrNominal(.adt, aidx, n.args, adef.type_params, adef.constraints, n.span);
                     }
                     if (self.findOpaqueInModule(target_mod, head_name)) |oidx| {
                         if (!self.opaque_defs.items[oidx].is_pub and target_mod != self.current_module_id) {
@@ -1595,10 +3083,12 @@ const Analyzer = struct {
                 }
                 if (self.module_slices.len == 0) {
                     if (self.findRecordIndex(head_name)) |ridx| {
-                        return try self.allocTy(.{ .record = ridx });
+                        const rdef = self.record_defs.items[ridx];
+                        return try self.makeAppliedOrNominal(.record, ridx, n.args, rdef.type_params, rdef.constraints, n.span);
                     }
                     if (self.findADTIndex(head_name)) |aidx| {
-                        return try self.allocTy(.{ .adt = aidx });
+                        const adef = self.adt_defs.items[aidx];
+                        return try self.makeAppliedOrNominal(.adt, aidx, n.args, adef.type_params, adef.constraints, n.span);
                     }
                     if (self.findOpaqueIndex(head_name)) |oidx| {
                         return try self.allocTy(.{ .opaque_ty = oidx });
@@ -1752,8 +3242,39 @@ const Analyzer = struct {
         for (self.module.decls) |decl| {
             self.current_module_id = self.moduleIdOfSpan(decl.span);
             switch (decl.kind) {
-                .fn_decl => {
-                    try self.checkFunction(decl.span, decl.kind);
+                .fn_decl => |fd| {
+                    if (fd.has_body) {
+                        try self.checkFunction(decl.span, decl.kind);
+                    } else {
+                        const local_name = fd.name.slice(self.source);
+                        const fsig_idx = self.findFnInModule(self.current_module_id, local_name) orelse self.findFnIndex(local_name) orelse continue;
+                        const fsig = self.fn_sigs.items[fsig_idx];
+                        try self.checked_functions.append(self.alloc, .{
+                            .name = fsig.name,
+                            .span = decl.span,
+                            .type_params = fsig.type_params,
+                            .hkt_params = fsig.hkt_params,
+                            .constraint_count = fsig.constraints.len,
+                            .param_types = fsig.params,
+                            .ret_type = fsig.ret,
+                            .reads = &.{},
+                            .writes = &.{},
+                            .preserves = &.{},
+                            .target_record = fsig.target_record,
+                            .has_extern_abi = true,
+                            .rust_sym = fsig.rust_sym,
+                            .perm_trace = &.{},
+                            .disjoint_certs = &.{},
+                            .decreases_certs = &.{},
+                            .returned_origin = null,
+                        });
+                    }
+                },
+                .trait_decl => |tr| {
+                    try self.checkTraitLawsWellTyped(decl.span, tr);
+                },
+                .instance_decl => |inst| {
+                    try self.checkInstanceBodies(decl.span, inst);
                 },
                 else => {},
             }
@@ -1766,6 +3287,15 @@ const Analyzer = struct {
         const fsig_idx = self.findFnInModule(self.current_module_id, local_name) orelse self.findFnIndex(local_name) orelse return;
         const fname = self.fn_sigs.items[fsig_idx].name;
         var fsig = &self.fn_sigs.items[fsig_idx];
+
+        const prev_constraints = self.active_constraints;
+        const hkt_mark = self.active_hkt_params.items.len;
+        self.active_constraints = fsig.constraints;
+        for (fsig.hkt_params) |hp| try self.active_hkt_params.append(self.alloc, hp);
+        defer {
+            self.active_constraints = prev_constraints;
+            self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+        }
 
         try self.pushScope();
         defer self.popScope();
@@ -1873,6 +3403,8 @@ const Analyzer = struct {
             .name = fname,
             .span = span,
             .type_params = fsig.type_params,
+            .hkt_params = fsig.hkt_params,
+            .constraint_count = fsig.constraints.len,
             .param_types = fsig.params,
             .ret_type = fsig.ret,
             .reads = try reads_list.toOwnedSlice(self.alloc),
@@ -2007,6 +3539,10 @@ const Analyzer = struct {
                 try self.bindPattern(ls.pattern, final_ty, final_range, ls.mutable);
                 if (final_ty.* == .view and self.scopes.items.len > scopes_before and ls.pattern.* == .ident) {
                     try self.attachReturnedViewBinding(&self.scopes.items[self.scopes.items.len - 1], ls.value, final_ty.view, ls.span);
+                } else if ((final_ty.* == .slice or final_ty.* == .collection) and self.scopes.items.len > scopes_before and ls.pattern.* == .ident) {
+                    if (self.extractDynVecBorrowRoot(ls.value)) |rn| {
+                        try self.attachSharedBorrowBinding(&self.scopes.items[self.scopes.items.len - 1], rn, ls.span);
+                    }
                 }
             },
             .use_stmt => |us| {
@@ -2086,6 +3622,7 @@ const Analyzer = struct {
                     break :blk iter_res.ty;
                 } else switch (iter_res.ty.*) {
                     .collection => |c| c.elem_ty,
+                    .vec => |v| v.elem_ty,
                     .slice => |s| s.elem,
                     else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 64 } }),
                 };
@@ -2394,9 +3931,11 @@ const Analyzer = struct {
                 const elem_ty: *const Ty = switch (base.ty.*) {
                     .slice => |sl| sl.elem,
                     .collection => |c| c.elem_ty,
+                    .vec => |v| v.elem_ty,
                     .view => |v| switch (v.target.*) {
                         .slice => |sl| sl.elem,
                         .collection => |c| c.elem_ty,
+                        .vec => |vc| vc.elem_ty,
                         else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } }),
                     },
                     else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } }),
@@ -2407,6 +3946,8 @@ const Analyzer = struct {
                             self.addError(.borrow_conflict, ix.target.getSpan(), "cannot write through a shared view");
                         } else if (vb.ty.* == .slice and !vb.ty.slice.mutable) {
                             self.addError(.mutability_error, ix.target.getSpan(), "cannot write to immutable slice");
+                        } else if (vb.ty.* == .vec and !vb.mutable) {
+                            self.addError(.mutability_error, ix.target.getSpan(), "cannot write element of immutable Vec; mark binding 'mut'");
                         }
                     }
                 }
@@ -2698,9 +4239,17 @@ const Analyzer = struct {
 
         if (target.* == .path_borrow) {
             if (target.path_borrow.base.eql(val.ty.*)) return;
+            if (target.path_borrow.base.* == .collection and val.ty.* == .vec and
+                target.path_borrow.base.collection.elem_ty.eql(val.ty.vec.elem_ty.*))
+            {
+                return;
+            }
         }
         if (val.ty.* == .path_borrow) {
             if (val.ty.path_borrow.base.eql(target.*)) return;
+        }
+        if (target.* == .collection and val.ty.* == .vec) {
+            if (target.collection.elem_ty.eql(val.ty.vec.elem_ty.*)) return;
         }
         if (target.* == .view) {
             const inner_ok = switch (val.ty.*) {
@@ -2711,6 +4260,9 @@ const Analyzer = struct {
                     if (target.view.target.* == .slice and vv.target.* == .slice) {
                         break :blk target.view.target.slice.elem.eql(vv.target.slice.elem.*);
                     }
+                    if (target.view.target.* == .collection and vv.target.* == .vec) {
+                        break :blk target.view.target.collection.elem_ty.eql(vv.target.vec.elem_ty.*);
+                    }
                     break :blk target.view.target.eql(vv.target.*);
                 },
                 .path_borrow => |pb| blk: {
@@ -2718,6 +4270,15 @@ const Analyzer = struct {
                         self.addError(.borrow_conflict, span, "cannot coerce shared path borrow to Exclusive View");
                     }
                     break :blk target.view.target.eql(pb.base.*);
+                },
+                .vec => |vc| blk: {
+                    if (target.view.target.* == .collection) {
+                        break :blk target.view.target.collection.elem_ty.eql(vc.elem_ty.*);
+                    }
+                    if (target.view.target.* == .slice) {
+                        break :blk target.view.target.slice.elem.eql(vc.elem_ty.*);
+                    }
+                    break :blk target.view.target.eql(val.ty.*);
                 },
                 .slice => |sl| blk: {
                     if (target.view.target.* != .slice) break :blk false;
@@ -2729,6 +4290,9 @@ const Analyzer = struct {
                 else => target.view.target.eql(val.ty.*),
             };
             if (inner_ok) return;
+        }
+        if (target.* == .slice and val.ty.* == .vec) {
+            if (!target.slice.mutable and target.slice.elem.eql(val.ty.vec.elem_ty.*)) return;
         }
         if (target.* == .slice and val.ty.* == .slice) {
             if (target.slice.mutable and !val.ty.slice.mutable) {
@@ -2767,6 +4331,16 @@ const Analyzer = struct {
                 }
             }
             return;
+        }
+        if (target.* == .applied and val.ty.* == .applied) {
+            const ta = target.applied;
+            const va = val.ty.applied;
+            if (ta.kind == va.kind and ta.decl_idx == va.decl_idx and ta.brand_inst != null and va.brand_inst != null and
+                !std.mem.eql(u8, ta.brand_inst.?, va.brand_inst.?))
+            {
+                self.addError(.type_mismatch, span, "branded container instance mismatch: cannot mix values created with different instances");
+                return;
+            }
         }
         if (!target.eql(val.ty.*)) {
             self.addError(.type_mismatch, span, "expression type does not match expected type");
@@ -3070,8 +4644,8 @@ const Analyzer = struct {
                 }
                 if (std.mem.eql(u8, fname, "len")) {
                     const is_len_container = switch (base.ty.*) {
-                        .slice, .collection, .string => true,
-                        .view => |v| v.target.* == .slice or v.target.* == .collection or v.target.* == .string,
+                        .slice, .collection, .vec, .map, .set, .deque, .string => true,
+                        .view => |v| v.target.* == .slice or v.target.* == .collection or v.target.* == .vec or v.target.* == .map or v.target.* == .set or v.target.* == .deque or v.target.* == .string,
                         else => false,
                     };
                     if (is_len_container) {
@@ -3083,14 +4657,23 @@ const Analyzer = struct {
                         if (resolved.root_name) |rn| {
                             try self.recordAccess(rn, ridx, fidx, false, fld.span, idx_key, resolved.through_view_id);
                         }
-                        const cf = self.record_defs.items[ridx].fields[fidx];
+                        const rdef = self.record_defs.items[ridx];
+                        const cf = rdef.fields[fidx];
+                        var field_ty = cf.ty;
+                        if (base.ty.* == .applied and rdef.type_params.len > 0) {
+                            var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+                            for (rdef.type_params, 0..) |tp, ti| {
+                                if (ti < base.ty.applied.args.len) try subst.put(self.alloc, tp, base.ty.applied.args[ti]);
+                            }
+                            field_ty = try self.substituteType(field_ty, &subst);
+                        }
                         if (base.ty.* == .collection) {
                             return .{
-                                .ty = try self.allocTy(.{ .slice = .{ .mutable = false, .elem = cf.ty } }),
+                                .ty = try self.allocTy(.{ .slice = .{ .mutable = false, .elem = field_ty } }),
                                 .range = null,
                             };
                         }
-                        return .{ .ty = cf.ty, .range = cf.ty.rangeOf() };
+                        return .{ .ty = field_ty, .range = field_ty.rangeOf() };
                     }
                 }
                 return .{ .ty = try self.allocTy(.err), .range = null };
@@ -3107,16 +4690,18 @@ const Analyzer = struct {
                     const elem: *const Ty = switch (base.ty.*) {
                         .slice => |sl| sl.elem,
                         .collection => |c| c.elem_ty,
+                        .vec => |v| v.elem_ty,
                         .view => |v| switch (v.target.*) {
                             .slice => |sl| sl.elem,
                             .collection => |c| c.elem_ty,
+                            .vec => |vc| vc.elem_ty,
                             else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } }),
                         },
                         else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } }),
                     };
                     const is_mut = switch (base.ty.*) {
                         .slice => |sl| sl.mutable,
-                        .collection => blk: {
+                        .collection, .vec => blk: {
                             if (self.extractRootIdent(ix.target)) |rn| {
                                 if (self.lookupVar(rn)) |vb| {
                                     if (vb.mutable or vb.authorized_paths != null) break :blk true;
@@ -3127,6 +4712,17 @@ const Analyzer = struct {
                         .view => |v| v.mode == .exclusive,
                         else => false,
                     };
+                    if (base.ty.* == .collection or base.ty.* == .vec or
+                        (base.ty.* == .view and (base.ty.view.target.* == .collection or base.ty.view.target.* == .vec)))
+                    {
+                        const ridx_c = recordOfType(elem);
+                        if (ridx_c != null and self.record_defs.items[ridx_c.?].collection_layout != null) {
+                            const cl = self.record_defs.items[ridx_c.?].collection_layout.?;
+                            if (cl == .soa or cl == .aosoa) {
+                                return .{ .ty = try self.allocTy(.{ .collection = .{ .elem_record = ridx_c, .elem_ty = elem } }), .range = null };
+                            }
+                        }
+                    }
                     return .{ .ty = try self.allocTy(.{ .slice = .{ .mutable = is_mut, .elem = elem } }), .range = null };
                 }
                 _ = try self.checkExpr(ix.idx, null);
@@ -3134,9 +4730,11 @@ const Analyzer = struct {
                 const elem: *const Ty = switch (base.ty.*) {
                     .slice => |sl| sl.elem,
                     .collection => |c| c.elem_ty,
+                    .vec => |v| v.elem_ty,
                     .view => |v| switch (v.target.*) {
                         .slice => |sl| sl.elem,
                         .collection => |c| c.elem_ty,
+                        .vec => |vc| vc.elem_ty,
                         else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } }),
                     },
                     else => try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } }),
@@ -3197,17 +4795,47 @@ const Analyzer = struct {
                 if (resolved_ridx) |ridx| {
                     try self.resolved_records.put(self.alloc, expr, ridx);
                     const rdef = self.record_defs.items[ridx];
+                    var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+                    if (expected) |exp| {
+                        if (exp.* == .applied and exp.applied.kind == .record and exp.applied.decl_idx == ridx) {
+                            for (rdef.type_params, 0..) |tp, ti| {
+                                if (ti < exp.applied.args.len) try subst.put(self.alloc, tp, exp.applied.args[ti]);
+                            }
+                        }
+                    }
                     for (rl.fields) |rf_init| {
                         const fnm = rf_init.name.slice(self.source);
                         if (self.findRecordField(ridx, fnm)) |fi| {
-                            const fty = rdef.fields[fi].ty;
+                            const raw_fty = rdef.fields[fi].ty;
+                            const fty = try self.substituteType(raw_fty, &subst);
+                            const has_free = containsUnresolvedTypeVar(fty, &subst);
                             if (rf_init.value) |v| {
-                                const vr = try self.checkExpr(v, fty);
-                                try self.checkAssignmentValue(rf_init.span, fty, vr);
+                                const vr = try self.checkExpr(v, if (has_free) null else fty);
+                                const final_vt = if (has_free) try self.finalizeInferredType(v.getSpan(), vr) else vr.ty;
+                                if (rdef.type_params.len > 0) {
+                                    if (!try self.unifyType(raw_fty, final_vt, &subst)) {
+                                        self.addError(.type_mismatch, rf_init.span, "field value does not match generic record type parameter");
+                                    }
+                                } else {
+                                    try self.checkAssignmentValue(rf_init.span, fty, vr);
+                                }
                             }
                         } else {
                             self.addError(.unknown_ident, rf_init.name, "unknown field in record literal");
                         }
+                    }
+                    if (rdef.type_params.len > 0 or rdef.constraints.len > 0) {
+                        const targs = try self.alloc.alloc(*const Ty, rdef.type_params.len);
+                        for (rdef.type_params, 0..) |tp, ti| {
+                            targs[ti] = subst.get(tp) orelse try self.allocTy(.{ .type_var = tp });
+                        }
+                        const brand = self.resolveBrandForConstraints(rdef.constraints, &subst, rl.span);
+                        return .{ .ty = try self.allocTy(.{ .applied = .{
+                            .kind = .record,
+                            .decl_idx = ridx,
+                            .args = targs,
+                            .brand_inst = brand,
+                        } }), .range = null };
                     }
                     return .{ .ty = try self.allocTy(.{ .record = ridx }), .range = null };
                 }
@@ -3228,6 +4856,7 @@ const Analyzer = struct {
             .list => |ls| {
                 var elem_ty: ?*const Ty = if (expected) |exp| switch (exp.*) {
                     .collection => |c| c.elem_ty,
+                    .vec => |v| v.elem_ty,
                     .slice => |s| s.elem,
                     else => null,
                 } else null;
@@ -3240,7 +4869,7 @@ const Analyzer = struct {
                     }
                 }
                 if (expected) |exp| {
-                    if (exp.* == .collection) {
+                    if (exp.* == .collection or exp.* == .vec) {
                         if (recordOfType(exp)) |ridx| {
                             const cur = self.record_defs.items[ridx].observed_collection_len;
                             self.record_defs.items[ridx].observed_collection_len = if (cur) |c| @max(c, ls.elems.len) else ls.elems.len;
@@ -3660,6 +5289,13 @@ const Analyzer = struct {
                 }
 
                 return .{ .ty = try self.allocTy(.unit), .range = null };
+            },
+            .using_expr => |ue| {
+                const pushed = try self.pushUsingInstances(ue.span, ue.instances);
+                defer if (pushed) {
+                    _ = self.active_using_stack.pop();
+                };
+                return try self.checkExpr(ue.target, expected);
             },
             .todo_expr => |td| {
                 if (td.message) |m| _ = try self.checkExpr(m, try self.allocTy(.string));
@@ -4229,10 +5865,64 @@ const Analyzer = struct {
                 try self.collectFreeRefsBlockScoped(&vw.body, locals, out);
             },
             .fork_expr => |fk| for (fk.branches) |*br| try self.collectFreeRefsBlockScoped(br, locals, out),
+            .using_expr => |ue| try self.collectFreeRefsExprScoped(ue.target, locals, out),
             .todo_expr => |td| if (td.message) |m| try self.collectFreeRefsExprScoped(m, locals, out),
             .panic_expr => |pn| if (pn.message) |m| try self.collectFreeRefsExprScoped(m, locals, out),
             else => {},
         }
+    }
+
+    fn pushUsingInstances(self: *Analyzer, span: ast.Span, inst_paths: []const []const ast.Span) std.mem.Allocator.Error!bool {
+        var resolved: std.ArrayList(usize) = .empty;
+        for (inst_paths) |path| {
+            if (path.len == 0) continue;
+            const tail_name = path[path.len - 1].slice(self.source);
+            var found: ?usize = null;
+            if (path.len >= 2) {
+                const qual = path[0].slice(self.source);
+                if (self.resolveImportedModule(self.current_module_id, qual)) |tmod| {
+                    for (self.instance_defs.items, 0..) |id, ii| {
+                        if (id.module_id == tmod and std.mem.eql(u8, id.local_name, tail_name)) {
+                            if (!id.is_pub and tmod != self.current_module_id) {
+                                self.addError(.visibility_error, path[path.len - 1], "cannot use private instance from imported module");
+                            }
+                            found = ii;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (self.instance_defs.items, 0..) |id, ii| {
+                    if (id.module_id == self.current_module_id and std.mem.eql(u8, id.local_name, tail_name)) {
+                        found = ii;
+                        break;
+                    }
+                }
+                if (found == null) {
+                    if (self.memberImportTarget(self.current_module_id, tail_name)) |tmod| {
+                        for (self.instance_defs.items, 0..) |id, ii| {
+                            if (id.module_id == tmod and std.mem.eql(u8, id.local_name, tail_name)) {
+                                if (!id.is_pub and tmod != self.current_module_id) {
+                                    self.addError(.visibility_error, path[0], "cannot use private instance from imported module");
+                                }
+                                found = ii;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (found == null and self.module_slices.len == 0) {
+                    found = self.findInstanceIndex(tail_name);
+                }
+            }
+            if (found) |ii| {
+                try resolved.append(self.alloc, ii);
+            } else {
+                self.addError(.unknown_ident, span, "unknown trait instance in 'using' clause");
+            }
+        }
+        try self.active_using_stack.append(self.alloc, try resolved.toOwnedSlice(self.alloc));
+        return true;
     }
 
     fn checkPipeline(
@@ -4244,6 +5934,22 @@ const Analyzer = struct {
     ) std.mem.Allocator.Error!ExprResult {
         _ = full_expr;
         const left_res = try self.checkExpr(left, null);
+        if (right.* == .using_expr) {
+            const ue = right.using_expr;
+            const pushed = try self.pushUsingInstances(ue.span, ue.instances);
+            defer if (pushed) {
+                _ = self.active_using_stack.pop();
+            };
+            if (ue.target.* == .call) {
+                const cr = try self.checkCall(ue.target, ue.target.call.span, ue.target.call.callee, ue.target.call.args, left_res, left, expected);
+                try self.expr_types.put(self.alloc, ue.target, cr.ty);
+                try self.expr_types.put(self.alloc, right, cr.ty);
+                return cr;
+            }
+            const ur = try self.checkExpr(ue.target, expected);
+            try self.expr_types.put(self.alloc, right, ur.ty);
+            return ur;
+        }
         if (right.* == .call) {
             const call_res = try self.checkCall(right, right.call.span, right.call.callee, right.call.args, left_res, left, expected);
             try self.expr_types.put(self.alloc, right, call_res.ty);
@@ -4361,22 +6067,709 @@ const Analyzer = struct {
         return .{ .ty = try self.allocTy(.{ .fn_ty = .{ .params = ps, .ret = ret, .is_once = lam.is_once } }), .range = null };
     }
 
+    fn hktNameFromTy(self: *const Analyzer, ty: *const Ty) ?[]const u8 {
+        return switch (ty.*) {
+            .option => "Option",
+            .applied => |ap| switch (ap.kind) {
+                .record => self.record_defs.items[ap.decl_idx].name,
+                .adt => self.adt_defs.items[ap.decl_idx].name,
+                .opaque_ty => self.opaque_defs.items[ap.decl_idx].name,
+            },
+            .hkt_app => |ha| ha.ctor,
+            else => null,
+        };
+    }
+
+    fn instantiateReturnBrand(self: *Analyzer, ty: *const Ty, witnesses: []const ResolvedWitness) std.mem.Allocator.Error!*const Ty {
+        if (witnesses.len == 0) return ty;
+        if (ty.* == .applied) {
+            const ap = ty.applied;
+            var new_brand = ap.brand_inst;
+            var changed = false;
+            if (ap.brand_inst) |b| {
+                if (std.mem.startsWith(u8, b, "__param_")) {
+                    const pidx = std.fmt.parseInt(usize, b["__param_".len..], 10) catch null;
+                    if (pidx) |pi| {
+                        if (pi < witnesses.len) {
+                            new_brand = switch (witnesses[pi]) {
+                                .concrete => |cw| self.instance_defs.items[cw.inst_idx].name,
+                                .param => |op| try std.fmt.allocPrint(self.alloc, "__param_{d}", .{op}),
+                            };
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if (changed) {
+                return try self.allocTy(.{ .applied = .{
+                    .kind = ap.kind,
+                    .decl_idx = ap.decl_idx,
+                    .args = ap.args,
+                    .brand_inst = new_brand,
+                } });
+            }
+        }
+        return ty;
+    }
+
+    fn resolveConstraintsList(
+        self: *Analyzer,
+        cs: []const ResolvedConstraint,
+        subst: *const std.StringHashMapUnmanaged(*const Ty),
+        span: ast.Span,
+    ) std.mem.Allocator.Error![]const ResolvedWitness {
+        var out: std.ArrayList(ResolvedWitness) = .empty;
+        for (cs) |rc| {
+            const tr = self.trait_defs.items[rc.trait_idx];
+            var sub_args = try self.alloc.alloc(*const Ty, rc.args.len);
+            var sub_hkts = try self.alloc.alloc(?[]const u8, rc.args.len);
+            for (rc.args, 0..) |ca, ci| {
+                sub_args[ci] = try self.substituteType(ca, subst);
+                const raw_h = if (ci < rc.hkt_arg_names.len) rc.hkt_arg_names[ci] else null;
+                if (ci < tr.params.len and tr.params[ci].arity >= 1 and raw_h != null) {
+                    const hkey = try std.fmt.allocPrint(self.alloc, "__hkt__{s}", .{raw_h.?});
+                    if (subst.get(hkey)) |bound_ty| {
+                        sub_hkts[ci] = self.hktNameFromTy(bound_ty) orelse raw_h.?;
+                    } else {
+                        sub_hkts[ci] = raw_h.?;
+                    }
+                } else {
+                    sub_hkts[ci] = raw_h;
+                }
+            }
+            if (self.resolveTraitWitness(rc.trait_idx, sub_args, sub_hkts, span, true)) |w| {
+                try out.append(self.alloc, w);
+            }
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn findTraitMethodCandidate(self: *const Analyzer, cname: []const u8, total_args: usize) ?struct { trait_idx: usize, method: TraitMethodDef } {
+        for (self.trait_defs.items, 0..) |tr, ti| {
+            if (self.module_slices.len > 0 and tr.module_id != self.current_module_id and !tr.is_pub) {
+                if (self.memberImportTarget(self.current_module_id, tr.local_name) == null) continue;
+            }
+            for (tr.methods) |m| {
+                if (std.mem.eql(u8, m.name, cname) and m.params.len == total_args) {
+                    return .{ .trait_idx = ti, .method = m };
+                }
+            }
+        }
+        return null;
+    }
+
+    fn tryCheckTraitMethodCall(
+        self: *Analyzer,
+        call_expr: *const ast.Expr,
+        span: ast.Span,
+        cname: []const u8,
+        args: []const ast.CallArg,
+        piped_recv: ?ExprResult,
+        expected: ?*const Ty,
+    ) std.mem.Allocator.Error!?ExprResult {
+        const recv_off: usize = if (piped_recv != null) 1 else 0;
+        const cand = self.findTraitMethodCandidate(cname, args.len + recv_off) orelse return null;
+        const tr = self.trait_defs.items[cand.trait_idx];
+        const m = cand.method;
+
+        var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+        if (expected) |exp| {
+            if (exp.* != .err) {
+                _ = self.unifyType(m.ret, exp, &subst) catch false;
+            }
+        }
+        if (piped_recv) |pr| {
+            if (m.params.len > 0) {
+                if (!try self.unifyType(m.params[0], pr.ty, &subst)) {
+                    self.addError(.type_mismatch, span, "trait method receiver type mismatch");
+                }
+            }
+        }
+        for (args, 0..) |arg, ai| {
+            const pidx = ai + recv_off;
+            const raw_p = m.params[pidx];
+            const ep_sub = try self.substituteType(raw_p, &subst);
+            const has_free = containsUnresolvedTypeVar(ep_sub, &subst);
+            const ar = try self.checkExpr(arg.value, if (has_free) null else ep_sub);
+            const final_ar_ty = if (has_free) try self.finalizeInferredType(arg.value.getSpan(), ar) else ar.ty;
+            if (!try self.unifyType(raw_p, final_ar_ty, &subst)) {
+                self.addError(.type_mismatch, arg.span, "trait method argument type mismatch");
+            }
+        }
+
+        const t_args = try self.alloc.alloc(*const Ty, tr.params.len);
+        const t_hkts = try self.alloc.alloc(?[]const u8, tr.params.len);
+        for (tr.params, 0..) |tp, pi| {
+            if (tp.arity >= 1) {
+                const hkey = try std.fmt.allocPrint(self.alloc, "__hkt__{s}", .{tp.name});
+                if (subst.get(hkey)) |hty| {
+                    t_hkts[pi] = self.hktNameFromTy(hty);
+                } else {
+                    t_hkts[pi] = if (self.isHKTActive(tp.name)) tp.name else null;
+                }
+                t_args[pi] = try self.allocTy(.{ .type_var = tp.name });
+            } else {
+                t_hkts[pi] = null;
+                t_args[pi] = subst.get(tp.name) orelse try self.allocTy(.{ .type_var = tp.name });
+            }
+        }
+
+        const witness_opt = self.resolveTraitWitness(cand.trait_idx, t_args, t_hkts, span, true);
+        if (witness_opt) |w| {
+            const m_targs = try self.alloc.alloc(*const Ty, m.type_params.len);
+            for (m.type_params, 0..) |tp, ti| {
+                m_targs[ti] = subst.get(tp) orelse try self.allocTy(.{ .type_var = tp });
+            }
+            const empty_ws: []const ResolvedWitness = &.{};
+            try self.call_trait_resolutions.put(self.alloc, call_expr, .{
+                .kind = .{ .trait_method = .{ .method_name = m.name, .witness = w } },
+                .witnesses = empty_ws,
+                .type_args = m_targs,
+            });
+        }
+        const ret_ty = try self.substituteType(m.ret, &subst);
+        return .{ .ty = ret_ty, .range = ret_ty.rangeOf() };
+    }
+
     fn collectionElemTy(ty: *const Ty) ?*const Ty {
         return switch (ty.*) {
             .collection => |c| c.elem_ty,
+            .vec => |v| v.elem_ty,
             .slice => |s| s.elem,
             .view => |v| switch (v.target.*) {
                 .collection => |c| c.elem_ty,
+                .vec => |vc| vc.elem_ty,
                 .slice => |s| s.elem,
                 else => null,
             },
             .path_borrow => |pb| switch (pb.base.*) {
                 .collection => |c| c.elem_ty,
+                .vec => |vc| vc.elem_ty,
                 .slice => |s| s.elem,
                 else => null,
             },
             else => null,
         };
+    }
+
+    fn moduleKeyOf(self: *const Analyzer, mod_id: usize) ?[]const u8 {
+        for (self.module_slices) |sl| {
+            if (sl.module_id == mod_id) return sl.module_key;
+        }
+        return null;
+    }
+
+    const StdModuleNs = enum { vec, map, set, deque, str };
+
+    fn stdModuleNsOfKey(mkey: []const u8) ?StdModuleNs {
+        if (std.mem.eql(u8, mkey, "std/vec")) return .vec;
+        if (std.mem.eql(u8, mkey, "std/map")) return .map;
+        if (std.mem.eql(u8, mkey, "std/set")) return .set;
+        if (std.mem.eql(u8, mkey, "std/deque")) return .deque;
+        if (std.mem.eql(u8, mkey, "std/str")) return .str;
+        return null;
+    }
+
+    fn resolveStdNsForCall(self: *Analyzer, callee: *const ast.Expr) ?struct { ns: StdModuleNs, method: []const u8 } {
+        switch (callee.*) {
+            .field => |fld| {
+                if (fld.target.* != .ident) return null;
+                const qname = fld.target.ident.slice(self.source);
+                const mname = fld.name.slice(self.source);
+                if (self.resolveImportedModule(self.current_module_id, qname)) |target_mod| {
+                    const mkey = self.moduleKeyOf(target_mod) orelse return null;
+                    const ns = stdModuleNsOfKey(mkey) orelse return null;
+                    return .{ .ns = ns, .method = mname };
+                }
+                if (self.lookupVar(qname) == null) {
+                    if (std.mem.eql(u8, qname, "vec")) return .{ .ns = .vec, .method = mname };
+                    if (std.mem.eql(u8, qname, "map")) return .{ .ns = .map, .method = mname };
+                    if (std.mem.eql(u8, qname, "set")) return .{ .ns = .set, .method = mname };
+                    if (std.mem.eql(u8, qname, "deque")) return .{ .ns = .deque, .method = mname };
+                    if (std.mem.eql(u8, qname, "str")) return .{ .ns = .str, .method = mname };
+                }
+                return null;
+            },
+            .ident => |sp| {
+                const mname = sp.slice(self.source);
+                if (self.memberImportTarget(self.current_module_id, mname)) |target_mod| {
+                    const mkey = self.moduleKeyOf(target_mod) orelse return null;
+                    const ns = stdModuleNsOfKey(mkey) orelse return null;
+                    return .{ .ns = ns, .method = mname };
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn extractDynVecBorrowRoot(self: *Analyzer, expr: *const ast.Expr) ?[]const u8 {
+        switch (expr.*) {
+            .index => |ix| {
+                if (self.extractRootIdent(ix.target)) |rn| {
+                    if (self.lookupVar(rn)) |vb| {
+                        if (vb.ty.* == .vec or (vb.ty.* == .view and vb.ty.view.target.* == .vec)) return rn;
+                    }
+                }
+                return null;
+            },
+            .call => |c| {
+                if (self.resolveStdNsForCall(c.callee)) |info| {
+                    if (info.ns == .vec and (std.mem.eql(u8, info.method, "as_slice") or std.mem.eql(u8, info.method, "as_collection")) and c.args.len >= 1) {
+                        return self.extractRootIdent(c.args[0].value);
+                    }
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn attachSharedBorrowBinding(
+        self: *Analyzer,
+        vb: *Binding,
+        root_name: []const u8,
+        span: ast.Span,
+    ) std.mem.Allocator.Error!void {
+        _ = span;
+        const vid = self.next_view_id;
+        self.next_view_id += 1;
+        try self.active_views.append(self.alloc, .{
+            .id = vid,
+            .binding_name = vb.name,
+            .root_name = root_name,
+            .record_idx = null,
+            .field_idx = null,
+            .index_key = null,
+            .perm = .shared,
+            .active = true,
+            .is_sentinel = false,
+            .in_trace = false,
+        });
+        vb.view_id = vid;
+        vb.view_root = root_name;
+    }
+
+    fn checkDynamicContainerMut(
+        self: *Analyzer,
+        span: ast.Span,
+        recv_expr: *const ast.Expr,
+        allow_active_views: bool,
+    ) std.mem.Allocator.Error!bool {
+        const resolved = self.resolveAccessRoot(recv_expr);
+        const rn = resolved.root_name orelse {
+            self.addError(.mutability_error, span, "dynamic container mutation requires a mutable binding or Exclusive View");
+            return false;
+        };
+        const vb = self.lookupVar(rn) orelse return false;
+        if (vb.moved) {
+            self.addError(.use_after_move, recv_expr.getSpan(), "use of moved dynamic container");
+            return false;
+        }
+        const is_excl_view = vb.ty.* == .view and vb.ty.view.mode == .exclusive;
+        const is_shared_view = vb.ty.* == .view and vb.ty.view.mode == .shared;
+        if (is_shared_view) {
+            self.addError(.borrow_conflict, span, "cannot mutate or reallocate dynamic container through a shared View");
+            return false;
+        }
+        if (!vb.mutable and !is_excl_view) {
+            self.addError(.mutability_error, span, "cannot mutate immutable dynamic container; mark binding 'mut'");
+            return false;
+        }
+        if (!allow_active_views) {
+            for (self.active_views.items) |av| {
+                if (!av.active) continue;
+                if (std.mem.eql(u8, av.root_name, rn)) {
+                    self.addError(.borrow_conflict, span, "cannot grow, shrink, or reallocate dynamic container while an active view borrows from it");
+                    return false;
+                }
+            }
+        }
+        try self.recordAccess(rn, recordOfType(vb.ty), null, true, span, null, resolved.through_view_id);
+        return true;
+    }
+
+    fn recordDynamicContainerRead(self: *Analyzer, span: ast.Span, recv_expr: *const ast.Expr) std.mem.Allocator.Error!void {
+        const resolved = self.resolveAccessRoot(recv_expr);
+        if (resolved.root_name) |rn| {
+            if (self.lookupVar(rn)) |vb| {
+                try self.recordAccess(rn, recordOfType(vb.ty), null, false, span, null, resolved.through_view_id);
+            }
+        }
+    }
+
+    fn tryCheckStdIntrinsicCall(
+        self: *Analyzer,
+        call_expr: *const ast.Expr,
+        span: ast.Span,
+        callee: *const ast.Expr,
+        args: []const ast.CallArg,
+        piped_recv: ?ExprResult,
+        piped_recv_expr: ?*const ast.Expr,
+        expected: ?*const Ty,
+    ) std.mem.Allocator.Error!?ExprResult {
+        const ns_info = self.resolveStdNsForCall(callee) orelse return null;
+        const mname = ns_info.method;
+        const unit_ty = try self.allocTy(.unit);
+        const bool_ty = try self.allocTy(.bool);
+        const u64_ty = try self.allocTy(.{ .int = .{ .signed = false, .bits = 64 } });
+        const u8_ty = try self.allocTy(.{ .int = .{ .signed = false, .bits = 8 } });
+        const str_ty = try self.allocTy(.string);
+
+        switch (ns_info.ns) {
+            .str => {
+                const recv_offset: usize = if (piped_recv != null) 0 else 1;
+                const s0_res = piped_recv orelse blk: {
+                    if (args.len < 1) return null;
+                    break :blk try self.checkExpr(args[0].value, str_ty);
+                };
+                try self.checkAssignmentValue(span, str_ty, s0_res);
+                if (std.mem.eql(u8, mname, "len") and args.len == recv_offset) {
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_len, .container_ty = str_ty });
+                    return .{ .ty = u64_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "is_empty") and args.len == recv_offset) {
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_is_empty, .container_ty = str_ty });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "eq") and args.len == recv_offset + 1) {
+                    const s1 = try self.checkExpr(args[recv_offset].value, str_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, str_ty, s1);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_eq, .container_ty = str_ty });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "concat") and args.len == recv_offset + 1) {
+                    const s1 = try self.checkExpr(args[recv_offset].value, str_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, str_ty, s1);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_concat, .container_ty = str_ty });
+                    return .{ .ty = str_ty, .range = null };
+                } else if ((std.mem.eql(u8, mname, "starts_with") or std.mem.eql(u8, mname, "ends_with") or std.mem.eql(u8, mname, "contains")) and args.len == recv_offset + 1) {
+                    const s1 = try self.checkExpr(args[recv_offset].value, str_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, str_ty, s1);
+                    const kind: StdIntrinsicKind = if (std.mem.eql(u8, mname, "starts_with"))
+                        .str_starts_with
+                    else if (std.mem.eql(u8, mname, "ends_with"))
+                        .str_ends_with
+                    else
+                        .str_contains;
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = kind, .container_ty = str_ty });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "byte_at") and args.len == recv_offset + 1) {
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_byte_at, .container_ty = str_ty });
+                    return .{ .ty = try self.allocTy(.{ .option = u8_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "slice_bytes") and args.len == recv_offset + 2) {
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    _ = try self.checkExpr(args[recv_offset + 1].value, null);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_slice_bytes, .container_ty = str_ty });
+                    return .{ .ty = str_ty, .range = null };
+                }
+                return null;
+            },
+            .vec => {
+                if (piped_recv == null and (std.mem.eql(u8, mname, "new") or std.mem.eql(u8, mname, "with_capacity"))) {
+                    const is_cap = std.mem.eql(u8, mname, "with_capacity");
+                    if ((is_cap and args.len != 1) or (!is_cap and args.len != 0)) {
+                        self.addError(.type_mismatch, span, "invalid argument count for vec constructor");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
+                    if (is_cap) _ = try self.checkExpr(args[0].value, null);
+                    if (expected != null and expected.?.* == .vec) {
+                        try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                            .kind = if (is_cap) .vec_with_capacity else .vec_new,
+                            .container_ty = expected.?,
+                        });
+                        return .{ .ty = expected.?, .range = null };
+                    }
+                    self.addError(.type_mismatch, span, "cannot infer element type of vec constructor; add annotation like 'let mut xs: Vec(u32) = vec.new()'");
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const recv_offset: usize = if (piped_recv != null) 0 else 1;
+                if (piped_recv == null and args.len < 1) return null;
+                const recv_expr = piped_recv_expr orelse args[0].value;
+                const recv_res = piped_recv orelse try self.checkExpr(args[0].value, null);
+                const recv_is_ptr = recv_res.ty.* == .view;
+                const inner_ty = if (recv_res.ty.* == .view) recv_res.ty.view.target else recv_res.ty;
+                if (inner_ty.* != .vec) {
+                    if (inner_ty.* != .err) {
+                        self.addError(.type_mismatch, recv_expr.getSpan(), "vec operation requires a Vec(T) or View(Vec(T), ...)");
+                    }
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const elem_ty = inner_ty.vec.elem_ty;
+
+                if (std.mem.eql(u8, mname, "len") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_len, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = u64_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "capacity") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_capacity, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = u64_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "is_empty") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_is_empty, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "get") and args.len == recv_offset + 1) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_get, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .option = elem_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "as_slice") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_as_slice, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .slice = .{ .mutable = false, .elem = elem_ty } }), .range = null };
+                } else if (std.mem.eql(u8, mname, "as_collection") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    const col_ty = try self.allocTy(.{ .collection = .{ .elem_record = inner_ty.vec.elem_record, .elem_ty = elem_ty } });
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_as_collection, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = col_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "push") and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    const vr = try self.checkExpr(args[recv_offset].value, elem_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, elem_ty, vr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_push, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = unit_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "pop") and args.len == recv_offset) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_pop, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .option = elem_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "set") and args.len == recv_offset + 2) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, true);
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    const vr = try self.checkExpr(args[recv_offset + 1].value, elem_ty);
+                    try self.checkAssignmentValue(args[recv_offset + 1].span, elem_ty, vr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_set, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "swap_remove") and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_swap_remove, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .option = elem_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "reserve") and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_reserve, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = unit_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "clear") and args.len == recv_offset) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_clear, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = unit_ty, .range = null };
+                }
+                return null;
+            },
+            .map => {
+                if (piped_recv == null and (std.mem.eql(u8, mname, "new") or std.mem.eql(u8, mname, "with_capacity"))) {
+                    const is_cap = std.mem.eql(u8, mname, "with_capacity");
+                    if ((is_cap and args.len != 1) or (!is_cap and args.len != 0)) {
+                        self.addError(.type_mismatch, span, "invalid argument count for map constructor");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
+                    if (is_cap) _ = try self.checkExpr(args[0].value, null);
+                    if (expected != null and expected.?.* == .map) {
+                        try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                            .kind = if (is_cap) .map_with_capacity else .map_new,
+                            .container_ty = expected.?,
+                        });
+                        return .{ .ty = expected.?, .range = null };
+                    }
+                    self.addError(.type_mismatch, span, "cannot infer Map(K, V) type; add annotation like 'let mut m: Map(String, u32) = map.new()'");
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const recv_offset: usize = if (piped_recv != null) 0 else 1;
+                if (piped_recv == null and args.len < 1) return null;
+                const recv_expr = piped_recv_expr orelse args[0].value;
+                const recv_res = piped_recv orelse try self.checkExpr(args[0].value, null);
+                const recv_is_ptr = recv_res.ty.* == .view;
+                const inner_ty = if (recv_res.ty.* == .view) recv_res.ty.view.target else recv_res.ty;
+                if (inner_ty.* != .map) {
+                    if (inner_ty.* != .err) {
+                        self.addError(.type_mismatch, recv_expr.getSpan(), "map operation requires a Map(K, V) or View(Map(K, V), ...)");
+                    }
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const key_ty = inner_ty.map.key_ty;
+                const val_ty = inner_ty.map.val_ty;
+
+                if (std.mem.eql(u8, mname, "len") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .map_len, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = u64_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "is_empty") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .map_is_empty, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "get") and args.len == recv_offset + 1) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    const kr = try self.checkExpr(args[recv_offset].value, key_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, key_ty, kr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .map_get, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .option = val_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "contains") and args.len == recv_offset + 1) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    const kr = try self.checkExpr(args[recv_offset].value, key_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, key_ty, kr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .map_contains, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if ((std.mem.eql(u8, mname, "insert") or std.mem.eql(u8, mname, "put")) and args.len == recv_offset + 2) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    const kr = try self.checkExpr(args[recv_offset].value, key_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, key_ty, kr);
+                    const vr = try self.checkExpr(args[recv_offset + 1].value, val_ty);
+                    try self.checkAssignmentValue(args[recv_offset + 1].span, val_ty, vr);
+                    const is_put = std.mem.eql(u8, mname, "put");
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                        .kind = if (is_put) .map_put else .map_insert,
+                        .container_ty = inner_ty,
+                        .recv_is_ptr = recv_is_ptr,
+                    });
+                    return .{ .ty = if (is_put) unit_ty else try self.allocTy(.{ .option = val_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "remove") and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    const kr = try self.checkExpr(args[recv_offset].value, key_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, key_ty, kr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .map_remove, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .option = val_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "clear") and args.len == recv_offset) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .map_clear, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = unit_ty, .range = null };
+                }
+                return null;
+            },
+            .set => {
+                if (piped_recv == null and (std.mem.eql(u8, mname, "new") or std.mem.eql(u8, mname, "with_capacity"))) {
+                    const is_cap = std.mem.eql(u8, mname, "with_capacity");
+                    if ((is_cap and args.len != 1) or (!is_cap and args.len != 0)) {
+                        self.addError(.type_mismatch, span, "invalid argument count for set constructor");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
+                    if (is_cap) _ = try self.checkExpr(args[0].value, null);
+                    if (expected != null and expected.?.* == .set) {
+                        try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                            .kind = if (is_cap) .set_with_capacity else .set_new,
+                            .container_ty = expected.?,
+                        });
+                        return .{ .ty = expected.?, .range = null };
+                    }
+                    self.addError(.type_mismatch, span, "cannot infer Set(T) element type; add annotation like 'let mut s: Set(u32) = set.new()'");
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const recv_offset: usize = if (piped_recv != null) 0 else 1;
+                if (piped_recv == null and args.len < 1) return null;
+                const recv_expr = piped_recv_expr orelse args[0].value;
+                const recv_res = piped_recv orelse try self.checkExpr(args[0].value, null);
+                const recv_is_ptr = recv_res.ty.* == .view;
+                const inner_ty = if (recv_res.ty.* == .view) recv_res.ty.view.target else recv_res.ty;
+                if (inner_ty.* != .set) {
+                    if (inner_ty.* != .err) {
+                        self.addError(.type_mismatch, recv_expr.getSpan(), "set operation requires a Set(T) or View(Set(T), ...)");
+                    }
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const elem_ty = inner_ty.set.elem_ty;
+
+                if (std.mem.eql(u8, mname, "len") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .set_len, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = u64_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "is_empty") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .set_is_empty, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "contains") and args.len == recv_offset + 1) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    const er = try self.checkExpr(args[recv_offset].value, elem_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, elem_ty, er);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .set_contains, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "insert") and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    const er = try self.checkExpr(args[recv_offset].value, elem_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, elem_ty, er);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .set_insert, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "remove") and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    const er = try self.checkExpr(args[recv_offset].value, elem_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, elem_ty, er);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .set_remove, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "clear") and args.len == recv_offset) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .set_clear, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = unit_ty, .range = null };
+                }
+                return null;
+            },
+            .deque => {
+                if (piped_recv == null and (std.mem.eql(u8, mname, "new") or std.mem.eql(u8, mname, "with_capacity"))) {
+                    const is_cap = std.mem.eql(u8, mname, "with_capacity");
+                    if ((is_cap and args.len != 1) or (!is_cap and args.len != 0)) {
+                        self.addError(.type_mismatch, span, "invalid argument count for deque constructor");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
+                    if (is_cap) _ = try self.checkExpr(args[0].value, null);
+                    if (expected != null and expected.?.* == .deque) {
+                        try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                            .kind = if (is_cap) .deque_with_capacity else .deque_new,
+                            .container_ty = expected.?,
+                        });
+                        return .{ .ty = expected.?, .range = null };
+                    }
+                    self.addError(.type_mismatch, span, "cannot infer Deque(T) element type; add annotation like 'let mut dq: Deque(i32) = deque.new()'");
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const recv_offset: usize = if (piped_recv != null) 0 else 1;
+                if (piped_recv == null and args.len < 1) return null;
+                const recv_expr = piped_recv_expr orelse args[0].value;
+                const recv_res = piped_recv orelse try self.checkExpr(args[0].value, null);
+                const recv_is_ptr = recv_res.ty.* == .view;
+                const inner_ty = if (recv_res.ty.* == .view) recv_res.ty.view.target else recv_res.ty;
+                if (inner_ty.* != .deque) {
+                    if (inner_ty.* != .err) {
+                        self.addError(.type_mismatch, recv_expr.getSpan(), "deque operation requires a Deque(T) or View(Deque(T), ...)");
+                    }
+                    return .{ .ty = try self.allocTy(.err), .range = null };
+                }
+                const elem_ty = inner_ty.deque.elem_ty;
+
+                if (std.mem.eql(u8, mname, "len") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .deque_len, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = u64_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "is_empty") and args.len == recv_offset) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .deque_is_empty, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = bool_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "get") and args.len == recv_offset + 1) {
+                    try self.recordDynamicContainerRead(span, recv_expr);
+                    _ = try self.checkExpr(args[recv_offset].value, null);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .deque_get, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .option = elem_ty }), .range = null };
+                } else if ((std.mem.eql(u8, mname, "push_back") or std.mem.eql(u8, mname, "push_front")) and args.len == recv_offset + 1) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    const er = try self.checkExpr(args[recv_offset].value, elem_ty);
+                    try self.checkAssignmentValue(args[recv_offset].span, elem_ty, er);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                        .kind = if (std.mem.eql(u8, mname, "push_back")) .deque_push_back else .deque_push_front,
+                        .container_ty = inner_ty,
+                        .recv_is_ptr = recv_is_ptr,
+                    });
+                    return .{ .ty = unit_ty, .range = null };
+                } else if ((std.mem.eql(u8, mname, "pop_front") or std.mem.eql(u8, mname, "pop_back")) and args.len == recv_offset) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
+                        .kind = if (std.mem.eql(u8, mname, "pop_front")) .deque_pop_front else .deque_pop_back,
+                        .container_ty = inner_ty,
+                        .recv_is_ptr = recv_is_ptr,
+                    });
+                    return .{ .ty = try self.allocTy(.{ .option = elem_ty }), .range = null };
+                } else if (std.mem.eql(u8, mname, "clear") and args.len == recv_offset) {
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, false);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .deque_clear, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = unit_ty, .range = null };
+                }
+                return null;
+            },
+        }
     }
 
     fn checkCall(
@@ -4397,9 +6790,21 @@ const Analyzer = struct {
             return .{ .ty = try self.allocTy(.unit), .range = null };
         }
 
+        // Standard library compiler-managed dynamic containers & String intrinsics (`std/vec`, `std/map`, `std/set`, `std/deque`, `std/str`).
+        if (try self.tryCheckStdIntrinsicCall(call_expr, span, callee, args, piped_recv, piped_recv_expr, expected)) |std_res| {
+            return std_res;
+        }
+
         // Special-case collection/option/result higher-order combinators (`map_in_place`, `fold`, `map`, `and_then`, `unwrap_or`, `ok_or`).
         if (callee.* == .ident) {
             const cname = callee.ident.slice(self.source);
+            if (self.active_using_stack.items.len > 0) {
+                if (self.findTraitMethodCandidate(cname, args.len + (if (piped_recv != null) @as(usize, 1) else 0)) != null) {
+                    if (try self.tryCheckTraitMethodCall(call_expr, span, cname, args, piped_recv, expected)) |tres| {
+                        return tres;
+                    }
+                }
+            }
             if (std.mem.eql(u8, cname, "map_in_place") and piped_recv != null and args.len == 1 and args[0].value.* == .lambda) {
                 const lam = args[0].value.lambda;
                 if (recordOfType(piped_recv.?.ty)) |ridx| {
@@ -4565,9 +6970,10 @@ const Analyzer = struct {
             try self.resolved_fn_calls.put(self.alloc, callee, fsig.name);
             const recv_offset: usize = if (piped_recv != null) 1 else 0;
             var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
+            const is_poly_fn = fsig.type_params.len > 0 or fsig.hkt_params.len > 0;
             if (piped_recv) |pr| {
                 if (fsig.params.len > 0) {
-                    if (fsig.type_params.len > 0) {
+                    if (is_poly_fn) {
                         if (!try self.unifyType(fsig.params[0], pr.ty, &subst)) {
                             self.addError(.type_mismatch, span, "generic receiver type mismatch");
                         }
@@ -4579,7 +6985,7 @@ const Analyzer = struct {
             for (args, 0..) |arg, ai| {
                 const param_idx = ai + recv_offset;
                 const expected_p = if (param_idx < fsig.params.len) fsig.params[param_idx] else null;
-                if (fsig.type_params.len > 0 and expected_p != null) {
+                if (is_poly_fn and expected_p != null) {
                     const ep_sub = try self.substituteType(expected_p.?, &subst);
                     const has_free = containsUnresolvedTypeVar(ep_sub, &subst);
                     const ar = try self.checkExpr(arg.value, if (has_free) null else ep_sub);
@@ -4619,6 +7025,22 @@ const Analyzer = struct {
                     concrete[ti] = subst.get(tp) orelse try self.allocTy(.{ .type_var = tp });
                 }
                 try self.call_type_args.put(self.alloc, call_expr, concrete);
+            }
+            var resolved_ws: []const ResolvedWitness = &.{};
+            if (fsig.constraints.len > 0 or fsig.hkt_params.len > 0) {
+                resolved_ws = try self.resolveConstraintsList(fsig.constraints, &subst, span);
+                const hkt_concrete = try self.alloc.alloc(?[]const u8, fsig.hkt_params.len);
+                for (fsig.hkt_params, 0..) |hp, hi| {
+                    const hkey = try std.fmt.allocPrint(self.alloc, "__hkt__{s}", .{hp});
+                    hkt_concrete[hi] = if (subst.get(hkey)) |bt| self.hktNameFromTy(bt) else hp;
+                }
+                const fn_targs = self.call_type_args.get(call_expr) orelse &.{};
+                try self.call_trait_resolutions.put(self.alloc, call_expr, .{
+                    .kind = .{ .constrained_fn = fsig.name },
+                    .witnesses = resolved_ws,
+                    .type_args = fn_targs,
+                    .hkt_args = hkt_concrete,
+                });
             }
             if (fsig.is_extern) {
                 try self.checkRustFFISliceAliasing(span, fsig.params, piped_recv_expr, args);
@@ -4678,8 +7100,15 @@ const Analyzer = struct {
                 for (args, 0..) |a, ai| arg_exprs[ai] = a.value;
                 try self.verifyRecursiveDecreasesCall(span, arg_exprs);
             }
-            const final_ret = if (fsig.type_params.len > 0) try self.substituteType(fsig.ret, &subst) else fsig.ret;
+            const raw_ret = if (fsig.type_params.len > 0 or fsig.hkt_params.len > 0) try self.substituteType(fsig.ret, &subst) else fsig.ret;
+            const final_ret = try self.instantiateReturnBrand(raw_ret, resolved_ws);
             return .{ .ty = final_ret, .range = final_ret.rangeOf() };
+        }
+
+        if (callee.* == .ident and self.lookupVar(callee.ident.slice(self.source)) == null) {
+            if (try self.tryCheckTraitMethodCall(call_expr, span, callee.ident.slice(self.source), args, piped_recv, expected)) |tres| {
+                return tres;
+            }
         }
 
         if (callee.* == .upper_ident) {
@@ -5988,14 +8417,19 @@ const Analyzer = struct {
                     .is_subbyte_packable = info.packable,
                 };
             }
-            const base_planned = try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
+            const base_planned = if (rdef.is_flat_c)
+                try layout.planFlatCLayout(self.alloc, schemas)
+            else
+                try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
 
             var hot_count: usize = 0;
             var hot_bytes: usize = 0;
-            for (rdef.hot_fields, 0..) |is_h, fi| {
-                if (is_h) {
-                    hot_count += 1;
-                    hot_bytes += @max(@as(usize, 1), schemas[fi].addressable_size);
+            if (!rdef.is_flat_c) {
+                for (rdef.hot_fields, 0..) |is_h, fi| {
+                    if (is_h) {
+                        hot_count += 1;
+                        hot_bytes += @max(@as(usize, 1), schemas[fi].addressable_size);
+                    }
                 }
             }
 
@@ -6014,7 +8448,7 @@ const Analyzer = struct {
             }
 
             var final_planned = base_planned;
-            if (hot_count > 0 and hot_count < rdef.fields.len and rdef.fields.len > 1) {
+            if (!rdef.is_flat_c and hot_count > 0 and hot_count < rdef.fields.len and rdef.fields.len > 1) {
                 const orig_indices = try self.alloc.alloc(usize, rdef.fields.len);
                 for (orig_indices, 0..) |*idx_slot, fi| idx_slot.* = fi;
                 const reordered_idx = try layout.reorderHotFieldsFirst(usize, self.alloc, orig_indices, rdef.hot_fields);
@@ -6049,6 +8483,7 @@ const Analyzer = struct {
                 .collection_layout = rdef.collection_layout,
                 .hot_fields = rdef.hot_fields,
                 .auto_layout_decision = auto_decision,
+                .is_flat_c = rdef.is_flat_c,
             };
             if (rdef.collection_layout) |cl| {
                 if (!self.hasCollectionNamed(rdef.name)) {
@@ -6058,6 +8493,13 @@ const Analyzer = struct {
                         .field_count = @max(@as(usize, 1), rdef.fields.len),
                     });
                 }
+            }
+            if (rdef.used_in_dyn_vec) {
+                try self.checked_dyn_vecs.append(self.alloc, .{
+                    .name = rdef.name,
+                    .layout = rdef.collection_layout orelse .aos,
+                    .field_count = @max(@as(usize, 1), rdef.fields.len),
+                });
             }
         }
         return out;
@@ -6149,6 +8591,7 @@ const Analyzer = struct {
         for (self.module.decls) |decl| {
             if (decl.kind == .fn_decl) {
                 const fd = decl.kind.fn_decl;
+                if (!fd.has_body) continue;
                 const cname = self.decl_canonical_names.get(decl.span.start) orelse fd.name.slice(self.source);
                 try list.append(self.alloc, .{
                     .name = cname,
@@ -6182,6 +8625,15 @@ const Analyzer = struct {
             .bool => return .{ .name = name, .kind = .bool_ty },
             .int => |it| return .{ .name = name, .kind = .{ .int_ty = .{ .int_ty = it, .range = inner.rangeOf() } } },
             .int_range => |ir| return .{ .name = name, .kind = .{ .int_ty = .{ .int_ty = ir.synthesized, .range = ir.range } } },
+            .option => return .{ .name = name, .kind = .option_ty },
+            .fn_ty => |ft| {
+                if (ft.ret.* == .option) return .{ .name = name, .kind = .fn_opt_ty };
+                return .{ .name = name, .kind = .fn_scalar_ty };
+            },
+            .type_var => {
+                const it = IntType{ .signed = false, .bits = 8 };
+                return .{ .name = name, .kind = .{ .int_ty = .{ .int_ty = it, .range = IntRange.ofType(it) } } };
+            },
             .record => |ridx| {
                 const rdef = self.record_defs.items[ridx];
                 var fs = try self.alloc.alloc(law_verifier.ParamFieldInfo, rdef.fields.len);
@@ -6479,6 +8931,167 @@ const Analyzer = struct {
                 .symbolic_certs = try sym_certs.toOwnedSlice(self.alloc),
             });
         }
+
+        try self.checkInstanceLaws(fn_asts, rec_infos);
+    }
+
+    fn checkInstanceLaws(
+        self: *Analyzer,
+        mod_fns: []const law_verifier.FnAstEntry,
+        rec_infos: []const law_verifier.RecordAstInfo,
+    ) std.mem.Allocator.Error!void {
+        const dummy2 = try self.alloc.alloc(ast.Param, 2);
+        @memset(dummy2, ast.Param{ .span = .{ .start = 0, .end = 0 }, .label = null, .mutable = false, .name = .{ .start = 0, .end = 0 }, .ty = null });
+        const empty_blk = ast.Block{ .span = .{ .start = 0, .end = 0 }, .attrs = &.{}, .stmts = &.{}, .tail = null };
+
+        for (self.instance_defs.items) |inst| {
+            if (inst.is_external_rust or inst.type_params.len > 0) continue;
+
+            var inst_fns: std.ArrayList(law_verifier.FnAstEntry) = .empty;
+            for (inst.methods) |cm| {
+                if (cm.ast_method) |im| {
+                    try inst_fns.append(self.alloc, .{
+                        .name = cm.local_name,
+                        .params = im.params,
+                        .body = im.body,
+                        .synth = cm.synth,
+                    });
+                } else if (cm.synth != .none) {
+                    try inst_fns.append(self.alloc, .{
+                        .name = cm.local_name,
+                        .params = dummy2,
+                        .body = empty_blk,
+                        .synth = cm.synth,
+                    });
+                }
+            }
+            for (mod_fns) |mf| try inst_fns.append(self.alloc, mf);
+            const all_fns = try inst_fns.toOwnedSlice(self.alloc);
+
+            var all_laws: std.ArrayList(TraitLawDef) = .empty;
+            try self.collectTraitAndSuperLaws(inst.trait_idx, &all_laws);
+            const subst = try self.buildTraitSubstMap(inst.trait_idx, inst.target_tys, inst.target_hkt_names);
+
+            const tdef_main = self.trait_defs.items[inst.trait_idx];
+            const hkt_mark = self.active_hkt_params.items.len;
+            for (tdef_main.params) |tp| {
+                if (tp.arity >= 1) try self.active_hkt_params.append(self.alloc, tp.name);
+            }
+            defer self.active_hkt_params.shrinkRetainingCapacity(hkt_mark);
+
+            for (all_laws.items) |tlw| {
+                const lw = tlw.law;
+                const lname = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ inst.name, lw.name.slice(self.source) });
+                var param_domains = try self.alloc.alloc(law_verifier.LawParamDomain, lw.params.len);
+                var sym_ctx = law_verifier.SymCtx{
+                    .alloc = self.alloc,
+                    .source = self.source,
+                    .fns = all_fns,
+                    .resolved_calls = null,
+                };
+                for (lw.params, 0..) |p, pi| {
+                    const raw_pty = if (p.ty) |t| try self.resolveType(t) else try self.allocTy(.err);
+                    const sub_pty = try self.substituteType(raw_pty, &subst);
+                    const pname = p.name.slice(self.source);
+                    param_domains[pi] = try self.tyToParamDomain(pname, sub_pty);
+                    const nn = if (isTyNonNegativeNat(sub_pty)) |nni| nni.non_neg else false;
+                    _ = sym_ctx.bindVar(pname, nn);
+                }
+
+                var guards_ast: std.ArrayList(*const ast.Expr) = .empty;
+                var sym_certs: std.ArrayList(law_verifier.SymbolicLawCert) = .empty;
+                var has_claim = false;
+                var all_proved = lw.clauses.len > 0;
+                var falsified = false;
+                var tier1_ok = false;
+                var tier2_ok = false;
+                var tier1_max_states: usize = 0;
+                var first_counterexample: ?[]const u8 = null;
+
+                for (lw.clauses, 0..) |cl, ci| {
+                    switch (cl) {
+                        .when => |wh| try guards_ast.append(self.alloc, wh.expr),
+                        .always, .never, .expr => {
+                            has_claim = true;
+                            const is_never = (cl == .never);
+                            const cl_span = switch (cl) {
+                                .always => |a| a.span,
+                                .never => |n| n.span,
+                                .expr => |e| e.span,
+                                else => unreachable,
+                            };
+                            const goal_expr = switch (cl) {
+                                .always => |a| a.expr,
+                                .never => |n| n.expr,
+                                .expr => |e| e.expr,
+                                else => unreachable,
+                            };
+                            if (law_verifier.tryProveSymbolicClause(self.alloc, &sym_ctx, guards_ast.items, goal_expr, is_never)) |sym_ok| {
+                                tier2_ok = true;
+                                const cert_name = if (lw.clauses.len <= 1)
+                                    lname
+                                else
+                                    try std.fmt.allocPrint(self.alloc, "{s}__c{d}", .{ lname, ci });
+                                try sym_certs.append(self.alloc, .{
+                                    .name = cert_name,
+                                    .kind = if (is_never) .never else .always,
+                                    .hyps = sym_ok.hyps,
+                                    .goal = sym_ok.goal,
+                                    .is_trait_law = true,
+                                });
+                                continue;
+                            }
+                            switch (law_verifier.runTier1ClauseResolved(self.alloc, self.source, all_fns, rec_infos, null, param_domains, guards_ast.items, goal_expr, is_never)) {
+                                .proved_exhaustive => |states| {
+                                    tier1_ok = true;
+                                    tier1_max_states = @max(tier1_max_states, states);
+                                },
+                                .falsified => |witness| {
+                                    falsified = true;
+                                    if (first_counterexample == null) first_counterexample = witness;
+                                    const msg = try std.fmt.allocPrint(self.alloc, "instance '{s}' violates trait law '{s}' at {s}", .{ inst.local_name, lw.name.slice(self.source), witness });
+                                    self.addError(.law_violation, inst.span, msg);
+                                    _ = cl_span;
+                                },
+                                .inconclusive => {
+                                    all_proved = false;
+                                },
+                            }
+                        },
+                        .preserves => {},
+                    }
+                }
+
+                if (!has_claim) all_proved = false;
+                const verdict: LawVerdict = if (falsified)
+                    .falsified
+                else if (!all_proved)
+                    .unverified_symbolic
+                else if (tier2_ok)
+                    .proved_tier2_symbolic
+                else if (tier1_ok)
+                    .proved_tier1_exhaustive
+                else
+                    .unverified_symbolic;
+                const detail: []const u8 = switch (verdict) {
+                    .proved_tier2_symbolic => "Tier 2 (trait law symbolic)",
+                    .proved_tier1_exhaustive => try std.fmt.allocPrint(self.alloc, "Tier 1 (trait law exhaustive, {d} states)", .{tier1_max_states}),
+                    .falsified => if (first_counterexample) |ce|
+                        try std.fmt.allocPrint(self.alloc, "FALSIFIED ({s})", .{ce})
+                    else
+                        "FALSIFIED",
+                    else => "Tier 1 (bounded sample OK)",
+                };
+                try self.checked_laws.append(self.alloc, .{
+                    .name = lname,
+                    .span = inst.span,
+                    .verdict = verdict,
+                    .tier_detail = detail,
+                    .counterexample = first_counterexample,
+                    .symbolic_certs = try sym_certs.toOwnedSlice(self.alloc),
+                });
+            }
+        }
     }
 
     const IntervalTruth = enum {
@@ -6595,12 +9208,55 @@ pub fn analyzeWithModules(
         };
     }
 
+    const checked_traits = try alloc.alloc(CheckedTrait, az.trait_defs.items.len);
+    for (az.trait_defs.items, 0..) |t, ti| {
+        const cmethods = try alloc.alloc(CheckedTraitMethod, t.methods.len);
+        for (t.methods, 0..) |m, mi| {
+            cmethods[mi] = .{ .name = m.name, .params = m.params, .ret = m.ret };
+        }
+        const claws = try alloc.alloc(CheckedTraitLaw, t.laws.len);
+        for (t.laws, 0..) |lw, li| {
+            claws[li] = .{ .name = lw.name.slice(tree.source), .span = lw.span };
+        }
+        checked_traits[ti] = .{
+            .name = t.name,
+            .local_name = t.local_name,
+            .params = t.params,
+            .supers = t.supers,
+            .methods = cmethods,
+            .laws = claws,
+        };
+    }
+
+    const checked_instances = try alloc.alloc(CheckedInstance, az.instance_defs.items.len);
+    for (az.instance_defs.items, 0..) |id, ii| {
+        checked_instances[ii] = .{
+            .name = id.name,
+            .local_name = id.local_name,
+            .module_id = id.module_id,
+            .is_pub = id.is_pub,
+            .is_default = id.is_default,
+            .is_external_rust = id.is_external_rust,
+            .rust_target = id.rust_target,
+            .rust_sym = id.rust_sym,
+            .trait_idx = id.trait_idx,
+            .target_tys = id.target_tys,
+            .target_hkt_names = id.target_hkt_names,
+            .type_params = id.type_params,
+            .hkt_params = id.hkt_params,
+            .constraints = id.constraints,
+            .methods = id.methods,
+            .span = id.span,
+        };
+    }
+
     return .{
         .arena = arena,
         .source = tree.source,
         .records = records,
         .adts = adts,
         .collections = try az.checked_collections.toOwnedSlice(alloc),
+        .dyn_vecs = try az.checked_dyn_vecs.toOwnedSlice(alloc),
         .functions = try az.checked_functions.toOwnedSlice(alloc),
         .laws = try az.checked_laws.toOwnedSlice(alloc),
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
@@ -6613,5 +9269,11 @@ pub fn analyzeWithModules(
         .resolved_idents = az.resolved_idents,
         .resolved_records = az.resolved_records,
         .alias_types = az.type_aliases,
+        .traits = checked_traits,
+        .instances = checked_instances,
+        .foreign_contracts = try az.foreign_contracts.toOwnedSlice(alloc),
+        .type_decl_params = az.type_decl_params,
+        .call_trait_resolutions = az.call_trait_resolutions,
+        .std_intrinsic_calls = az.std_intrinsic_calls,
     };
 }

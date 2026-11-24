@@ -1,0 +1,5 @@
+//// Standard I/O module for Aethel (`io.println`, `io.print`, `io.eprintln`, `io.eprint`).
+//// Lowered directly to OS stdio buffered writers by the compiler runtime.
+
+pub fn noop() {
+}

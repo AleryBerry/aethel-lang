@@ -1,0 +1,61 @@
+// Stage F Showcase 2:
+// Strictly Rust -> Aethel Interoperability hosting Rust ECS systems directly
+// over Aethel's physical `@layout(soa)` split-column queries and `@layout(aosoa(8))` tiles.
+
+@layout(flat)
+pub type PhysicsStep {
+  dt: f32,
+  damping: f32,
+}
+
+@layout(soa)
+pub type Entity {
+  px: f32,
+  py: f32,
+  vx: f32,
+  vy: f32,
+  health: i32,
+}
+
+@layout(aosoa(8))
+pub type SimdParticle {
+  x: f32,
+  vx: f32,
+}
+
+@external(rust, "rust_integrate_positions")
+pub fn rust_integrate_positions(q: Collection(Entity) ~> mut .{px, py, vx, vy}, step: PhysicsStep)
+
+@external(rust, "rust_apply_damage")
+pub fn rust_apply_damage(q: Collection(Entity) ~> mut .{health}, dmg: i32)
+
+@external(rust, "rust_step_aosoa_tiles")
+pub fn rust_step_aosoa_tiles(t: View(Collection(SimdParticle), Exclusive), dt: f32)
+
+pub fn main() {
+  let mut entities: Collection(Entity) = [
+    Entity { px: 0.0f32, py: 1.0f32, vx: 4.0f32, vy: 2.0f32, health: 100i32 },
+    Entity { px: 2.0f32, py: 3.0f32, vx: 6.0f32, vy: -1.0f32, health: 80i32 },
+    Entity { px: 5.0f32, py: 0.0f32, vx: 2.0f32, vy: 3.0f32, health: 60i32 },
+    Entity { px: 1.0f32, py: 4.0f32, vx: -2.0f32, vy: 5.0f32, health: 40i32 },
+  ]
+
+  let mut particles: Collection(SimdParticle) = [
+    SimdParticle { x: 0.0f32, vx: 1.0f32 },
+    SimdParticle { x: 1.0f32, vx: 2.0f32 },
+    SimdParticle { x: 2.0f32, vx: 3.0f32 },
+    SimdParticle { x: 3.0f32, vx: 4.0f32 },
+    SimdParticle { x: 4.0f32, vx: 5.0f32 },
+    SimdParticle { x: 5.0f32, vx: 6.0f32 },
+    SimdParticle { x: 6.0f32, vx: 7.0f32 },
+    SimdParticle { x: 7.0f32, vx: 8.0f32 },
+  ]
+
+  let cfg = PhysicsStep { dt: 0.5f32, damping: 1.0f32 }
+  rust_integrate_positions(entities, cfg)
+  rust_apply_damage(entities, 15i32)
+  rust_step_aosoa_tiles(particles, 0.5f32)
+
+  println("SoA Entity[0] px=", entities[0].px, " health=", entities[0].health)
+  println("AoSoA(8) Particle[7] x=", particles[7].x)
+}

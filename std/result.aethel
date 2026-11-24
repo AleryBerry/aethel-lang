@@ -1,0 +1,64 @@
+//// Standard Result helpers for Aethel (rank-1 generic, zero allocator plumbing).
+
+pub fn is_ok(r: Result(t, e)) -> bool {
+  case r {
+    Ok(_) -> true
+    Err(_) -> false
+  }
+}
+
+pub fn is_err(r: Result(t, e)) -> bool {
+  case r {
+    Err(_) -> true
+    Ok(_) -> false
+  }
+}
+
+pub fn unwrap_or(r: Result(t, e), fallback: t) -> t {
+  case r {
+    Ok(v) -> v
+    Err(_) -> fallback
+  }
+}
+
+pub fn unwrap_err_or(r: Result(t, e), fallback: e) -> e {
+  case r {
+    Err(e_val) -> e_val
+    Ok(_) -> fallback
+  }
+}
+
+pub fn map_res(r: Result(t, e), f: fn(t) -> u) -> Result(u, e) {
+  case r {
+    Ok(v) -> Ok(f(v))
+    Err(e_val) -> Err(e_val)
+  }
+}
+
+pub fn map_err(r: Result(t, e), f: fn(e) -> f_err) -> Result(t, f_err) {
+  case r {
+    Ok(v) -> Ok(v)
+    Err(e_val) -> Err(f(e_val))
+  }
+}
+
+pub fn and_then_res(r: Result(t, e), f: fn(t) -> Result(u, e)) -> Result(u, e) {
+  case r {
+    Ok(v) -> f(v)
+    Err(e_val) -> Err(e_val)
+  }
+}
+
+pub fn or_else(r: Result(t, e), alt: Result(t, e)) -> Result(t, e) {
+  case r {
+    Ok(v) -> Ok(v)
+    Err(_) -> alt
+  }
+}
+
+pub fn to_option(r: Result(t, e)) -> Option(t) {
+  case r {
+    Ok(v) -> Some(v)
+    Err(_) -> None
+  }
+}

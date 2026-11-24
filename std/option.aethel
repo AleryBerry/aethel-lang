@@ -1,0 +1,64 @@
+//// Standard Option helpers for Aethel (rank-1 generic, zero allocator plumbing).
+
+pub fn is_some(opt: Option(a)) -> bool {
+  case opt {
+    Some(_) -> true
+    None -> false
+  }
+}
+
+pub fn is_none(opt: Option(a)) -> bool {
+  case opt {
+    None -> true
+    Some(_) -> false
+  }
+}
+
+pub fn unwrap_or(opt: Option(a), fallback: a) -> a {
+  case opt {
+    Some(v) -> v
+    None -> fallback
+  }
+}
+
+pub fn map_opt(opt: Option(a), f: fn(a) -> b) -> Option(b) {
+  case opt {
+    Some(v) -> Some(f(v))
+    None -> None
+  }
+}
+
+pub fn and_then_opt(opt: Option(a), f: fn(a) -> Option(b)) -> Option(b) {
+  case opt {
+    Some(v) -> f(v)
+    None -> None
+  }
+}
+
+pub fn flatten(opt: Option(Option(a))) -> Option(a) {
+  case opt {
+    Some(inner) -> inner
+    None -> None
+  }
+}
+
+pub fn or_else(opt: Option(a), alt: Option(a)) -> Option(a) {
+  case opt {
+    Some(v) -> Some(v)
+    None -> alt
+  }
+}
+
+pub fn filter(opt: Option(a), pred: fn(a) -> bool) -> Option(a) {
+  case opt {
+    Some(v) -> if pred(v) { Some(v) } else { None }
+    None -> None
+  }
+}
+
+pub fn to_result(opt: Option(a), err_val: e) -> Result(a, e) {
+  case opt {
+    Some(v) -> Ok(v)
+    None -> Err(err_val)
+  }
+}

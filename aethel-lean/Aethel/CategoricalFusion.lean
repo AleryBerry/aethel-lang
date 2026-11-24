@@ -16,10 +16,7 @@ disjoint-field commutativity, dual-field loop fusion, and map-fold deforestation
 def mapFieldStep (owner : OwnerId) (layout : CollectionLayout)
     (length fieldCount field : Nat) (f : UInt8 → UInt8)
     (s : Core.State) (i : Nat) : Core.State :=
-  let loc : ByteLocation := ⟨owner, collectionSlot layout length fieldCount i field⟩
-  match s.byte loc with
-  | some b => s.store loc (f b)
-  | none => s
+  applyElemField owner layout length fieldCount field f s i
 
 def mapFieldLoop (owner : OwnerId) (layout : CollectionLayout)
     (length fieldCount field : Nat) (f : UInt8 → UInt8)

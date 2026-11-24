@@ -71,6 +71,8 @@ module.exports = grammar({
       choice(
         $.import_declaration,
         $.type_definition,
+        $.trait_declaration,
+        $.instance_declaration,
         $.function,
         $.constant,
         $.law_declaration,
@@ -113,6 +115,7 @@ module.exports = grammar({
           "type",
           field("name", $.type_identifier),
           optional($.type_parameters),
+          optional(seq("with", sepBy1(",", $.trait_constraint))),
           optional(
             choice(
               seq("=", field("value", $._type)),
@@ -164,7 +167,8 @@ module.exports = grammar({
         field("type", $._type),
       ),
 
-    // `fn name(params) -> Ret decreases expr { ... }`
+    // `fn name(params) -> Ret with Trait(a) decreases expr { ... }`
+    // or bodyless `@external(rust) pub fn name(params) -> Ret`
     function: ($) =>
       seq(
         repeat($.attribute),
@@ -173,8 +177,65 @@ module.exports = grammar({
         field("name", $.identifier),
         field("parameters", $.function_parameters),
         optional(seq("->", field("return_type", $._type))),
-        optional(seq("decreases", field("decreases", $._expression))),
-        field("body", $.block),
+        repeat(
+          choice(
+            seq("with", sepBy1(",", $.trait_constraint)),
+            seq("decreases", field("decreases", $._expression)),
+          ),
+        ),
+        optional(field("body", $.block)),
+      ),
+
+    trait_declaration: ($) =>
+      seq(
+        repeat($.attribute),
+        optional($.visibility_modifier),
+        "trait",
+        field("name", $.type_identifier),
+        optional($.trait_parameters),
+        optional(seq("<=", sepBy1(",", $.trait_constraint))),
+        "{",
+        repeat(choice($.trait_method, $.law_declaration)),
+        "}",
+      ),
+
+    trait_parameters: ($) =>
+      seq("(", sepBy1(",", $.trait_parameter), optional(","), ")"),
+
+    trait_parameter: ($) =>
+      seq(
+        choice($.identifier, $.type_identifier),
+        optional(seq("(", sepBy1(",", "_"), optional(","), ")")),
+      ),
+
+    trait_constraint: ($) =>
+      prec.right(
+        seq(
+          choice($.type_identifier, $.remote_type_identifier),
+          optional($.type_arguments),
+        ),
+      ),
+
+    trait_method: ($) =>
+      seq(
+        repeat($.attribute),
+        "fn",
+        field("name", $.identifier),
+        field("parameters", $.function_parameters),
+        optional(seq("->", field("return_type", $._type))),
+        optional(";"),
+      ),
+
+    instance_declaration: ($) =>
+      seq(
+        repeat($.attribute),
+        optional($.visibility_modifier),
+        optional("default"),
+        "instance",
+        optional(seq(field("name", $.identifier), ":")),
+        field("trait", $.trait_constraint),
+        optional(seq("with", sepBy1(",", $.trait_constraint))),
+        optional(seq("{", repeat($.function), "}")),
       ),
 
     function_parameters: ($) =>
@@ -341,7 +402,7 @@ module.exports = grammar({
         field("return_type", $._type),
       ),
 
-    type_var: ($) => $.identifier,
+    type_var: ($) => prec.right(seq($.identifier, optional($.type_arguments))),
     hole: (_) => "_",
 
     // Blocks & Statements
@@ -500,6 +561,7 @@ module.exports = grammar({
         $.binary_expression,
         $.unary_expression,
         $.cast_expression,
+        $.using_expression,
         $.function_call,
         $.field_access,
         $.tuple_access,
@@ -542,6 +604,19 @@ module.exports = grammar({
           field("value", $._expression),
           "as",
           field("type", $._type),
+        ),
+      ),
+
+    using_expression: ($) =>
+      prec.left(
+        PREC.CAST,
+        seq(
+          field("value", $._expression),
+          "using",
+          choice(
+            $.field_path,
+            seq(".{", sepBy1(",", $.field_path), optional(","), "}"),
+          ),
         ),
       ),
 

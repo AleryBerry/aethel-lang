@@ -5,6 +5,7 @@ pub const parser = @import("parser.zig");
 pub const int_range = @import("int_range.zig");
 pub const layout = @import("layout.zig");
 pub const law_verifier = @import("law_verifier.zig");
+pub const stdlib = @import("stdlib.zig");
 pub const module_loader = @import("module_loader.zig");
 pub const sema = @import("sema.zig");
 pub const mir = @import("mir.zig");
@@ -34,5 +35,7 @@ test {
     _ = @import("sema_test.zig");
     _ = @import("law_test.zig");
     _ = @import("stage_e_test.zig");
+    _ = @import("stage_f_test.zig");
+    _ = @import("stage_g_test.zig");
     _ = @import("codegen_test.zig");
 }

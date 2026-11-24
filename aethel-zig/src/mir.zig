@@ -49,6 +49,16 @@ pub fn emitMir(checked: *const sema.CheckedModule, writer: *Io.Writer) Io.Writer
         try writer.print(" {d}\n", .{col.field_count});
     }
 
+    for (checked.dyn_vecs) |dv| {
+        try writer.print("dyn_vec {s} ", .{dv.name});
+        switch (dv.layout) {
+            .aos => try writer.writeAll("aos"),
+            .soa => try writer.writeAll("soa"),
+            .aosoa => |w| try writer.print("aosoa {d}", .{w}),
+        }
+        try writer.print(" {d} 8\n", .{dv.field_count});
+    }
+
     for (checked.functions) |fun| {
         if (fun.has_extern_abi) continue;
         try writer.print("fn {s}\n", .{fun.name});
@@ -107,7 +117,9 @@ pub fn emitMir(checked: *const sema.CheckedModule, writer: *Io.Writer) Io.Writer
 
     for (checked.laws) |law| {
         for (law.symbolic_certs) |sc| {
-            const kw = switch (sc.kind) {
+            const kw = if (sc.is_trait_law and sc.kind == .always)
+                "trait_law"
+            else switch (sc.kind) {
                 .always => "law_always",
                 .never => "law_never",
             };

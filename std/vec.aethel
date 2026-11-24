@@ -1,0 +1,16 @@
+//// Layout-polymorphic, borrow-checked dynamic array (`Vec(T)`).
+////
+//// Zero user-facing allocator arguments: allocation, Perceus in-place reuse
+//// (`len < cap`), physical layout selection (`@layout(soa)`, `@layout(aosoa(W))`,
+//// `@layout(auto)`), reallocation safety (`Unreserved`), and deterministic
+//// scope-exit reclamation are enforced automatically by the compiler and Lean gate.
+////
+//// Intrinsics exposed via `import std/vec [as vec]`:
+////   vec.new() / vec.with_capacity(cap) / vec.len(v) / vec.capacity(v)
+////   vec.is_empty(v) / vec.push(v, x) / vec.pop(v) / vec.get(v, i)
+////   vec.set(v, i, x) / vec.swap_remove(v, i) / vec.reserve(v, add)
+////   vec.clear(v) / vec.as_slice(v) / vec.as_collection(v)
+
+pub fn initial_capacity() -> u64 {
+  8u64
+}

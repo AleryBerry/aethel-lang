@@ -12,6 +12,11 @@
   "never"
   "decreases"
   "extern"
+  "trait"
+  "instance"
+  "default"
+  "with"
+  "using"
 ] @keyword
 
 "type" @keyword.type

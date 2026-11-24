@@ -1,0 +1,12 @@
+//// SwissTable-style SoA hash set (`Set(T)`), zero allocator plumbing.
+////
+//// Backed by 64B-aligned 1-byte `ctrl` (`h2` fingerprint) slots and dense
+//// key storage (`Aethel.StdContainers`), borrow-checked across mutation.
+////
+//// Intrinsics exposed via `import std/set [as set]`:
+////   set.new() / set.with_capacity(cap) / set.len(s) / set.is_empty(s)
+////   set.insert(s, x) / set.contains(s, x) / set.remove(s, x) / set.clear(s)
+
+pub fn empty_count() -> u64 {
+  0u64
+}

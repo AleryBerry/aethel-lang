@@ -1,0 +1,9 @@
+type Pair {
+  left: u8,
+  left: u8,
+}
+
+fn main() -> u8 {
+  let mut pair = Pair { left: 17u8, left: 23u8, };
+  pair.left
+}

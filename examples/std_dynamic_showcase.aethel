@@ -1,0 +1,120 @@
+import std/vec as vec
+import std/map as map
+import std/set as set
+import std/deque as deque
+import std/option as opt
+import std/result as res
+import std/cmp as cmp
+import std/math as math
+import std/str as str
+
+@layout(aosoa(8))
+type Particle {
+  x: f32,
+  y: f32,
+  vx: f32,
+  vy: f32,
+}
+
+@layout(soa)
+type Entity {
+  id: u32,
+  px: i32,
+  health: u32,
+}
+
+fn boost_entities(es: Collection(Entity) ~>.{ px, health }) -> u32 {
+  let mut total: u32 = 0u32
+  for e in es {
+    total = total +| e.health
+  }
+  total +| 2u32
+}
+
+fn build_scores() -> Vec(u32) {
+  let mut xs: Vec(u32) = vec.new()
+  vec.push(xs, 10u32)
+  vec.push(xs, 25u32)
+  vec.push(xs, 40u32)
+  xs
+}
+
+pub fn main() {
+  // 1. Dynamic @layout(aosoa(8)) Vec growth across 64B-aligned tile boundaries (0 -> 8 -> 16)
+  //    plus fused SIMD map_in_place |> fold pass.
+  let mut particles: Vec(Particle) = vec.new()
+  let mut i: u32 = 0u32
+  let mut fx: f32 = 0.0f32
+  while i < 12u32 {
+    vec.push(particles, Particle { x: fx, y: 1.0f32, vx: 2.0f32, vy: 0.5f32 })
+    fx = fx + 1.0f32
+    i = i + 1u32
+  }
+  let sum_x = particles
+    |> map_in_place(fn(p) { p.x = p.x + p.vx; p.y = p.y + p.vy })
+    |> fold(0.0f32, fn(acc, p) { acc + p.x })
+
+  // 2. Dynamic @layout(soa) Vec passed zero-copy to path-borrowed Collection(Entity) ~>.{ px, health }
+  let mut entities: Vec(Entity) = vec.with_capacity(4u64)
+  vec.push(entities, Entity { id: 1u32, px: 10i32, health: 80u32 })
+  vec.push(entities, Entity { id: 2u32, px: 20i32, health: 90u32 })
+  let health_sig = boost_entities(vec.as_collection(entities))
+  vec.push(entities, Entity { id: 3u32, px: 30i32, health: health_sig })
+
+  // 3. Ownership move return + in-place mutation + pure std modules (math, cmp, option, result, str)
+  let mut scores = build_scores()
+  let popped = opt.unwrap_or(vec.pop(scores), 0u32)
+  let swapped = opt.unwrap_or(vec.swap_remove(scores, 0u64), 0u32)
+  let remaining = opt.unwrap_or(vec.get(scores, 0u64), 0u32)
+
+  let g = math.gcd_u32(48u32, 18u32)
+  let p = math.pow_u32(2u32, 6u32)
+  let r: Result(u32, u32) = Ok(g +| p)
+  let r_val = res.unwrap_or(r, 0u32)
+  let tag = str.concat("stage-g:", "ok")
+  let tag_ok = str.starts_with(tag, "stage-g") && cmp.is_lt(cmp.compare_u32(g, p))
+
+  // 4. Flat linear-probing Map, Set, and circular RingDeque (zero allocator parameters)
+  let mut roster: Map(String, u32) = map.new()
+  map.put(roster, "alpha", 100u32)
+  map.put(roster, "beta", 200u32)
+  let old_alpha = opt.unwrap_or(map.insert(roster, "alpha", 150u32), 0u32)
+  let cur_alpha = opt.unwrap_or(map.get(roster, "alpha"), 0u32)
+  let rem_beta = opt.unwrap_or(map.remove(roster, "beta"), 0u32)
+
+  let mut ids: Set(u32) = set.new()
+  let ins1 = set.insert(ids, 7u32)
+  let ins_dup = set.insert(ids, 7u32)
+  let rem_id = set.remove(ids, 7u32)
+
+  let mut dq: Deque(i32) = deque.new()
+  deque.push_back(dq, 20i32)
+  deque.push_front(dq, 10i32)
+  deque.push_back(dq, 30i32)
+  let front_v = opt.unwrap_or(deque.pop_front(dq), 0i32)
+  let back_v = opt.unwrap_or(deque.pop_back(dq), 0i32)
+  let mid_v = opt.unwrap_or(deque.get(dq, 0u64), 0i32)
+
+  // 5. 500-iteration allocation/deallocation stress loop (checked by Zig 0.17 init.gpa for 0 leaks)
+  let mut iter: u32 = 0u32
+  let mut loop_acc: u64 = 0u64
+  while iter < 500u32 {
+    let mut lv: Vec(u32) = vec.new()
+    vec.push(lv, iter)
+    vec.push(lv, iter + 1u32)
+    let mut lm: Map(u32, u32) = map.new()
+    map.put(lm, iter, iter * 2u32)
+    let mut ls: Set(u32) = set.new()
+    let _ = set.insert(ls, iter)
+    let mut ld: Deque(i32) = deque.new()
+    deque.push_back(ld, iter as i32)
+    loop_acc = loop_acc +| lv.len +| lm.len +| ls.len +| ld.len
+    iter = iter + 1u32
+  }
+
+  println("AoSoA(8) Particle len=", particles.len, " cap=", vec.capacity(particles), " sum_x=", sum_x)
+  println("SoA Entity len=", entities.len, " boost=", health_sig, " tail_px=", entities[2].px)
+  println("Scores popped=", popped, " swapped=", swapped, " rem=", remaining, " math=", r_val, " tag_ok=", tag_ok)
+  println("Map old=", old_alpha, " cur=", cur_alpha, " rem=", rem_beta, " Set=", ins1, ins_dup, rem_id)
+  println("Deque f=", front_v, " m=", mid_v, " b=", back_v, " gpa_loop_ops=", loop_acc)
+}

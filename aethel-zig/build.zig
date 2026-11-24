@@ -7,12 +7,15 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
     build_options.addOption([]const u8, "lean_dir", b.pathResolve(&.{ b.root.root_dir.path orelse ".", b.root.sub_path, "../aethel-lean" }));
+    build_options.addOption([]const u8, "std_dir", b.pathResolve(&.{ b.root.root_dir.path orelse ".", b.root.sub_path, "../std" }));
+
+    const build_options_mod = build_options.createModule();
 
     const mod = b.addModule("aethel", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
-    mod.addOptions("build_options", build_options);
+    mod.addImport("build_options", build_options_mod);
 
     const exe = b.addExecutable(.{
         .name = "aethel",
@@ -25,7 +28,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    exe.root_module.addOptions("build_options", build_options);
+    exe.root_module.addImport("build_options", build_options_mod);
 
     b.installArtifact(exe);
 

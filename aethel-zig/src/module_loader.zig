@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const stdlib = @import("stdlib.zig");
 
 pub const SourceSlice = struct {
     module_id: usize,
@@ -209,18 +210,21 @@ const Loader = struct {
 
     fn isBuiltinVirtualModule(imp_key: []const u8) bool {
         return std.mem.eql(u8, imp_key, "io") or
-            std.mem.eql(u8, imp_key, "std/io") or
             std.mem.startsWith(u8, imp_key, "aethel/");
     }
 
-    fn loadFile(self: *Loader, norm_path: []const u8, explicit_key: ?[]const u8) std.mem.Allocator.Error!?usize {
+    fn loadSourceBuffer(
+        self: *Loader,
+        norm_path: []const u8,
+        explicit_key: ?[]const u8,
+        src: [:0]const u8,
+    ) std.mem.Allocator.Error!?usize {
         if (self.findLoadedByPath(norm_path)) |existing| {
             return existing;
         }
         if (self.isVisiting(norm_path)) {
             return null;
         }
-        const src = self.readSource(norm_path) orelse return null;
 
         try self.visiting.append(self.alloc, norm_path);
         defer _ = self.visiting.pop();
@@ -263,6 +267,11 @@ const Loader = struct {
                     _ = try self.loadFile(mf.path, mf.module_key);
                     continue;
                 }
+                if (stdlib.lookup(imp_key)) |std_src| {
+                    const vpath = try std.fmt.allocPrint(self.alloc, "<std>/{s}", .{imp_key});
+                    _ = try self.loadSourceBuffer(vpath, imp_key, std_src);
+                    continue;
+                }
                 if (isBuiltinVirtualModule(imp_key)) continue;
                 const msg = try std.fmt.allocPrint(self.alloc, "imported module '{s}' not found", .{imp_key});
                 try self.errors.append(self.alloc, .{ .path = norm_path, .source = src, .span = decl.span, .message = msg });
@@ -292,6 +301,9 @@ const Loader = struct {
                     continue;
                 }
                 _ = try self.loadFile(target_path, chosen_key);
+            } else if (stdlib.lookup(imp_key)) |std_src| {
+                const vpath = try std.fmt.allocPrint(self.alloc, "<std>/{s}", .{imp_key});
+                _ = try self.loadSourceBuffer(vpath, imp_key, std_src);
             } else {
                 if (isBuiltinVirtualModule(imp_key)) continue;
                 const msg = try std.fmt.allocPrint(self.alloc, "imported module file '{s}' not found", .{cand_entry});
@@ -308,6 +320,17 @@ const Loader = struct {
             .module_id = mod_id,
         });
         return mod_id;
+    }
+
+    fn loadFile(self: *Loader, norm_path: []const u8, explicit_key: ?[]const u8) std.mem.Allocator.Error!?usize {
+        if (self.findLoadedByPath(norm_path)) |existing| {
+            return existing;
+        }
+        if (self.isVisiting(norm_path)) {
+            return null;
+        }
+        const src = self.readSource(norm_path) orelse return null;
+        return try self.loadSourceBuffer(norm_path, explicit_key, src);
     }
 
     fn buildLoadedProgram(

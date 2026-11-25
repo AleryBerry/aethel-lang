@@ -1,5 +1,6 @@
 import Aethel.Machine
 import Aethel.ResourceCheck
+import Aethel.Disjointness
 import Aethel.LayoutAlgebra
 import Aethel.CacheLayout
 
@@ -34,7 +35,7 @@ def RustSliceSpec.byteLen (sl : RustSliceSpec) : Nat :=
 def RustSliceSpec.locations (sl : RustSliceSpec) : List ByteLocation :=
   (List.range sl.byteLen).map fun i => ⟨sl.owner, sl.byteOffset + i⟩
 
-def checkRustSlice (s : Core.State) (sl : RustSliceSpec) : Bool :=
+private def checkRustSliceWhere (s : Core.State) (sl : RustSliceSpec) (permitted : Unit → Bool) : Bool :=
   !sl.isSubBytePacked &&
   decide (0 < sl.elemAlign) &&
   sl.elemAlign.isPowerOfTwo &&
@@ -47,10 +48,9 @@ def checkRustSlice (s : Core.State) (sl : RustSliceSpec) : Bool :=
     | none => false
     | some alloc =>
       decide (sl.byteOffset + sl.byteLen ≤ alloc.bytes.length) &&
-      sl.locations.all fun loc => decide (s.Available loc sl.mode none)
+      permitted ()
 
-/-- Independent mathematical Rust C-ABI slice validity contract. -/
-def RustSliceValid (s : Core.State) (sl : RustSliceSpec) : Prop :=
+private def RustSliceContract (s : Core.State) (sl : RustSliceSpec) (permitted : Prop) : Prop :=
   sl.isSubBytePacked = false ∧
   0 < sl.elemAlign ∧
   sl.elemAlign.isPowerOfTwo = true ∧
@@ -60,11 +60,25 @@ def RustSliceValid (s : Core.State) (sl : RustSliceSpec) : Prop :=
   (sl.len = 0 ∨
     ∃ alloc, s.allocation sl.owner = some alloc ∧
       sl.byteOffset + sl.byteLen ≤ alloc.bytes.length ∧
-      ∀ loc ∈ sl.locations, s.Available loc sl.mode none)
+      permitted)
 
-theorem checkRustSlice_correct (s : Core.State) (sl : RustSliceSpec) :
-    checkRustSlice s sl = true ↔ RustSliceValid s sl := by
-  dsimp [checkRustSlice, RustSliceValid]
+def checkRustSlice (s : Core.State) (sl : RustSliceSpec) : Bool :=
+  checkRustSliceWhere s sl fun _ => sl.locations.all fun loc => decide (s.Available loc sl.mode none)
+
+/-- Independent mathematical Rust C-ABI slice validity contract. -/
+def RustSliceValid (s : Core.State) (sl : RustSliceSpec) : Prop :=
+  RustSliceContract s sl (∀ loc ∈ sl.locations, s.Available loc sl.mode none)
+
+def checkRustSliceAbi (s : Core.State) (sl : RustSliceSpec) : Bool :=
+  checkRustSliceWhere s sl fun _ => true
+
+def RustSliceAbiValid (s : Core.State) (sl : RustSliceSpec) : Prop :=
+  RustSliceContract s sl True
+
+private theorem checkRustSliceWhere_correct (s : Core.State) (sl : RustSliceSpec)
+    {test : Unit → Bool} {condition : Prop} (check : test () = true ↔ condition) :
+    checkRustSliceWhere s sl test = true ↔ RustSliceContract s sl condition := by
+  dsimp [checkRustSliceWhere, RustSliceContract]
   cases hLen : sl.len with
   | zero =>
     simp [and_assoc]
@@ -74,7 +88,15 @@ theorem checkRustSlice_correct (s : Core.State) (sl : RustSliceSpec) :
     | none =>
       simp
     | some alloc =>
-      simp [and_assoc]
+      simp [and_assoc, check]
+
+theorem checkRustSlice_correct (s : Core.State) (sl : RustSliceSpec) :
+    checkRustSlice s sl = true ↔ RustSliceValid s sl :=
+  checkRustSliceWhere_correct s sl (by simp [List.all_eq_true])
+
+theorem checkRustSliceAbi_correct (s : Core.State) (sl : RustSliceSpec) :
+    checkRustSliceAbi s sl = true ↔ RustSliceAbiValid s sl :=
+  checkRustSliceWhere_correct s sl (by simp)
 
 theorem rust_empty_slice_valid (s : Core.State) (owner : OwnerId)
     (offset elemSize elemAlign : Nat) (mode : AccessMode)
@@ -85,30 +107,47 @@ theorem rust_empty_slice_valid (s : Core.State) (owner : OwnerId)
   dsimp [RustSliceSpec.byteLen, isizeMax64]
   omega
 
-/-- Checks compatibility when two Rust slice arguments are borrowed simultaneously. -/
-def sliceLocCompatible (a b : RustSliceSpec) (loc : ByteLocation) : Bool :=
-  !decide (loc ∈ b.locations) || (decide (a.mode = .shared) && decide (b.mode = .shared))
+def RustSliceSpec.interval (slice : RustSliceSpec) : Interval :=
+  ⟨slice.byteOffset, slice.byteOffset + slice.byteLen⟩
 
+theorem RustSliceSpec.mem_locations (slice : RustSliceSpec) (location : ByteLocation) :
+    location ∈ slice.locations ↔ location.allocation = slice.owner ∧ slice.interval.Contains location.offset := by
+  cases location with
+  | mk owner offset =>
+    simp only [RustSliceSpec.locations, List.mem_map, List.mem_range, RustSliceSpec.interval,
+      Interval.Contains, ByteLocation.mk.injEq]
+    constructor
+    · rintro ⟨index, valid, rfl, rfl⟩
+      exact ⟨rfl, by omega, by omega⟩
+    · rintro ⟨rfl, lower, upper⟩
+      exact ⟨offset - slice.byteOffset, by omega, rfl, by omega⟩
+
+/-- Compare allocations and interval endpoints without enumerating the bytes. -/
 def checkRustSlicePairCompatible (a b : RustSliceSpec) : Bool :=
-  a.locations.all fun loc => sliceLocCompatible a b loc
+  letI : Decidable (AccessMode.Compatible a.mode b.mode) :=
+    inferInstanceAs (Decidable (a.mode = .shared ∧ b.mode = .shared))
+  decide (a.owner ≠ b.owner) || a.interval.disjoint b.interval ||
+    decide (AccessMode.Compatible a.mode b.mode)
 
 def RustSlicesCompatible (a b : RustSliceSpec) : Prop :=
   ∀ loc ∈ a.locations, loc ∈ b.locations → AccessMode.Compatible a.mode b.mode
 
 theorem checkRustSlicePairCompatible_correct (a b : RustSliceSpec) :
     checkRustSlicePairCompatible a b = true ↔ RustSlicesCompatible a b := by
-  simp only [checkRustSlicePairCompatible, sliceLocCompatible, RustSlicesCompatible,
-    AccessMode.Compatible, List.all_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-    Bool.and_eq_true, decide_eq_false_iff_not, decide_eq_true_eq]
+  simp only [checkRustSlicePairCompatible, RustSlicesCompatible, Bool.or_eq_true, Bool.and_eq_true,
+    decide_eq_true_eq, Interval.disjoint_correct, RustSliceSpec.mem_locations]
   constructor
-  · intro h loc ha hb
-    rcases h loc ha with hNotB | hShared
-    · exact False.elim (hNotB hb)
-    · exact hShared
-  · intro h loc ha
-    by_cases hb : loc ∈ b.locations
-    · exact Or.inr (h loc ha hb)
-    · exact Or.inl hb
+  · rintro ((separate | disjoint) | shared) location ⟨ownerA, inA⟩ ⟨ownerB, inB⟩
+    · exact False.elim (separate (ownerA.symm.trans ownerB))
+    · exact False.elim (disjoint location.offset ⟨inA, inB⟩)
+    · exact shared
+  · intro compatible
+    by_cases same : a.owner = b.owner
+    · by_cases shared : AccessMode.Compatible a.mode b.mode
+      · exact .inr shared
+      · exact .inl (.inr fun index ⟨inA, inB⟩ =>
+          shared (compatible ⟨a.owner, index⟩ ⟨rfl, inA⟩ ⟨same, inB⟩))
+    · exact .inl (.inl same)
 
 theorem rust_disjoint_soa_columns_mut_compatible (owner : OwnerId) (length f1 f2 : Nat)
     (hNe : f1 ≠ f2) :
@@ -193,11 +232,11 @@ theorem rustOwn_drop_consumes :
 
 theorem rust_packed_subbyte_slice_rejected (s : Core.State) :
     checkRustSlice s ⟨0, 0, 4, 1, 1, .shared, true⟩ = false := by
-  simp [checkRustSlice]
+  simp [checkRustSlice, checkRustSliceWhere]
 
 theorem rust_unaligned_slice_rejected (s : Core.State) :
     checkRustSlice s ⟨0, 3, 2, 4, 4, .shared, false⟩ = false := by
-  simp [checkRustSlice]
+  simp [checkRustSlice, checkRustSliceWhere]
 
 theorem rust_overlapping_mut_slices_rejected :
     checkRustSlicePairCompatible

@@ -505,4 +505,164 @@ theorem aosoa_simd_tile_step_refines {owner : Core.OwnerId} {w length fieldCount
   · have hNot : ¬ (0 ≤ i ∧ i < 0 + length ∧ g = field) := fun h => hgEq h.2.2
     rw [ite_eq_right hNot, ite_eq_right hgEq]
 
+/-- Native `.soa` `@Vector(w, T)` SIMD + scalar tail execution refines exact element-wise
+physical column representation identically across every element and preserves unqueried columns. -/
+theorem soa_simd_tile_step_refines {owner : Core.OwnerId} {w length fieldCount field : Nat}
+    (_hw : 0 < w) (hField : field < fieldCount) (f : UInt8 → UInt8)
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner .soa length fieldCount table) :
+    ByteCollectionRep
+      (applyTiledSimdPass owner .soa length fieldCount w field f s)
+      owner .soa length fieldCount
+      (fun i g => if g = field then f (table i g) else table i g) := by
+  rw [applyTiledSimdPass_eq_applyRange]
+  have hRng := applyRange_rep (layout := .soa) trivial hField f 0 length (by omega) hRep
+  intro i hi g hg
+  have hCell := hRng i hi g hg
+  rw [hCell]
+  congr 1
+  dsimp only
+  have hBound : 0 ≤ i ∧ i < 0 + length := ⟨Nat.zero_le _, by omega⟩
+  by_cases hgEq : g = field
+  · have hAll : 0 ≤ i ∧ i < 0 + length ∧ g = field := ⟨hBound.1, hBound.2, hgEq⟩
+    rw [ite_eq_left hAll, ite_eq_left hgEq]
+  · have hNot : ¬ (0 ≤ i ∧ i < 0 + length ∧ g = field) := fun h => hgEq h.2.2
+    rw [ite_eq_right hNot, ite_eq_right hgEq]
+
+/-- Writing back a full row snapshot `writeAllColumnsUpTo` after an interleaved write to column `1`
+clobbers column `1` back to `snap 1` instead of preserving `newCold` (demonstrating why selective
+column writes are required to uphold `CategoricalFusion` and `ScopedForkJoin` frame guarantees). -/
+def writeAllColumnsUpTo (owner : Core.OwnerId) (layout : CollectionLayout)
+    (length fieldCount idx : Nat) (row : Nat → UInt8) (s : Core.State) : Nat → Core.State
+  | 0 => s
+  | g + 1 =>
+    (writeAllColumnsUpTo owner layout length fieldCount idx row s g).store
+      ⟨owner, collectionSlot layout length fieldCount idx g⟩ (row g)
+
+theorem whole_record_set_clobbers_sibling_counterexample {owner : Core.OwnerId}
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner .soa 1 2 table)
+    (newHot newCold : UInt8) :
+    let loc1 : ByteLocation := ⟨owner, collectionSlot .soa 1 2 0 1⟩
+    let s1 := s.store loc1 newCold
+    let snap := fun g => if g = 0 then newHot else table 0 g
+    (writeAllColumnsUpTo owner .soa 1 2 0 snap s1 2).byte loc1 = some (table 0 1) := by
+  intro loc1 s1 snap
+  let loc0 : ByteLocation := ⟨owner, collectionSlot .soa 1 2 0 0⟩
+  have hAt1 : s.byte loc1 = some (table 0 1) := hRep 0 (by decide) 1 (by decide)
+  have hNeLoc : loc0 ≠ loc1 := by
+    intro hEq
+    have hSlot := congrArg ByteLocation.offset hEq
+    have hSame := (collectionSlot_eq_iff (layout := .soa) (length := 1) (fieldCount := 2)
+      trivial (by decide) (by decide) (by decide) (by decide)).mp hSlot
+    exact absurd hSame.2 (by decide)
+  have hS1Has1 : s1.byte loc1 = some newCold :=
+    Core.State.store_byte_written s loc1 (table 0 1) newCold hAt1
+  have hStep0 : (s1.store loc0 (snap 0)).byte loc1 = some newCold := by
+    rw [Core.State.store_byte_other s1 loc0 loc1 (snap 0) hNeLoc]
+    exact hS1Has1
+  dsimp [writeAllColumnsUpTo]
+  simpa [snap, loc1] using
+    Core.State.store_byte_written (s1.store loc0 (snap 0)) loc1 newCold (table 0 1) hStep0
+
+/-- Branchless `@select` SIMD predication (`if pred v then fThen v else fElse v`) refines exact
+element-wise conditional field updates over `.soa` while preserving all unqueried columns. -/
+theorem soa_simd_select_step_refines {owner : Core.OwnerId} {w length fieldCount field : Nat}
+    (hw : 0 < w) (hField : field < fieldCount)
+    (pred : UInt8 → Bool) (fThen fElse : UInt8 → UInt8)
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner .soa length fieldCount table) :
+    ByteCollectionRep
+      (applyTiledSimdPass owner .soa length fieldCount w field
+        (fun v => if pred v then fThen v else fElse v) s)
+      owner .soa length fieldCount
+      (fun i g =>
+        if g = field then (if pred (table i g) then fThen (table i g) else fElse (table i g))
+        else table i g) :=
+  soa_simd_tile_step_refines hw hField (fun v => if pred v then fThen v else fElse v) hRep
+
+/-- Branchless `@select` SIMD predication over 64B-aligned `.aosoa w` tiles refines exact
+element-wise conditional field updates while preserving all unqueried columns. -/
+theorem aosoa_simd_select_step_refines {owner : Core.OwnerId} {w length fieldCount field : Nat}
+    (hw : 0 < w) (hField : field < fieldCount)
+    (pred : UInt8 → Bool) (fThen fElse : UInt8 → UInt8)
+    {s : Core.State} {table : Nat → Nat → UInt8}
+    (hRep : ByteCollectionRep s owner (.aosoa w) length fieldCount table) :
+    ByteCollectionRep
+      (applyTiledSimdPass owner (.aosoa w) length fieldCount w field
+        (fun v => if pred v then fThen v else fElse v) s)
+      owner (.aosoa w) length fieldCount
+      (fun i g =>
+        if g = field then (if pred (table i g) then fThen (table i g) else fElse (table i g))
+        else table i g) :=
+  aosoa_simd_tile_step_refines hw hField (fun v => if pred v then fThen v else fElse v) hRep
+
+/-- Associative wrapping/natural addition fold over a contiguous index range `[start, start+count)`. -/
+def sumRange (vals : Nat → Nat) (start : Nat) : Nat → Nat
+  | 0 => 0
+  | n + 1 => sumRange vals start n + vals (start + n)
+
+def sumTiles (vals : Nat → Nat) (w : Nat) : Nat → Nat
+  | 0 => 0
+  | t + 1 => sumTiles vals w t + sumRange vals (t * w) w
+
+theorem sumRange_append (vals : Nat → Nat) (start n m : Nat) :
+    sumRange vals start (n + m) = sumRange vals start n + sumRange vals (start + n) m := by
+  induction m with
+  | zero => simp [sumRange]
+  | succ m ih =>
+    have hAssoc : start + (n + m) = (start + n) + m := by omega
+    dsimp [sumRange]
+    rw [ih, hAssoc, Nat.add_assoc]
+
+theorem sumTiles_eq_sumRange (vals : Nat → Nat) (w tiles : Nat) :
+    sumTiles vals w tiles = sumRange vals 0 (tiles * w) := by
+  induction tiles with
+  | zero => simp [sumTiles, sumRange]
+  | succ t ih =>
+    dsimp [sumTiles]
+    rw [ih]
+    have hMul : (t + 1) * w = t * w + w := Nat.succ_mul _ _
+    have hZ : 0 + t * w = t * w := Nat.zero_add _
+    rw [hMul, sumRange_append, hZ]
+
+/-- Accumulating `w`-wide SIMD lane sums (`sumTiles`) plus scalar tail equals the sequential `fold`. -/
+theorem simd_tiled_sum_eq_sequential_fold (vals : Nat → Nat) (w length : Nat) :
+    sumTiles vals w (length / w) + sumRange vals ((length / w) * w) (length % w) =
+      sumRange vals 0 length := by
+  rw [sumTiles_eq_sumRange]
+  have hZ : 0 + (length / w) * w = (length / w) * w := Nat.zero_add _
+  have hApp := sumRange_append vals 0 ((length / w) * w) (length % w)
+  rw [hZ] at hApp
+  rw [← hApp]
+  have hDivMod : (length / w) * w + length % w = length := by
+    rw [Nat.mul_comm]
+    exact Nat.div_add_mod length w
+  rw [hDivMod]
+
+/-- Default x86-64 L1 data cache capacity (32 KiB) for `@layout(auto)` sub-byte packing decisions. -/
+def l1DataCacheBytes : Nat := 32768
+
+def selectSubBytePolicy (hasConflict isHot : Bool) (workingSetBytes : Nat) :
+    AutomaticLayout.StoragePolicy :=
+  if hasConflict || (isHot && decide (workingSetBytes ≤ l1DataCacheBytes)) then .addressable
+  else .mayShareByte
+
+theorem selectSubBytePolicy_conflict_addressable (isHot : Bool) (workingSetBytes : Nat) :
+    selectSubBytePolicy true isHot workingSetBytes = .addressable := by
+  simp [selectSubBytePolicy]
+
+theorem selectSubBytePolicy_hot_l1_addressable (hasConflict : Bool) {workingSetBytes : Nat}
+    (hL1 : workingSetBytes ≤ l1DataCacheBytes) :
+    selectSubBytePolicy hasConflict true workingSetBytes = .addressable := by
+  simp [selectSubBytePolicy, decide_eq_true hL1]
+
+theorem selectSubBytePolicy_cold_or_streaming_packs
+    (hNoConflict : hasConflict = false)
+    (hNotHotInL1 : isHot = false ∨ l1DataCacheBytes < workingSetBytes) :
+    selectSubBytePolicy hasConflict isHot workingSetBytes = .mayShareByte := by
+  rcases hNotHotInL1 with rfl | hGt
+  · simp [selectSubBytePolicy, hNoConflict]
+  · simp [selectSubBytePolicy, hNoConflict, Nat.not_le_of_gt hGt]
+
 end Aethel.CacheLayout

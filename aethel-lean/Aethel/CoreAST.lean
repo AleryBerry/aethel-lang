@@ -49,6 +49,9 @@ inductive CoreExpr where
   | abort (reason : String) : CoreExpr
   deriving Repr, DecidableEq
 
+def CoreExpr.projectPair (expression : CoreExpr) (first : Bool) : CoreExpr :=
+  if first then .fst expression else .snd expression
+
 /-- Syntactic value predicate decider. -/
 def isVal : CoreExpr → Bool
   | .unit | .bool _ | .nat _ | .int _ _ _ => true
@@ -103,7 +106,7 @@ theorem isVal_correct (e : CoreExpr) : isVal e = true ↔ Value e := by
   | loop _ _ => simp [isVal]; intro h; cases h
   | abort _ => simp [isVal]; intro h; cases h
 
-/-- Capture-avoiding substitution of free variable `varId` by `val`. -/
+/-- Substitution of a closed value for free occurrences of `varId`. -/
 def subst (varId : Nat) (val : CoreExpr) : CoreExpr → CoreExpr
   | .unit => .unit
   | .bool b => .bool b
@@ -142,6 +145,15 @@ def Ctx.lookup (ctx : Ctx) (id : Nat) : Option CoreType :=
   | some (_, ty) => some ty
   | none => none
 
+def LiteralFits (signed : Bool) (bits : Nat) (value : Int) : Prop :=
+  match IntegerWidth.ofNat? bits with
+  | some width => (if signed then IntegerType.signed width else .unsigned width).Fits value
+  | none => False
+
+instance (signed : Bool) (bits : Nat) (value : Int) : Decidable (LiteralFits signed bits value) := by
+  unfold LiteralFits
+  split <;> infer_instance
+
 /-- Static typing judgment for unified sequential expressions. -/
 inductive WellTyped : Ctx → CoreExpr → CoreType → Effect → Prop where
   | unit (ctx : Ctx) :
@@ -150,7 +162,7 @@ inductive WellTyped : Ctx → CoreExpr → CoreType → Effect → Prop where
       WellTyped ctx (.bool b) .bool .empty
   | nat (ctx : Ctx) (n : Nat) :
       WellTyped ctx (.nat n) .nat .empty
-  | int (ctx : Ctx) (s : Bool) (bits : Nat) (v : Int) :
+  | int (ctx : Ctx) (s : Bool) (bits : Nat) (v : Int) (fits : LiteralFits s bits v) :
       WellTyped ctx (.int s bits v) (.int s bits) .empty
   | pair {ctx : Ctx} {a b : CoreExpr} {tyA tyB : CoreType} {effA effB : Effect} :
       WellTyped ctx a tyA effA →
@@ -165,9 +177,9 @@ inductive WellTyped : Ctx → CoreExpr → CoreType → Effect → Prop where
   | adt {ctx : Ctx} (tag : Nat) {p : CoreExpr} {tyP : CoreType} {eff : Effect} :
       WellTyped ctx p tyP eff →
       WellTyped ctx (.adt tag p) (.adt tag tyP) eff
-  | matchTag {ctx : Ctx} {s : CoreExpr} (tag : Nat) {pTy resTy : CoreType}
+  | matchTag {ctx : Ctx} {s : CoreExpr} (tag : Nat) {inputTag : Nat} {pTy resTy : CoreType}
       {onMatch onElse : CoreExpr} {effS effM effE : Effect} :
-      WellTyped ctx s (.adt tag pTy) effS →
+      WellTyped ctx s (.adt inputTag pTy) effS →
       WellTyped ctx onMatch resTy effM →
       WellTyped ctx onElse resTy effE →
       WellTyped ctx (.matchTag s tag onMatch onElse) resTy (effS.union (effM.union effE))

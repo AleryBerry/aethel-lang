@@ -1,6 +1,27 @@
 import Aethel.Iteration
+import Aethel.SourceLoops
 
 namespace Aethel.Iteration.Tests
+
+open Core SourceVerification
+
+private def runSourceCountdownTests : IO Unit := do
+  let state := (({} : State).addAllocation 0 [7, 44]).addHandle 0 ⟨⟨0, 0⟩, .exclusive⟩
+  let initial := state.addView ⟨0, ⟨0, 1⟩, .shared⟩
+  let some loop := checkSaturatingCountdown initial.resources 1 0 3
+    | throw (IO.userError "Well-founded source countdown rejected a disjoint live view")
+  let final := (loop.run ⟨initial, rfl⟩).val
+  if final.observations != [0, 1, 1, 4, 4, 7, 7] || final.byte ⟨0, 0⟩ != some 0 ||
+      final.byte ⟨0, 1⟩ != some 44 || final.views != initial.views then
+    throw (IO.userError "Well-founded source countdown changed its guard trace or caller frame")
+  if (Operations.countdown 0 0 3 .done .done).run 1 initial != some final then
+    throw (IO.userError "Compact source countdown changed the number of saturated steps or guard reads")
+  if (checkSaturatingCountdown initial.resources 1 0 0).isSome then
+    throw (IO.userError "Zero decrement accepted as a termination measure")
+  let blocked := state.addView ⟨0, ⟨0, 0⟩, .shared⟩
+  if (checkSaturatingCountdown blocked.resources 1 0 3).isSome then
+    throw (IO.userError "Well-founded source countdown accepted a write through a conflicting view")
+  IO.println "4 source-operation countdown regressions passed"
 
 structure LoopState where
   count : Nat
@@ -93,5 +114,6 @@ def runIterationTests : IO Unit := do
   | _ => throw (IO.userError "drive with fuel > measure must finish")
 
   IO.println "10 bounded driver and well-founded loop iteration regressions passed"
+  runSourceCountdownTests
 
 end Aethel.Iteration.Tests

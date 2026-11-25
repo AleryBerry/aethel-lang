@@ -228,4 +228,54 @@ theorem RingDeque.popBack_pushBack {α : Type} (d : RingDeque α) (x : α) :
     (d.pushBack x).popBack = some (x, d) := by
   simp [RingDeque.pushBack, RingDeque.popBack]
 
+/-! ### Part D: Append-Only Tip Arena String Concatenation (`str.concat`) -/
+
+/-- Immutable slice descriptor `(offset, len)` inside a contiguous byte arena `buf`. -/
+structure StrSliceView where
+  offset : Nat
+  len : Nat
+  deriving Repr, DecidableEq
+
+def StrSliceView.Valid (buf : List UInt8) (v : StrSliceView) : Prop :=
+  v.offset + v.len ≤ buf.length
+
+def StrSliceView.read (buf : List UInt8) (v : StrSliceView) : List UInt8 :=
+  (buf.drop v.offset).take v.len
+
+def isArenaTip (buf : List UInt8) (v : StrSliceView) : Bool :=
+  decide (v.offset + v.len = buf.length)
+
+theorem arenaTipAppend_preserves_existing_views {buf suffix : List UInt8} {v : StrSliceView}
+    (hValid : v.Valid buf) :
+    v.read (buf ++ suffix) = v.read buf := by
+  dsimp [StrSliceView.Valid] at hValid
+  dsimp [StrSliceView.read]
+  rw [List.drop_append, Nat.sub_eq_zero_of_le (by omega), List.drop_zero,
+      List.take_append, List.length_drop, Nat.sub_eq_zero_of_le (by omega), List.take_zero,
+      List.append_nil]
+
+theorem arenaTipAppend_extends_tip_exact {buf suffix : List UInt8} {v : StrSliceView}
+    (hTip : isArenaTip buf v = true) :
+    (StrSliceView.mk v.offset (v.len + suffix.length)).read (buf ++ suffix) =
+      v.read buf ++ suffix := by
+  simp only [isArenaTip, decide_eq_true_eq] at hTip
+  dsimp [StrSliceView.read]
+  have hDropLen : (buf.drop v.offset).length = v.len := by
+    rw [List.length_drop]; omega
+  rw [List.drop_append, Nat.sub_eq_zero_of_le (by omega), List.drop_zero]
+  rw [List.take_append, hDropLen, Nat.add_sub_cancel_left]
+  rw [List.take_of_length_le (by omega : (buf.drop v.offset).length ≤ v.len + suffix.length)]
+  rw [List.take_of_length_le (by omega : (buf.drop v.offset).length ≤ v.len)]
+  rw [List.take_of_length_le (Nat.le_refl suffix.length)]
+
+theorem arenaNonTip_detected_sound {buf suffix : List UInt8} {v : StrSliceView}
+    (hValid : v.Valid buf) (hNonEmpty : suffix ≠ []) :
+    isArenaTip (buf ++ suffix) v = false := by
+  dsimp [StrSliceView.Valid] at hValid
+  cases suffix with
+  | nil => exact absurd rfl hNonEmpty
+  | cons _ _ =>
+    simp only [isArenaTip, List.length_append, List.length_cons, decide_eq_false_iff_not]
+    omega
+
 end Aethel.StdContainers

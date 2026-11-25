@@ -50,6 +50,21 @@ theorem decodeUInt16LE_split (v : UInt16) :
   rw [Nat.mul_comm 256]
   exact Nat.mod_add_div' v.toNat 256
 
+/-- Unsigned saturating subtraction keeps the mathematical truncated difference. -/
+def subtractByteSat (left right : UInt8) : UInt8 :=
+  UInt8.ofNat (left.toNat - right.toNat)
+
+theorem subtractByteSat_toNat (left right : UInt8) :
+    (subtractByteSat left right).toNat = left.toNat - right.toNat := by
+  simp only [subtractByteSat, UInt8.toNat_ofNat']
+  exact Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le ..) left.toNat_lt)
+
+theorem subtractByteSat_strict_decrease {left right : UInt8}
+    (leftPositive : 0 < left.toNat) (rightPositive : 0 < right.toNat) :
+    (subtractByteSat left right).toNat < left.toNat := by
+  rw [subtractByteSat_toNat]
+  omega
+
 inductive Var : List Ty → Ty → Type where
   | here : Var (ty :: ctx) ty
   | there : Var ctx ty → Var (other :: ctx) ty
@@ -64,6 +79,7 @@ inductive Term : List Ty → Ty → Type where
   | byteEq : Term ctx .byte → Term ctx .byte → Term ctx .bool
   | byteLt : Term ctx .byte → Term ctx .byte → Term ctx .bool
   | byteLe : Term ctx .byte → Term ctx .byte → Term ctx .bool
+  | byteSubSat : Term ctx .byte → Term ctx .byte → Term ctx .byte
   | uint16Lt : Term ctx .uint16 → Term ctx .uint16 → Term ctx .bool
   | uint16Le : Term ctx .uint16 → Term ctx .uint16 → Term ctx .bool
   | bool : Bool → Term ctx .bool
@@ -99,6 +115,7 @@ def Term.eval {ctx : List Ty} {ty : Ty} (env : Env ctx) : Term ctx ty → ty.Val
   | .byteEq a b => (show UInt8 from a.eval env) == b.eval env
   | .byteLt a b => (show UInt8 from a.eval env) < b.eval env
   | .byteLe a b => (show UInt8 from a.eval env) ≤ b.eval env
+  | .byteSubSat a b => subtractByteSat (a.eval env) (b.eval env)
   | .uint16Lt a b => (show UInt16 from a.eval env) < b.eval env
   | .uint16Le a b => (show UInt16 from a.eval env) ≤ b.eval env
   | .bool b => b
@@ -128,6 +145,7 @@ inductive Raw where
   | byteEq (left right : Raw)
   | byteLt (left right : Raw)
   | byteLe (left right : Raw)
+  | byteSubSat (left right : Raw)
   | uint16Lt (left right : Raw)
   | uint16Le (left right : Raw)
   | bool (value : Bool)
@@ -190,6 +208,10 @@ def infer (ctx : List Ty) : Raw → Except TypeError ((ty : Ty) × Term ctx ty)
     let left ← expect .byte (← infer ctx a)
     let right ← expect .byte (← infer ctx b)
     return ⟨.bool, .byteLe left right⟩
+  | .byteSubSat a b => do
+    let left ← expect .byte (← infer ctx a)
+    let right ← expect .byte (← infer ctx b)
+    return ⟨.byte, .byteSubSat left right⟩
   | .uint16Lt a b => do
     let left ← expect .uint16 (← infer ctx a)
     let right ← expect .uint16 (← infer ctx b)
@@ -247,6 +269,7 @@ def Term.erase : Term ctx ty → Raw
   | .byteEq a b => .byteEq a.erase b.erase
   | .byteLt a b => .byteLt a.erase b.erase
   | .byteLe a b => .byteLe a.erase b.erase
+  | .byteSubSat a b => .byteSubSat a.erase b.erase
   | .uint16Lt a b => .uint16Lt a.erase b.erase
   | .uint16Le a b => .uint16Le a.erase b.erase
   | .bool b => .bool b
@@ -290,6 +313,8 @@ inductive Evaluates : Env ctx → Term ctx ty → ty.Value → Prop where
       Evaluates env a x → Evaluates env b y → Evaluates env (.byteLt a b) (x < y)
   | byteLe {a b : Term ctx .byte} {x y : UInt8} :
       Evaluates env a x → Evaluates env b y → Evaluates env (.byteLe a b) (x ≤ y)
+  | byteSubSat {a b : Term ctx .byte} {x y : UInt8} :
+      Evaluates env a x → Evaluates env b y → Evaluates env (.byteSubSat a b) (subtractByteSat x y)
   | uint16Lt {a b : Term ctx .uint16} {x y : UInt16} :
       Evaluates env a x → Evaluates env b y → Evaluates env (.uint16Lt a b) (x < y)
   | uint16Le {a b : Term ctx .uint16} {x y : UInt16} :
@@ -328,6 +353,7 @@ theorem Term.evaluates (term : Term ctx ty) (env : Env ctx) :
   | byteEq _ _ left right => exact .byteEq (left env) (right env)
   | byteLt _ _ left right => exact .byteLt (left env) (right env)
   | byteLe _ _ left right => exact .byteLe (left env) (right env)
+  | byteSubSat _ _ left right => exact .byteSubSat (left env) (right env)
   | uint16Lt _ _ left right => exact .uint16Lt (left env) (right env)
   | uint16Le _ _ left right => exact .uint16Le (left env) (right env)
   | bool => exact .bool

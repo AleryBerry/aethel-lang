@@ -396,8 +396,8 @@ pub const modules = [_]StdModule{
         .source =
         \\//// Standard string helpers for Aethel (immutable copyable slices).
         \\//// Core operations (`str.len`, `str.is_empty`, `str.eq`, `str.concat`,
-        \\//// `str.starts_with`, `str.ends_with`, `str.contains`, `str.byte_at`,
-        \\//// `str.slice_bytes`) are lowered directly by the compiler backend.
+        \\//// `str.repeat`, `str.starts_with`, `str.ends_with`, `str.contains`,
+        \\//// `str.byte_at`, `str.slice_bytes`) are lowered directly by the compiler backend.
         \\
         \\pub fn empty() -> String {
         \\  ""
@@ -430,7 +430,7 @@ pub const modules = [_]StdModule{
         \\////   vec.new() / vec.with_capacity(cap) / vec.len(v) / vec.capacity(v)
         \\////   vec.is_empty(v) / vec.push(v, x) / vec.pop(v) / vec.get(v, i)
         \\////   vec.set(v, i, x) / vec.swap_remove(v, i) / vec.reserve(v, add)
-        \\////   vec.clear(v) / vec.as_slice(v) / vec.as_collection(v)
+        \\////   vec.clear(v) / vec.as_slice(v) / vec.as_mut_slice(v) / vec.as_collection(v)
         \\
         \\pub fn initial_capacity() -> u64 {
         \\  8u64

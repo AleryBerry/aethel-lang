@@ -48,6 +48,10 @@ def AccessTarget.location (target : AccessTarget) (state : State) : Option ByteL
   | .handle id => (state.handle id).map Handle.location
   | .view id => (state.view id).map View.location
 
+theorem AccessTarget.location_resources (target : AccessTarget) (state : State) :
+    target.location state.resources.authorityState = target.location state := by
+  cases target <;> rfl
+
 /-- Permission and liveness checks precede observation. A successful read
 returns the byte at the target in the state immediately before the read. -/
 theorem AccessTarget.read_current_byte {target : AccessTarget} {state next : State} {value : UInt8}
@@ -81,10 +85,7 @@ def checkAdjacent (state : ResourceState) (low high : AccessTarget) : Bool :=
 
 theorem checkAdjacent_correct (state : State) (low high : AccessTarget) :
     checkAdjacent state.resources low high = true ↔ Adjacent state low high := by
-  have location (target : AccessTarget) :
-      target.location state.resources.authorityState = target.location state := by
-    cases target <;> rfl
-  simp only [checkAdjacent, Adjacent, location]
+  simp only [checkAdjacent, Adjacent, AccessTarget.location_resources]
   cases low.location state <;> cases high.location state <;> simp
 
 theorem AccessTarget.check_value (target : AccessTarget) (state : ResourceState) (a b : UInt8) :
@@ -100,8 +101,10 @@ inductive Code : List Ty → Type where
   | readUInt16LE : AccessTarget → AccessTarget → Code (.uint16 :: ctx) → Code ctx
   | write : AccessTarget → Term ctx .byte → Code ctx → Code ctx
   | writeUInt16LE : AccessTarget → AccessTarget → Term ctx .uint16 → Code ctx → Code ctx
+  | requireLocation : AccessTarget → ByteLocation → Code ctx → Code ctx
   | letValue : Term ctx ty → Code (ty :: ctx) → Code ctx
   | branch : Term ctx .bool → Code ctx → Code ctx → Code ctx
+  | selectByte : Term ctx .byte → (Fin 256 → Code ctx) → Code ctx
 
 inductive RawCode where
   | finish
@@ -157,10 +160,14 @@ def checkWithFacts (state : ResourceState) (facts : BranchFacts ctx) : Code ctx 
       ((checkInstruction state (low.writeInstruction 0)).any fun middle =>
         (checkInstruction middle (high.writeInstruction 0)).any fun s =>
           checkWithFacts s facts next)
+  | .requireLocation target location next =>
+    decide (target.location state.authorityState = some location) && checkWithFacts state facts next
   | .letValue (ty := ty) _ body => checkWithFacts state (facts.underBinder ty) body
   | .branch condition yes no =>
     facts.checkArms condition (fun known => checkWithFacts state known yes)
       (fun known => checkWithFacts state known no)
+  | .selectByte _ arms =>
+    (List.finRange 256).all fun i => checkWithFacts state facts (arms i)
 
 def check (state : ResourceState) (code : Code ctx) : Bool :=
   checkWithFacts state [] code
@@ -197,9 +204,12 @@ def runCode (env : Env ctx) (state : State) : Code ctx → Option (Program × St
       let stepHigh ← execute middle highInstruction
       let (steps, final) ← runCode env stepHigh next
       return (lowInstruction :: highInstruction :: steps, final)
+  | .requireLocation target location next =>
+    if target.location state = some location then runCode env state next else none
   | .letValue value body => runCode (env.extend (value.eval env)) state body
   | .branch condition yes no =>
     if (show Bool from condition.eval env) then runCode env state yes else runCode env state no
+  | .selectByte value arms => runCode env state (arms (value.eval env : UInt8).toFin)
 
 /-- Declarative execution. The read rule uses the byte machine's observed
 value to extend the local environment. -/
@@ -226,12 +236,16 @@ inductive Executes : Env ctx → State → Code ctx → Program → State → Pr
       Executes env next rest steps final →
       Executes env state (.writeUInt16LE low high term rest)
         (low.writeInstruction (splitLow word) :: high.writeInstruction (splitHigh word) :: steps) final
+  | requireLocation : target.location state = some location → Executes env state next steps final →
+      Executes env state (.requireLocation target location next) steps final
   | letValue : Evaluates env term value → Executes (env.extend value) state body steps final →
       Executes env state (.letValue term body) steps final
   | branchTrue : Evaluates env condition true → Executes env state yes steps final →
       Executes env state (.branch condition yes no) steps final
   | branchFalse : Evaluates env condition false → Executes env state no steps final →
       Executes env state (.branch condition yes no) steps final
+  | selectByte : Evaluates env term value → Executes env state (arms value.toFin) steps final →
+      Executes env state (.selectByte term arms) steps final
 
 inductive CheckError where
   | illTyped (error : TypeError)
@@ -260,7 +274,8 @@ theorem Executes.trace {env : Env ctx} {state final : State} {code : Code ctx} {
   | readUInt16LE _ first _ second _ _ ih => exact .cons first (.cons second ih)
   | write _ first _ ih => exact .cons first ih
   | writeUInt16LE _ _ first second _ ih => exact .cons first (.cons second ih)
-  | letValue _ _ ih | branchTrue _ _ ih | branchFalse _ _ ih => exact ih
+  | requireLocation _ _ ih | letValue _ _ ih | branchTrue _ _ ih | branchFalse _ _ ih | selectByte _ _ ih =>
+    exact ih
 
 theorem Executes.agrees {env : Env ctx} {state final : State} {code : Code ctx} {steps : Program}
     (execution : Executes env state code steps final) :
@@ -281,8 +296,9 @@ theorem Executes.agrees {env : Env ctx} {state final : State} {code : Code ctx} 
   | writeUInt16LE adjacent evaluated first second _ ih =>
     simp [runCode, (checkAdjacent_correct _ _ _).mpr adjacent, evaluated.agrees,
       execute_complete first, execute_complete second, ih, bind, pure]
+  | requireLocation located _ ih => simp [runCode, located, ih]
   | letValue evaluated _ ih => simp [runCode, evaluated.agrees, ih]
-  | branchTrue evaluated _ ih | branchFalse evaluated _ ih =>
+  | branchTrue evaluated _ ih | branchFalse evaluated _ ih | selectByte evaluated _ ih =>
     simp [runCode, evaluated.agrees, ih]
 
 theorem runCode_sound {env : Env ctx} {state final : State} {code : Code ctx} {steps : Program}
@@ -326,6 +342,10 @@ theorem runCode_sound {env : Env ctx} {state final : State} {code : Code ctx} {s
       exact .writeUInt16LE ((checkAdjacent_correct _ _ _).mp adjacent) (value.evaluates env)
         (execute_sound first) (execute_sound second) (ih remaining)
     · simp [runCode, adjacent] at ran
+  | requireLocation target location next ih =>
+    by_cases located : target.location state = some location
+    · exact .requireLocation located (ih (by simpa [runCode, located] using ran))
+    · simp [runCode, located] at ran
   | letValue value body ih =>
     exact .letValue (value.evaluates env) (ih ran)
   | branch condition _ _ yes no =>
@@ -333,6 +353,8 @@ theorem runCode_sound {env : Env ctx} {state final : State} {code : Code ctx} {s
       ite_true] at ran
     · exact .branchFalse (h ▸ condition.evaluates env) (no ran)
     · exact .branchTrue (h ▸ condition.evaluates env) (yes ran)
+  | selectByte term _ ih =>
+    exact .selectByte (term.evaluates env) (ih _ ran)
 
 theorem runCode_correct (env : Env ctx) (state : State) (code : Code ctx)
     (steps : Program) (final : State) :
@@ -400,6 +422,11 @@ theorem checkWithFacts_executes (code : Code ctx) (env : Env ctx) (state : State
     obtain ⟨steps, final, remaining, closed⟩ := ih env stepHigh facts validFacts rest
     exact ⟨_, final, .writeUInt16LE ((checkAdjacent_correct _ _ _).mp valid.1)
       (value.evaluates env) first second remaining, closed⟩
+  | requireLocation target location _ ih =>
+    obtain ⟨located, next⟩ := Bool.and_eq_true_iff.mp checked
+    rw [AccessTarget.location_resources] at located
+    obtain ⟨steps, final, remaining, closed⟩ := ih env state facts validFacts next
+    exact ⟨steps, final, .requireLocation (of_decide_eq_true located) remaining, closed⟩
   | letValue value _ ih =>
     obtain ⟨steps, final, remaining, closed⟩ :=
       ih (env.extend (value.eval env)) state _ (validFacts.underBinder _) checked
@@ -414,6 +441,13 @@ theorem checkWithFacts_executes (code : Code ctx) (env : Env ctx) (state : State
     · obtain ⟨steps, final, remaining, closed⟩ := yes env state _ (validFacts.learn h)
         (BranchFacts.checkArms_sound validFacts h arms)
       exact ⟨steps, final, .branchTrue (h ▸ condition.evaluates env) remaining, closed⟩
+  | selectByte term arms ih =>
+    let value : UInt8 := term.eval env
+    have valid : (List.finRange 256).all (fun i => checkWithFacts state.resources facts (arms i)) = true :=
+      checked
+    obtain ⟨steps, final, remaining, closed⟩ := ih value.toFin env state facts validFacts
+      (List.all_eq_true.mp valid _ (List.mem_finRange _))
+    exact ⟨steps, final, .selectByte (term.evaluates env) remaining, closed⟩
 
 theorem check_executes (code : Code ctx) (env : Env ctx) (state : State)
     (checked : check state.resources code = true) :

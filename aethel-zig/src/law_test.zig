@@ -164,3 +164,38 @@ test "3. Stage D termination decreases verification on while loops and recursive
         try std.testing.expectEqual(sema.SemaDiagnostic.Kind.termination_error, res.checked.diagnostics[0].kind);
     }
 }
+
+test "field countdown certificate describes the saturated update" {
+    var good = try analyzeSource(
+        \\type Counter { value: u8, spare: u8 }
+        \\fn count(mut counter: Counter) -> u8 {
+        \\  while counter.value > 0u8 decreases counter.value {
+        \\    counter.value = counter.value -| 1u8;
+        \\  }
+        \\  counter.value
+        \\}
+    );
+    defer good.tree.deinit();
+    defer good.checked.deinit();
+    try std.testing.expect(!good.checked.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), good.checked.functions[0].decreases_certs.len);
+
+    var mir_buf: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer mir_buf.deinit();
+    try mir.emitMir(&good.checked, &mir_buf.writer);
+    try std.testing.expect(std.mem.indexOf(u8, mir_buf.written(), "decreases 1 lt 0 v0 v0 sub v0 1") != null);
+
+    var bad = try analyzeSource(
+        \\type Counter { value: u8, spare: u8 }
+        \\fn count(mut counter: Counter) -> u8 {
+        \\  while counter.value > 0u8 decreases counter.value {
+        \\    counter.value = counter.spare -| 1u8;
+        \\  }
+        \\  counter.value
+        \\}
+    );
+    defer bad.tree.deinit();
+    defer bad.checked.deinit();
+    try std.testing.expect(bad.checked.hasErrors());
+    try std.testing.expectEqual(sema.SemaDiagnostic.Kind.termination_error, bad.checked.diagnostics[0].kind);
+}

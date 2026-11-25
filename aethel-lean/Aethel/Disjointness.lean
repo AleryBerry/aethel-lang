@@ -76,4 +76,17 @@ theorem Interval.disjoint_sound {a b : Interval} {i : Nat} (h : a.disjoint b = t
   simp only [Contains]
   omega
 
+theorem Interval.disjoint_correct (a b : Interval) :
+    a.disjoint b = true ↔ ∀ i, ¬ (a.Contains i ∧ b.Contains i) := by
+  constructor
+  · intro checked _
+    exact Interval.disjoint_sound checked
+  · intro separate
+    by_cases checked : a.disjoint b = true
+    · exact checked
+    · simp only [disjoint, decide_eq_true_eq] at checked
+      exact False.elim (separate (max a.lo b.lo) (by
+        simp only [Contains]
+        omega))
+
 end Aethel

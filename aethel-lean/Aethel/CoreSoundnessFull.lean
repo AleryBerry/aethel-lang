@@ -67,9 +67,13 @@ theorem progress (e : CoreExpr) (hSeq : IsSequentialCore e) (ty : CoreType) (eff
   | matchTag tag hs hm he ihs _ _ =>
     cases hTyped with
     | matchTag _ hS _ _ =>
+      rename_i inputTag _ _ _ _ _ _
       rcases ihs _ _ hS with hValS | ⟨s', sc', hStepS⟩
       · obtain ⟨p, rfl, hValP⟩ := canonical_adt hValS hS
-        exact Or.inr ⟨s, _, Step.match_hit tag hValP⟩
+        by_cases same : inputTag = tag
+        · subst inputTag
+          exact Or.inr ⟨s, _, Step.match_hit tag hValP⟩
+        · exact Or.inr ⟨s, _, Step.match_miss inputTag tag same hValP⟩
       · exact Or.inr ⟨s', .matchTag sc' tag _ _, Step.match_eval tag hStepS⟩
     | matchBool hS _ _ =>
       rcases ihs _ _ hS with hValS | ⟨s', sc', hStepS⟩
@@ -179,7 +183,7 @@ theorem wellTyped_weaken {ctx1 ctx2 : Ctx} {e : CoreExpr} {ty : CoreType} {eff :
   | unit => exact .unit ctx2
   | bool _ b => exact .bool ctx2 b
   | nat _ n => exact .nat ctx2 n
-  | int _ s bits v => exact .int ctx2 s bits v
+  | int _ s bits v fits => exact .int ctx2 s bits v fits
   | pair ha hb iha ihb =>
     exact .pair (iha hsub) (ihb hsub)
   | fst hp ih =>
@@ -266,7 +270,7 @@ theorem substitution_value {val : CoreExpr} {tyV : CoreType}
   | int s bits v =>
     intro ctx varId tyBody effBody hBody
     cases hBody
-    exact .int ctx s bits v
+    exact .int ctx s bits v (by assumption)
   | pair a b iha ihb =>
     intro ctx varId tyBody effBody hBody
     cases hBody with

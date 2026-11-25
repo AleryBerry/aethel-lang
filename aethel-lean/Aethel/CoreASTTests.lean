@@ -46,7 +46,7 @@ def runCoreASTTests : IO Unit := do
   have hUnit : WellTyped [] .unit .unit .empty := .unit []
   have hBool : WellTyped [] (.bool true) .bool .empty := .bool [] true
   have hNat : WellTyped [] (.nat 10) .nat .empty := .nat [] 10
-  have hByte : WellTyped [] (.int false 8 128) CoreType.byte .empty := .int [] false 8 128
+  have hByte : WellTyped [] (.int false 8 128) CoreType.byte .empty := .int [] false 8 128 (by decide)
   have _ := hUnit; have _ := hBool; have _ := hNat; have _ := hByte
 
   -- Test 7: Static typing of pairs and projections
@@ -68,7 +68,7 @@ def runCoreASTTests : IO Unit := do
   have hLam : WellTyped [] (.lam 0 .byte (.readHandle 0 1) effRead) (.arrow .byte .byte effRead) .empty :=
     .lam 0 .byte effRead (.readHandle [(0, .byte)] 0 1)
   have hApp : WellTyped [] (.app (.lam 0 .byte (.readHandle 0 1) effRead) (.int false 8 0)) .byte effRead := by
-    have hArg : WellTyped [] (.int false 8 0) .byte .empty := .int [] false 8 0
+    have hArg : WellTyped [] (.int false 8 0) .byte .empty := .int [] false 8 0 (by decide)
     have happ := WellTyped.app hLam hArg
     simp only [Effect.union_empty_left] at happ
     exact happ

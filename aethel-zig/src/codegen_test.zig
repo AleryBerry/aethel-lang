@@ -263,3 +263,49 @@ test "8. codegen: LNL once closures, generics, fused SIMD+fold pipelines, combin
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "// Categorical fusion: Option.map |> unwrap_or") != null);
     try std.testing.expect(std.mem.indexOf(u8, zig_src, "// Categorical fusion: Result.map |> unwrap_or") != null);
 }
+
+test "integer comparisons read through scalar field views and widen their values" {
+    const zig_src = try compileToZig(
+        \\type Reading { value: u8 }
+        \\fn main() -> u8 {
+        \\  let mut reading = Reading { value: 17u8 }
+        \\  view exclusive held = reading.value {
+        \\    if 300u16 > held { 0u8 } else { 1u8 }
+        \\  }
+        \\}
+    );
+    defer std.testing.allocator.free(zig_src);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "@as(u16, @intCast((held).*))") != null);
+}
+
+test "a numeric range snapshots the value read through its bound view" {
+    const zig_src = try compileToZig(
+        \\type Reading { value: u8, result: u8 }
+        \\fn main() -> u8 {
+        \\  let mut reading = Reading { value: 2u8, result: 0u8 };
+        \\  view exclusive count = reading.value {
+        \\    for _ in 0u8..count { reading.result = 19u8; };
+        \\  };
+        \\  reading.result
+        \\}
+    );
+    defer std.testing.allocator.free(zig_src);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, ": u8 = (count).*;") != null);
+}
+
+test "integer assignment and saturated subtraction read scalar views" {
+    const zig_src = try compileToZig(
+        \\type Reading { value: u8, result: u8 }
+        \\fn main() -> u8 {
+        \\  let mut reading = Reading { value: 10u8, result: 0u8 };
+        \\  view exclusive held = reading.value {
+        \\    reading.result = held;
+        \\    reading.result = held -| 2u8;
+        \\  };
+        \\  reading.result
+        \\}
+    );
+    defer std.testing.allocator.free(zig_src);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "reading.result = (held).*;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, zig_src, "(held).* -| ") != null);
+}

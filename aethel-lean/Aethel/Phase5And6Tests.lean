@@ -1,6 +1,8 @@
 import Aethel.MIRValidator
 import Aethel.ScopedForkJoin
 import Aethel.RustFFI
+import Aethel.RustBorrowedCall
+import Aethel.SourceMIR
 
 namespace Aethel.Phase5And6.Tests
 
@@ -234,11 +236,45 @@ private def runRustFFITests : IO Unit := do
     (!checkRustSlicePairCompatible
       ⟨0, 0, 4, 1, 1, .exclusive, false⟩
       ⟨0, 2, 4, 1, 1, .shared, false⟩)
+  require "empty mutable Rust span inside a long range is disjoint"
+    (checkRustSlicePairCompatible
+      ⟨0, 0, isizeMax64, 1, 1, .exclusive, false⟩
+      ⟨0, 24, 0, 1, 1, .exclusive, false⟩)
+  require "long mutable Rust ranges overlap by their endpoints"
+    (!checkRustSlicePairCompatible
+      ⟨0, 0, isizeMax64, 1, 1, .exclusive, false⟩
+      ⟨0, isizeMax64 - 1, 1, 1, 1, .shared, false⟩)
 
   let stWithView : Core.State := st0.addView ⟨1, ⟨0, 0⟩, .shared⟩
   let callViews : List Core.View := [⟨10, ⟨0, 4⟩, .exclusive⟩, ⟨11, ⟨0, 5⟩, .exclusive⟩]
   require "rustCall bracket restores existing views"
     (popCallViews (pushCallViews stWithView callViews) [10, 11] == stWithView)
+  let writable : RustSliceSpec := ⟨0, 4, 2, 1, 1, .exclusive, false⟩
+  let readable : RustSliceSpec := ⟨0, 1, 2, 1, 1, .shared, false⟩
+  let empty := { writable with len := 0 }
+  let slices := [writable, empty, readable]
+  let grants := rustCallViews stWithView slices
+  let some written := grants[0]? | throw (IO.userError "missing mutable Rust loan")
+  let some read := grants[3]? | throw (IO.userError "missing last shared Rust loan")
+  let some after := runRustBorrowedCall stWithView slices
+      [.writeView written.id 99, .readView read.id, .readView written.id] |
+    throw (IO.userError "valid Rust borrowed trace rejected")
+  require "Rust trace writes the borrowed byte and reads the current contents"
+    (after.byte ⟨0, 4⟩ == some 99 && after.observations == [99, 3])
+  require "Rust trace restores caller permissions and keeps unrelated bytes"
+    (decide (after.resources = stWithView.resources) && after.byte ⟨0, 7⟩ == some 8)
+  require "Rust trace cannot write through a shared slice"
+    (runRustBorrowedCall stWithView slices [.writeView read.id 20]).isNone
+  require "Rust trace rejects the ID just after the last granted byte"
+    (runRustBorrowedCall stWithView slices [.readView (read.id + 1)]).isNone
+  require "A zero-length Rust slice grants no byte IDs"
+    (runRustBorrowedCall stWithView [empty] [.readView stWithView.freshView]).isNone
+  require "Rust trace cannot use the caller's separate view"
+    (runRustBorrowedCall stWithView [writable] [.readView 1]).isNone
+  require "Rust mut slice cannot overlap a live caller shared reservation"
+    (runRustBorrowedCall stWithView [⟨0, 0, 1, 1, 1, .exclusive, false⟩] []).isNone
+  require "Rust call rejects two overlapping slice arguments without executing accesses"
+    (runRustBorrowedCall stWithView [writable, ⟨0, 5, 1, 1, 1, .shared, false⟩] []).isNone
 
   require "RustOwn alive use succeeds"
     (rustOwnStep .alive .useHandle == some .alive)
@@ -249,10 +285,41 @@ private def runRustFFITests : IO Unit := do
   require "RustOwn use after drop rejected"
     ((rustOwnStep .dropped .useHandle).isNone)
 
+private def runReferenceAccessTests : IO Unit := do
+  let state := (({} : Core.State).addAllocation 0 [14, 27]).addView ⟨0, ⟨0, 0⟩, .exclusive⟩
+  let matching : SourceVerification.Operations := .assign (.view 0 0) 82 .done
+  let forged : SourceVerification.Operations := .assign (.view 0 1) 82 .done
+  let exit : SourceVerification.Continuation := fun _ => .instruction (.release 0) .finish
+  require "A reference store checks and writes the byte of its actual exclusive reservation"
+    (matching.check 1 state.resources && (matching.run 1 state).any (fun after =>
+      after.byte ⟨0, 0⟩ == some 82 && after.byte ⟨0, 1⟩ == some 27))
+  require "An independent reference program cannot claim a sibling's offset for its view store"
+    (!forged.check 1 state.resources && (forged.run 1 state).isNone &&
+      Structured.check state.resources (matching.toCode 1 exit []) &&
+      !Structured.check state.resources (forged.toCode 1 exit []))
+  let forgedRead : SourceVerification.Operations := .discard (.view 0 1) .done
+  require "A reference load cannot claim a sibling's offset for its live view"
+    (!forgedRead.check 1 state.resources && (forgedRead.run 1 state).isNone &&
+      !Structured.check state.resources (forgedRead.toCode 1 exit []))
+  let guard : SourceVerification.Operations := .branch (.view 0 0) .less (.place (.field 1)) .done .done .done
+  let ready := state.addHandle 1 ⟨⟨0, 1⟩, .exclusive⟩
+  require "A two-operand branch observes the left byte once before the right byte"
+    ((guard.run 1 ready).any (fun after => after.observations == [27, 14]))
+  let samePlace := SourceVerification.Place.view 0 0
+  let constant : SourceVerification.Operations := .branch samePlace .equal (.place samePlace)
+    .done (.assign (.field 0) 96 .done) .done
+  require "A statically determined comparison still observes both authorized reads"
+    (constant.check 1 ready.resources &&
+      (constant.run 1 ready).any (fun after => after.observations == [14, 14]))
+  let emptyRange := SourceVerification.Operations.range (.place (.field 1)) (.place samePlace) .done .done
+  require "An empty dynamic range still evaluates both endpoints once in order"
+    ((emptyRange.run 1 ready).any (fun after => after.observations == [14, 27]))
+
 def run : IO Unit := do
   runMIRTests
   runForkJoinTests
   runRustFFITests
+  runReferenceAccessTests
   IO.println "Phase 5 & 6 MIR validator, scoped fork/join, and Rust FFI regressions passed"
 
 end Aethel.Phase5And6.Tests

@@ -1784,6 +1784,52 @@ pub const DecreasesResult = union(enum) {
     failed: []const u8,
 };
 
+fn sameDirectField(source: [:0]const u8, left: *const ast.Expr, right: *const ast.Expr) bool {
+    if (left.* != .field or right.* != .field) return false;
+    const lhs = left.field;
+    const rhs = right.field;
+    return lhs.target.* == .ident and rhs.target.* == .ident and
+        std.mem.eql(u8, lhs.target.ident.slice(source), rhs.target.ident.slice(source)) and
+        std.mem.eql(u8, lhs.name.slice(source), rhs.name.slice(source));
+}
+
+// The caller has checked that the measure is a u8 field. Match the entire
+// body so the emitted Nat subtraction describes the actual single update.
+pub fn byteFieldCountdown(
+    alloc: std.mem.Allocator,
+    source: [:0]const u8,
+    condition: *const ast.Expr,
+    measure: *const ast.Expr,
+    body: ast.Block,
+) ?DecreasesCertEmit {
+    if (condition.* != .binary or condition.binary.op != .gt or
+        body.stmts.len != 1 or body.tail != null or body.stmts[0] != .assign_stmt)
+        return null;
+    const guard = condition.binary;
+    if (!sameDirectField(source, measure, guard.left) or guard.right.* != .int_lit or
+        !std.mem.eql(u8, guard.right.int_lit.slice(source), "0u8"))
+        return null;
+    const update = body.stmts[0].assign_stmt;
+    if (update.op != .assign or !sameDirectField(source, measure, update.target) or
+        update.value.* != .binary or update.value.binary.op != .sub_sat)
+        return null;
+    const rhs = update.value.binary;
+    if (!sameDirectField(source, measure, rhs.left) or rhs.right.* != .int_lit or
+        !std.mem.eql(u8, rhs.right.int_lit.slice(source), "1u8"))
+        return null;
+
+    const current = mkLawExpr(alloc, .{ .var_id = 0 });
+    const zero = mkLawExpr(alloc, .{ .const_val = 0 });
+    const one = mkLawExpr(alloc, .{ .const_val = 1 });
+    const when_positive = mkLawProp(alloc, .{ .lt = .{ .a = zero, .b = current } });
+    const guards = alloc.dupe(*const LawProp, &.{when_positive}) catch return null;
+    return .{
+        .guards = guards,
+        .cur_measure = current,
+        .next_measure = mkLawExpr(alloc, .{ .sub = .{ .a = current, .b = one } }),
+    };
+}
+
 fn substLawExprChecked(alloc: std.mem.Allocator, expr: *const LawExpr, mapping: *const std.AutoHashMapUnmanaged(u16, ?*const LawExpr)) ?*const LawExpr {
     return switch (expr.*) {
         .var_id => |id| if (mapping.get(id)) |opt| opt else expr,

@@ -234,6 +234,53 @@ theorem soa_query_preserves_unqueried_columns {s : Core.State} {owner : OwnerId}
   have hAt := hWriteRep i hi fRead hfR
   simpa [writeByteTable, hNe.symm] using hAt
 
+/-- Dynamic `__AethelDynSoA_<Rec>` column slice specification: each column lives in an
+independently allocated, `elemAlign`-aligned heap buffer owned by `colOwner qf.fieldIdx`. -/
+def dynSoAColumnSliceSpec (colOwner : Nat → OwnerId) (length elemBytes elemAlign : Nat)
+    (qf : SoAQueryField) : RustSliceSpec :=
+  ⟨colOwner qf.fieldIdx, 0, length, elemBytes, elemAlign, qf.mode, false⟩
+
+theorem dynSoA_column_slices_compatible {colOwner : Nat → OwnerId}
+    (hInj : ∀ a b, colOwner a = colOwner b → a = b)
+    {length elemBytes elemAlign : Nat} {q1 q2 : SoAQueryField}
+    (hCompat : q1.fieldIdx ≠ q2.fieldIdx ∨ (q1.mode = .shared ∧ q2.mode = .shared)) :
+    RustSlicesCompatible
+      (dynSoAColumnSliceSpec colOwner length elemBytes elemAlign q1)
+      (dynSoAColumnSliceSpec colOwner length elemBytes elemAlign q2) := by
+  rcases hCompat with hNe | ⟨hM1, hM2⟩
+  · intro loc ha hb
+    simp only [dynSoAColumnSliceSpec, RustSliceSpec.locations, RustSliceSpec.byteLen,
+      List.mem_map, List.mem_range] at ha hb
+    obtain ⟨i, _, rfl⟩ := ha
+    obtain ⟨j, _, hEq⟩ := hb
+    have hOwner : colOwner q2.fieldIdx = colOwner q1.fieldIdx := congrArg ByteLocation.allocation hEq
+    exact absurd (hInj _ _ hOwner).symm hNe
+  · intro loc _ _
+    simp [dynSoAColumnSliceSpec, hM1, hM2, AccessMode.Compatible]
+
+/-- When a dynamic SoA query checks `SoAQueryValid [q1, q2]` and `colOwner` assigns distinct
+column allocations, distinct columns occupy completely disjoint byte locations, justifying
+direct Rust `&mut [T]` / `&[T]` `noalias` parameter passing without runtime overlap checks. -/
+theorem dynSoA_mut_noalias_disjoint {colOwner : Nat → OwnerId}
+    (hInj : ∀ a b, colOwner a = colOwner b → a = b)
+    {length elemBytes elemAlign : Nat} {q1 q2 : SoAQueryField}
+    (hValid : SoAQueryValid [q1, q2]) (hMut : q1.mode = .exclusive) :
+    ∀ loc, loc ∈ (dynSoAColumnSliceSpec colOwner length elemBytes elemAlign q1).locations →
+      loc ∉ (dynSoAColumnSliceSpec colOwner length elemBytes elemAlign q2).locations := by
+  have hPair : q1.fieldIdx ≠ q2.fieldIdx ∨ (q1.mode = .shared ∧ q2.mode = .shared) :=
+    (List.pairwise_cons.mp hValid).1 q2 (by simp)
+  have hNe : q1.fieldIdx ≠ q2.fieldIdx := by
+    rcases hPair with h | ⟨hM1, _⟩
+    · exact h
+    · rw [hMut] at hM1; cases hM1
+  intro loc ha hb
+  simp only [dynSoAColumnSliceSpec, RustSliceSpec.locations, RustSliceSpec.byteLen,
+    List.mem_map, List.mem_range] at ha hb
+  obtain ⟨i, _, rfl⟩ := ha
+  obtain ⟨j, _, hEq⟩ := hb
+  have hOwner : colOwner q2.fieldIdx = colOwner q1.fieldIdx := congrArg ByteLocation.allocation hEq
+  exact hNe (hInj _ _ hOwner).symm
+
 /-! ### Part C: Zero-Copy 64-Byte AoSoA SIMD Tile Bridge -/
 
 structure AoSoATileBridgeSpec where

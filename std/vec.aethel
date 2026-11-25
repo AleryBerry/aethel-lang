@@ -9,7 +9,7 @@
 ////   vec.new() / vec.with_capacity(cap) / vec.len(v) / vec.capacity(v)
 ////   vec.is_empty(v) / vec.push(v, x) / vec.pop(v) / vec.get(v, i)
 ////   vec.set(v, i, x) / vec.swap_remove(v, i) / vec.reserve(v, add)
-////   vec.clear(v) / vec.as_slice(v) / vec.as_collection(v)
+////   vec.clear(v) / vec.as_slice(v) / vec.as_mut_slice(v) / vec.as_collection(v)
 
 pub fn initial_capacity() -> u64 {
   8u64

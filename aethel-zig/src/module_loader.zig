@@ -92,6 +92,7 @@ const Loader = struct {
     io: ?Io,
     memory_files: ?[]const MemoryFile,
     entry_dir: []const u8,
+    project_src_dir: ?[]const u8 = null,
     visiting: std.ArrayList([]const u8) = .empty,
     loaded: std.ArrayList(LoadedFile) = .empty,
     errors: std.ArrayList(LoadError) = .empty,
@@ -292,6 +293,12 @@ const Loader = struct {
             {
                 chosen = cand_entry;
                 chosen_key = imp_key;
+            } else if (self.project_src_dir) |psrc| {
+                const cand_proj = try joinDirAndRel(self.alloc, psrc, rel_file);
+                if (self.readSource(cand_proj) != null or self.findLoadedByPath(cand_proj) != null or self.isVisiting(cand_proj)) {
+                    chosen = cand_proj;
+                    chosen_key = imp_key;
+                }
             }
 
             if (chosen) |target_path| {
@@ -415,11 +422,28 @@ pub fn loadProgram(
     const raw_dir = std.fs.path.dirname(norm_entry) orelse "";
     const norm_entry_dir = if (raw_dir.len > 0) try Loader.normalizePath(alloc, raw_dir) else "";
 
+    var project_src_dir: ?[]const u8 = null;
+    if (norm_entry_dir.len > 0) {
+        const parent = std.fs.path.dirname(norm_entry_dir) orelse "";
+        const manifest_cand = if (parent.len > 0)
+            try std.fmt.allocPrint(alloc, "{s}/aethel.toml", .{parent})
+        else
+            "aethel.toml";
+        if (Io.Dir.cwd().access(io, manifest_cand, .{})) |_| {
+            const psrc = if (parent.len > 0)
+                try std.fmt.allocPrint(alloc, "{s}/src", .{parent})
+            else
+                "src";
+            project_src_dir = psrc;
+        } else |_| {}
+    }
+
     var loader = Loader{
         .alloc = alloc,
         .io = io,
         .memory_files = null,
         .entry_dir = norm_entry_dir,
+        .project_src_dir = project_src_dir,
     };
 
     const entry_src = loader.readSource(norm_entry) orelse loader.readSource(entry_path) orelse {

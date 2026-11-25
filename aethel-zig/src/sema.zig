@@ -44,6 +44,12 @@ pub const SemaDiagnostic = struct {
     };
 };
 
+pub const FnTy = struct {
+    params: []const *const Ty,
+    ret: *const Ty,
+    is_once: bool = false,
+};
+
 pub const Ty = union(enum) {
     int: IntType,
     int_range: struct {
@@ -103,11 +109,7 @@ pub const Ty = union(enum) {
         elem: *const Ty,
     },
     tuple: []const *const Ty,
-    fn_ty: struct {
-        params: []const *const Ty,
-        ret: *const Ty,
-        is_once: bool = false,
-    },
+    fn_ty: FnTy,
     option: *const Ty,
     result: struct {
         ok: *const Ty,
@@ -221,6 +223,7 @@ pub const CheckedField = struct {
     bits: u16,
     signed: bool,
     mutable: bool,
+    rust_attrs: []const []const u8 = &.{},
 };
 
 pub const CheckedRecord = struct {
@@ -233,6 +236,9 @@ pub const CheckedRecord = struct {
     hot_fields: []const bool = &.{},
     auto_layout_decision: ?layout.AutoLayoutDecision = null,
     is_flat_c: bool = false,
+    rust_derives: []const []const u8 = &.{},
+    rust_attrs: []const []const u8 = &.{},
+    has_pod_derive: bool = false,
 };
 
 pub const CheckedADTVariant = struct {
@@ -509,6 +515,7 @@ pub const StdIntrinsicKind = enum {
     vec_reserve,
     vec_clear,
     vec_as_slice,
+    vec_as_mut_slice,
     vec_as_collection,
     map_new,
     map_with_capacity,
@@ -542,6 +549,7 @@ pub const StdIntrinsicKind = enum {
     str_is_empty,
     str_eq,
     str_concat,
+    str_repeat,
     str_starts_with,
     str_ends_with,
     str_contains,
@@ -638,6 +646,12 @@ const CallLink = struct {
     callee_param: usize,
 };
 
+const ReturnField = union(enum) {
+    pending,
+    precise: ParamFieldEffect,
+    whole,
+};
+
 const FnSig = struct {
     name: []const u8,
     local_name: []const u8,
@@ -660,6 +674,7 @@ const FnSig = struct {
     param_writes: std.ArrayList(ParamFieldEffect) = .empty,
     call_links: std.ArrayList(CallLink) = .empty,
     returned_origin: ?usize = null,
+    returned_field: ?ParamFieldEffect = null,
 };
 
 const TraitMethodDef = struct {
@@ -852,9 +867,12 @@ const Analyzer = struct {
     active_using_stack: std.ArrayList([]const usize) = .empty,
     current_fn_ret: ?*const Ty,
     inferred_return_origin: ?usize = null,
+    inferred_return_field: ReturnField = .pending,
     current_decreases_certs: ?*std.ArrayList(law_verifier.DecreasesCertEmit) = null,
     current_fn_name: ?[]const u8 = null,
     current_fn_params: []const []const u8 = &.{},
+    project_pkg_name: ?[]const u8 = null,
+    declared_rust_crates: ?[]const []const u8 = null,
     current_fn_decreases: ?*const ast.Expr = null,
     current_sym_guards: std.ArrayList(*const ast.Expr) = .empty,
 
@@ -874,6 +892,10 @@ const Analyzer = struct {
         observed_collection_len: ?usize = null,
         is_flat_c: bool = false,
         is_packed_attr: bool = false,
+        rust_derives: []const []const u8 = &.{},
+        rust_attrs: []const []const u8 = &.{},
+        has_pod_derive: bool = false,
+        fields_resolved: bool = false,
         used_in_dyn_vec: bool = false,
         type_params: []const []const u8 = &.{},
         constraints: []const ResolvedConstraint = &.{},
@@ -1261,6 +1283,7 @@ const Analyzer = struct {
                                     }
                                 }
                             }
+                            const rec_rust = try self.parseRustRecordAttrs(decl.attrs, is_flat);
                             var tps = try self.alloc.alloc([]const u8, td.type_params.len);
                             for (td.type_params, 0..) |tp, ti| tps[ti] = tp.slice(self.source);
                             if (tps.len > 0) try self.type_decl_params.put(self.alloc, self.record_defs.items.len, tps);
@@ -1281,6 +1304,9 @@ const Analyzer = struct {
                                 .hot_fields = hslice,
                                 .is_flat_c = is_flat,
                                 .is_packed_attr = is_packed,
+                                .rust_derives = rec_rust.derives,
+                                .rust_attrs = rec_rust.attrs,
+                                .has_pod_derive = rec_rust.has_pod_derive,
                                 .type_params = tps,
                             });
                         },
@@ -2003,8 +2029,8 @@ const Analyzer = struct {
                 else
                     null;
                 if (ext_spec != null) {
-                    for (ptypes, im.params) |pt, ip| self.validateRustFFIType(ip.span, pt);
-                    self.validateRustFFIType(im.span, rty);
+                    for (ptypes, im.params) |pt, ip| self.validateRustFFIType(ip.span, pt, false);
+                    self.validateRustFFIType(im.span, rty, true);
                 }
                 try checked_methods.append(self.alloc, .{
                     .local_name = req.def.name,
@@ -2017,8 +2043,8 @@ const Analyzer = struct {
                 });
             } else if (ext_spec != null) {
                 const esym = try std.fmt.allocPrint(self.alloc, "__aethel_ext_{s}_{s}", .{ cname, req.def.name });
-                for (ptypes) |pt| self.validateRustFFIType(decl.span, pt);
-                self.validateRustFFIType(decl.span, rty);
+                for (ptypes) |pt| self.validateRustFFIType(decl.span, pt, false);
+                self.validateRustFFIType(decl.span, rty, true);
                 try checked_methods.append(self.alloc, .{
                     .local_name = req.def.name,
                     .params = ptypes,
@@ -2419,17 +2445,21 @@ const Analyzer = struct {
                         .record => |fields| {
                             if (self.findRecordInModule(self.current_module_id, name)) |ridx| {
                                 self.record_defs.items[ridx].constraints = cs_slice;
+                                const is_flat = self.record_defs.items[ridx].is_flat_c;
                                 for (fields, 0..) |rf, fi| {
                                     const fty = try self.resolveType(rf.ty);
                                     const info = self.typeBitInfo(fty);
+                                    const fattrs = try self.parseRustHelperAttrs(rf.attrs, is_flat);
                                     self.record_defs.items[ridx].fields[fi] = .{
                                         .name = rf.name.slice(self.source),
                                         .ty = fty,
                                         .bits = info.bits,
                                         .signed = info.signed,
                                         .mutable = rf.mutable,
+                                        .rust_attrs = fattrs,
                                     };
                                 }
+                                self.record_defs.items[ridx].fields_resolved = true;
                             }
                         },
                         .variants => |variants| {
@@ -2522,10 +2552,10 @@ const Analyzer = struct {
                         ptypes[pi] = rty;
                         pauths[pi] = try self.extractAuthorizedPaths(p.span, rty);
                         if (target_rec == null) target_rec = recordOfType(rty);
-                        if (ext_spec != null) self.validateRustFFIType(p.span, rty);
+                        if (ext_spec != null) self.validateRustFFIType(p.span, rty, false);
                     }
                     const rty = if (fd.ret) |rt| try self.resolveType(rt) else try self.allocTy(.unit);
-                    if (ext_spec != null) self.validateRustFFIType(fd.name, rty);
+                    if (ext_spec != null) self.validateRustFFIType(fd.name, rty, true);
 
                     var tparams: std.ArrayList([]const u8) = .empty;
                     for (ptypes) |pt| try self.collectTypeVars(pt, &tparams);
@@ -2539,7 +2569,21 @@ const Analyzer = struct {
                         }
                     }
 
+                    var c_abi_sym: ?[]const u8 = if (ext_spec) |es| es.sym else null;
                     if (ext_spec) |es| {
+                        if (es.target) |tgt| {
+                            if (self.declared_rust_crates) |declared| {
+                                if (!self.isDeclaredRustTarget(tgt, declared)) {
+                                    const msg = try std.fmt.allocPrint(
+                                        self.alloc,
+                                        "undeclared Rust crate '{s}' in @external(rust, ...): add it to [rust-dependencies] via 'aethel add --rust {s}'",
+                                        .{ tgt, tgt },
+                                    );
+                                    self.addError(.invalid_ffi_type, es.span, msg);
+                                }
+                            }
+                            c_abi_sym = try self.sanitizeRustExtSym(tgt, es.sym);
+                        }
                         try self.foreign_contracts.append(self.alloc, .{
                             .aethel_name = cname,
                             .rust_target = es.target,
@@ -2564,7 +2608,7 @@ const Analyzer = struct {
                         .is_extern = ext_spec != null,
                         .has_body = fd.has_body,
                         .rust_target = if (ext_spec) |es| es.target else null,
-                        .rust_sym = if (ext_spec) |es| es.sym else null,
+                        .rust_sym = c_abi_sym,
                         .decl_index = decl_idx,
                     });
                 },
@@ -2581,10 +2625,10 @@ const Analyzer = struct {
                             const rty = if (p.ty) |t| try self.resolveType(t) else try self.allocTy(.err);
                             ptypes[pi] = rty;
                             pauths[pi] = null;
-                            self.validateRustFFIType(p.span, rty);
+                            self.validateRustFFIType(p.span, rty, false);
                         }
                         const rty = if (ef.ret) |rt| try self.resolveType(rt) else try self.allocTy(.unit);
-                        self.validateRustFFIType(ef.span, rty);
+                        self.validateRustFFIType(ef.span, rty, true);
                         try self.foreign_contracts.append(self.alloc, .{
                             .aethel_name = name,
                             .rust_target = null,
@@ -2647,17 +2691,340 @@ const Analyzer = struct {
         };
     }
 
-    fn validateRustFFIType(self: *Analyzer, span: ast.Span, ty: *const Ty) void {
+    fn unescapeRustAttrString(self: *Analyzer, raw_quoted: []const u8) std.mem.Allocator.Error![]const u8 {
+        const inner = stripStringQuotes(raw_quoted);
+        var buf: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) {
+            if (inner[i] == '\\' and i + 1 < inner.len) {
+                i += 1;
+                switch (inner[i]) {
+                    'n' => try buf.append(self.alloc, '\n'),
+                    'r' => try buf.append(self.alloc, '\r'),
+                    't' => try buf.append(self.alloc, '\t'),
+                    '\\' => try buf.append(self.alloc, '\\'),
+                    '"' => try buf.append(self.alloc, '"'),
+                    else => try buf.append(self.alloc, inner[i]),
+                }
+            } else {
+                try buf.append(self.alloc, inner[i]);
+            }
+        }
+        return try buf.toOwnedSlice(self.alloc);
+    }
+
+    fn isAllowedRustHelperNamespace(ns: []const u8) bool {
+        return std.mem.eql(u8, ns, "serde") or
+            std.mem.eql(u8, ns, "component") or
+            std.mem.eql(u8, ns, "bytemuck") or
+            std.mem.eql(u8, ns, "reflect") or
+            std.mem.eql(u8, ns, "bincode");
+    }
+
+    fn extractRustAttrNamespace(attr_text: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, attr_text, " \t\r\n");
+        var end: usize = 0;
+        while (end < trimmed.len) : (end += 1) {
+            const c = trimmed[end];
+            if (c == '(' or c == '=' or c == ' ' or c == '\t' or c == ':') break;
+        }
+        return trimmed[0..end];
+    }
+
+    fn isValidRustTraitPath(s: []const u8) bool {
+        if (s.len == 0) return false;
+        for (s) |c| {
+            const ok = (c >= 'a' and c <= 'z') or
+                (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or
+                c == '_' or c == ':';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    const ParsedRustRecordAttrs = struct {
+        derives: []const []const u8,
+        attrs: []const []const u8,
+        has_pod_derive: bool,
+    };
+
+    fn parseRustHelperAttrs(
+        self: *Analyzer,
+        attrs: []const ast.Attribute,
+        is_flat_record: bool,
+    ) std.mem.Allocator.Error![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (attrs) |attr| {
+            const aname = attr.name.slice(self.source);
+            if (!std.mem.eql(u8, aname, "rust_attr")) continue;
+            if (!is_flat_record) {
+                self.addError(.invalid_ffi_type, attr.span, "@rust_attr requires enclosing @layout(flat) record");
+                continue;
+            }
+            if (attr.payload != .args or attr.payload.args.len == 0) {
+                self.addError(.invalid_ffi_type, attr.span, "@rust_attr expects one or more string helper attributes");
+                continue;
+            }
+            for (attr.payload.args) |arg_expr| {
+                if (arg_expr.* != .string_lit) {
+                    self.addError(.invalid_ffi_type, arg_expr.getSpan(), "@rust_attr arguments must be string literals");
+                    continue;
+                }
+                const txt = try self.unescapeRustAttrString(arg_expr.string_lit.slice(self.source));
+                const ns = extractRustAttrNamespace(txt);
+                if (!isAllowedRustHelperNamespace(ns)) {
+                    self.addError(.invalid_ffi_type, attr.span, "@rust_attr only permits inert derive helpers (serde, component, bytemuck, reflect, bincode); layout-altering attributes like repr(...) are forbidden");
+                    continue;
+                }
+                try out.append(self.alloc, txt);
+            }
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn parseRustRecordAttrs(
+        self: *Analyzer,
+        attrs: []const ast.Attribute,
+        is_flat: bool,
+    ) std.mem.Allocator.Error!ParsedRustRecordAttrs {
+        var derives: std.ArrayList([]const u8) = .empty;
+        var has_pod = false;
+        for (attrs) |attr| {
+            const aname = attr.name.slice(self.source);
+            const is_derive = std.mem.eql(u8, aname, "derive");
+            const is_rust_derive = std.mem.eql(u8, aname, "rust_derive");
+            if (!is_derive and !is_rust_derive) continue;
+            if (!is_flat) {
+                self.addError(.invalid_ffi_type, attr.span, "@derive(rust, ...) requires @layout(flat) so Zig and Rust share identical #[repr(C)] layout");
+                continue;
+            }
+            if (attr.payload != .args or attr.payload.args.len == 0) {
+                self.addError(.invalid_ffi_type, attr.span, "@derive requires target language and trait paths, e.g. @derive(rust, \"serde::Serialize\")");
+                continue;
+            }
+            var start_idx: usize = 0;
+            if (is_derive) {
+                const lang_expr = attr.payload.args[0];
+                const lang = switch (lang_expr.*) {
+                    .ident => |sp| sp.slice(self.source),
+                    .string_lit => |sp| stripStringQuotes(sp.slice(self.source)),
+                    else => "",
+                };
+                if (!std.mem.eql(u8, lang, "rust")) {
+                    self.addError(.invalid_ffi_type, attr.span, "unsupported @derive target (use @derive(rust, ...))");
+                    continue;
+                }
+                start_idx = 1;
+            }
+            if (start_idx >= attr.payload.args.len) {
+                self.addError(.invalid_ffi_type, attr.span, "@derive(rust, ...) requires at least one trait path");
+                continue;
+            }
+            for (attr.payload.args[start_idx..]) |arg_expr| {
+                const raw_trait = switch (arg_expr.*) {
+                    .string_lit => |sp| try self.unescapeRustAttrString(sp.slice(self.source)),
+                    .ident, .upper_ident => |sp| sp.slice(self.source),
+                    else => "",
+                };
+                const trait_path = std.mem.trim(u8, raw_trait, " \t\r\n");
+                if (!isValidRustTraitPath(trait_path)) {
+                    self.addError(.invalid_ffi_type, arg_expr.getSpan(), "invalid Rust trait path in @derive(rust, ...)");
+                    continue;
+                }
+                const stripped = std.mem.trimStart(u8, trait_path, ":");
+                if (std.mem.indexOf(u8, stripped, "::")) |col_idx| {
+                    const root_crate = stripped[0..col_idx];
+                    const is_std_root = std.mem.eql(u8, root_crate, "core") or
+                        std.mem.eql(u8, root_crate, "std") or
+                        std.mem.eql(u8, root_crate, "alloc");
+                    if (!is_std_root) {
+                        if (self.declared_rust_crates) |declared| {
+                            if (!self.isDeclaredRustTarget(root_crate, declared)) {
+                                const msg = try std.fmt.allocPrint(
+                                    self.alloc,
+                                    "undeclared Rust crate '{s}' in @derive(rust, ...): add it to [rust-dependencies] via 'aethel add --rust {s}'",
+                                    .{ root_crate, root_crate },
+                                );
+                                self.addError(.invalid_ffi_type, arg_expr.getSpan(), msg);
+                            }
+                        }
+                    }
+                }
+                if (std.mem.eql(u8, trait_path, "Pod") or std.mem.endsWith(u8, trait_path, "::Pod")) {
+                    has_pod = true;
+                }
+                try derives.append(self.alloc, trait_path);
+            }
+        }
+        const rust_attrs = try self.parseRustHelperAttrs(attrs, is_flat);
+        return .{
+            .derives = try derives.toOwnedSlice(self.alloc),
+            .attrs = rust_attrs,
+            .has_pod_derive = has_pod,
+        };
+    }
+
+    fn isPodBitPatternSafeTy(self: *const Analyzer, ty: *const Ty, depth: u8) bool {
+        if (depth > 8) return false;
+        return switch (ty.*) {
+            .f32, .f64, .err => true,
+            .int => |it| it.bits == 8 or it.bits == 16 or it.bits == 32 or it.bits == 64 or it.bits == 128,
+            .record => |ridx| blk: {
+                const rdef = &self.record_defs.items[ridx];
+                if (!rdef.is_flat_c or rdef.fields.len == 0) break :blk false;
+                for (rdef.fields) |f| {
+                    if (!self.isPodBitPatternSafeTy(f.ty, depth + 1)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
+    fn rustCrateNamesMatch(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |ca, cb| {
+            const na = if (ca == '-') @as(u8, '_') else ca;
+            const nb = if (cb == '-') @as(u8, '_') else cb;
+            if (na != nb) return false;
+        }
+        return true;
+    }
+
+    fn isDeclaredRustTarget(self: *const Analyzer, target: []const u8, declared: []const []const u8) bool {
+        if (std.mem.eql(u8, target, "self") or std.mem.eql(u8, target, "bridge")) return true;
+        if (self.project_pkg_name) |pn| {
+            if (rustCrateNamesMatch(target, pn)) return true;
+        }
+        for (declared) |cr| {
+            if (rustCrateNamesMatch(target, cr)) return true;
+        }
+        return false;
+    }
+
+    fn sanitizeRustExtSym(self: *Analyzer, target: []const u8, sym: []const u8) std.mem.Allocator.Error![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(self.alloc, "ext_");
+        for (target) |c| {
+            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') {
+                try buf.append(self.alloc, c);
+            } else {
+                try buf.append(self.alloc, '_');
+            }
+        }
+        try buf.appendSlice(self.alloc, "__");
+        for (sym) |c| {
+            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') {
+                try buf.append(self.alloc, c);
+            } else {
+                try buf.append(self.alloc, '_');
+            }
+        }
+        return try buf.toOwnedSlice(self.alloc);
+    }
+
+    fn isValidRustFFISliceElem(self: *Analyzer, span: ast.Span, elem: *const Ty) bool {
+        return switch (elem.*) {
+            .int => |it| it.bits == 8 or it.bits == 16 or it.bits == 32 or it.bits == 64,
+            .f32, .f64 => true,
+            .record => |ridx| blk: {
+                const rdef = &self.record_defs.items[ridx];
+                if (!rdef.is_flat_c) break :blk false;
+                break :blk self.isFlatCABIScalarOrRecord(span, elem, 0);
+            },
+            else => false,
+        };
+    }
+
+    fn validateRustFFICallbackParam(self: *Analyzer, span: ast.Span, ty: *const Ty) void {
+        switch (ty.*) {
+            .bool, .f32, .f64, .opaque_ty, .string, .err => {},
+            .int => |it| {
+                if (it.bits != 8 and it.bits != 16 and it.bits != 32 and it.bits != 64 and it.bits != 128) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI callback scalar integer must be ABI byte width (8, 16, 32, 64, or 128 bits)");
+                }
+            },
+            .record => |ridx| {
+                const rdef = &self.record_defs.items[ridx];
+                if (!rdef.is_flat_c) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI callback record parameter requires @layout(flat)");
+                    return;
+                }
+                _ = self.isFlatCABIScalarOrRecord(span, ty, 0);
+            },
+            .view => |v| {
+                if (v.target.* == .record) {
+                    const rdef = &self.record_defs.items[v.target.record];
+                    if (!rdef.is_flat_c) {
+                        self.addError(.invalid_ffi_type, span, "Rust FFI callback View parameter requires @layout(flat) record");
+                        return;
+                    }
+                    _ = self.isFlatCABIScalarOrRecord(span, v.target, 0);
+                    return;
+                }
+                if (v.target.* == .slice) {
+                    if (!self.isValidRustFFISliceElem(span, v.target.slice.elem)) {
+                        self.addError(.invalid_ffi_type, span, "Rust FFI callback slice view requires byte-aligned C-ABI scalar or @layout(flat) record element");
+                    }
+                    return;
+                }
+                self.addError(.invalid_ffi_type, span, "unsupported callback View parameter across Aethel -> Rust FFI (use View(FlatRecord, ...) or slice view)");
+            },
+            .slice => |sl| {
+                if (!self.isValidRustFFISliceElem(span, sl.elem)) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI callback slice requires byte-aligned C-ABI scalar or @layout(flat) record element");
+                }
+            },
+            else => {
+                self.addError(.invalid_ffi_type, span, "unsupported callback parameter type across Aethel -> Rust FFI (use scalars, String, @opaque, @layout(flat) records, Views, or C-ABI slices)");
+            },
+        }
+    }
+
+    fn validateRustFFIType(self: *Analyzer, span: ast.Span, ty: *const Ty, is_return: bool) void {
         switch (ty.*) {
             .bool, .f32, .f64, .unit, .opaque_ty, .err => {},
+            .string => {
+                if (is_return) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI function cannot return borrowed String (&str) by value; pass an explicit buffer or callback");
+                }
+            },
+            .fn_ty => |ft| {
+                if (is_return) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI function cannot return a callback value");
+                    return;
+                }
+                if (ft.is_once) {
+                    self.addError(.invalid_ffi_type, span, "Aethel -> Rust FFI callback cannot be fn_once; foreign schedules require stateless reusable fn(...)");
+                    return;
+                }
+                for (ft.params) |p| {
+                    self.validateRustFFICallbackParam(span, p);
+                }
+                switch (ft.ret.*) {
+                    .unit, .bool, .f32, .f64, .opaque_ty, .err => {},
+                    .int => |it| {
+                        if (it.bits != 8 and it.bits != 16 and it.bits != 32 and it.bits != 64 and it.bits != 128) {
+                            self.addError(.invalid_ffi_type, span, "Rust FFI callback return scalar integer must be ABI byte width (8, 16, 32, 64, or 128 bits)");
+                        }
+                    },
+                    .record => |ridx| {
+                        const rdef = &self.record_defs.items[ridx];
+                        if (!rdef.is_flat_c) {
+                            self.addError(.invalid_ffi_type, span, "Rust FFI callback return record requires @layout(flat)");
+                        } else {
+                            _ = self.isFlatCABIScalarOrRecord(span, ft.ret, 0);
+                        }
+                    },
+                    else => {
+                        self.addError(.invalid_ffi_type, span, "unsupported callback return type across Aethel -> Rust FFI (use unit, scalar, @opaque, or @layout(flat) record)");
+                    },
+                }
+            },
             .slice => |sl| {
-                const ok = switch (sl.elem.*) {
-                    .int => |it| it.bits == 8 or it.bits == 16 or it.bits == 32 or it.bits == 64,
-                    .f32, .f64 => true,
-                    else => false,
-                };
-                if (!ok) {
-                    self.addError(.invalid_ffi_type, span, "Rust FFI slice requires byte-aligned C-ABI scalar element (u8..u64, i8..i64, f32, f64); sub-byte packed slices are forbidden");
+                if (!self.isValidRustFFISliceElem(span, sl.elem)) {
+                    self.addError(.invalid_ffi_type, span, "Rust FFI slice requires byte-aligned C-ABI scalar or @layout(flat) record element (sub-byte packed slices are forbidden)");
                 }
             },
             .int => |it| {
@@ -2689,12 +3056,12 @@ const Analyzer = struct {
                     _ = self.isFlatCABIScalarOrRecord(span, rec_ty, 0);
                     rdef.is_flat_c = was_flat;
                 } else {
-                    self.validateRustFFIType(span, c.elem_ty);
+                    self.validateRustFFIType(span, c.elem_ty, is_return);
                 }
             },
             .path_borrow => |pb| {
                 if (pb.base.* == .collection) {
-                    self.validateRustFFIType(span, pb.base);
+                    self.validateRustFFIType(span, pb.base, is_return);
                     return;
                 }
                 if (recordOfType(pb.base)) |ridx| {
@@ -2711,7 +3078,7 @@ const Analyzer = struct {
             .view => |v| {
                 if (v.target.* == .opaque_ty) return;
                 if (v.target.* == .slice or v.target.* == .collection or v.target.* == .record) {
-                    self.validateRustFFIType(span, v.target);
+                    self.validateRustFFIType(span, v.target, is_return);
                     return;
                 }
                 self.addError(.invalid_ffi_type, span, "Rust FFI view must wrap an opaque handle, C-ABI slice, flat record, or flat Collection");
@@ -2790,7 +3157,40 @@ const Analyzer = struct {
         packable: bool,
     };
 
+    fn recordTypeBitInfo(self: *const Analyzer, ridx: usize, depth: u8) TypeBitInfo {
+        if (depth > 8 or ridx >= self.record_defs.items.len) {
+            return .{ .bits = 0, .signed = false, .size = 8, .alignment = 8, .packable = false };
+        }
+        const rdef = &self.record_defs.items[ridx];
+        if (!rdef.fields_resolved) {
+            return .{ .bits = 0, .signed = false, .size = 8, .alignment = 8, .packable = false };
+        }
+        if (rdef.fields.len == 0) {
+            return .{ .bits = 0, .signed = false, .size = 0, .alignment = 1, .packable = false };
+        }
+        var cursor: usize = 0;
+        var max_align: usize = 1;
+        for (rdef.fields) |f| {
+            const inner = self.typeBitInfoDepth(f.ty, depth + 1);
+            const a = @max(@as(usize, 1), inner.alignment);
+            if (a > max_align) max_align = a;
+            cursor = layout.alignUp(cursor, a) + inner.size;
+        }
+        const total = layout.alignUp(cursor, max_align);
+        return .{
+            .bits = @min(@as(u16, 65535), @as(u16, @intCast(total * 8))),
+            .signed = false,
+            .size = total,
+            .alignment = max_align,
+            .packable = false,
+        };
+    }
+
     fn typeBitInfo(self: *const Analyzer, ty: *const Ty) TypeBitInfo {
+        return self.typeBitInfoDepth(ty, 0);
+    }
+
+    fn typeBitInfoDepth(self: *const Analyzer, ty: *const Ty, depth: u8) TypeBitInfo {
         switch (ty.*) {
             .int => |it| {
                 const slot = layout.naturalSlot(it.bits);
@@ -2822,21 +3222,12 @@ const Analyzer = struct {
                 const slot = layout.naturalSlot(128);
                 return .{ .bits = 128, .signed = false, .size = slot.size, .alignment = slot.alignment, .packable = false };
             },
-            .record => |ridx| {
-                // Leaf integer-compatible size if already planned, else default conservative.
-                const rf = self.record_defs.items[ridx].fields;
-                var approx: usize = 0;
-                for (rf) |f| approx += @max(@as(usize, 1), (f.bits + 7) / 8);
-                return .{ .bits = 0, .signed = false, .size = approx, .alignment = 8, .packable = false };
-            },
+            .record => |ridx| return self.recordTypeBitInfo(ridx, depth),
             .applied => |ap| switch (ap.kind) {
-                .record => {
-                    const rty = Ty{ .record = ap.decl_idx };
-                    return self.typeBitInfo(&rty);
-                },
+                .record => return self.recordTypeBitInfo(ap.decl_idx, depth),
                 .adt => {
                     const aty = Ty{ .adt = ap.decl_idx };
-                    return self.typeBitInfo(&aty);
+                    return self.typeBitInfoDepth(&aty, depth);
                 },
                 .opaque_ty => return .{ .bits = 64, .signed = false, .size = 8, .alignment = 8, .packable = false },
             },
@@ -3333,6 +3724,7 @@ const Analyzer = struct {
         const prev_guard_len = self.current_sym_guards.items.len;
         const prev_ret = self.current_fn_ret;
         const prev_orig = self.inferred_return_origin;
+        const prev_return_field = self.inferred_return_field;
         self.current_accesses = &accesses;
         self.current_perm_trace = &perm_trace;
         self.current_disjoint_certs = &disjoint_certs;
@@ -3342,6 +3734,7 @@ const Analyzer = struct {
         self.current_fn_decreases = f.decreases;
         self.current_fn_ret = fsig.ret;
         self.inferred_return_origin = fsig.returned_origin;
+        self.inferred_return_field = .pending;
         defer {
             self.current_accesses = prev_acc;
             self.current_perm_trace = prev_pt;
@@ -3353,6 +3746,7 @@ const Analyzer = struct {
             self.current_sym_guards.shrinkRetainingCapacity(prev_guard_len);
             self.current_fn_ret = prev_ret;
             self.inferred_return_origin = prev_orig;
+            self.inferred_return_field = prev_return_field;
         }
 
         const body_res = try self.checkBlock(&f.body, fsig.ret, f.ret != null);
@@ -3368,6 +3762,11 @@ const Analyzer = struct {
         }
         if (self.inferred_return_origin != null and fsig.returned_origin == null) {
             fsig.returned_origin = self.inferred_return_origin;
+        }
+        if (self.inferred_return_field == .precise and
+            self.inferred_return_field.precise.param_idx == fsig.returned_origin)
+        {
+            fsig.returned_field = self.inferred_return_field.precise;
         }
 
         // Release any lingering function-scope active views before ending the trace.
@@ -3553,7 +3952,11 @@ const Analyzer = struct {
             },
             .assign_stmt => |asg| {
                 const hinted_ty = self.peekWriteTargetType(asg.target);
-                const rhs_res = try self.checkExpr(asg.value, hinted_ty);
+                const rhs = try self.checkExpr(asg.value, hinted_ty);
+                const rhs_res = if (asg.op == .assign and hinted_ty != null and hinted_ty.?.isInteger() != null)
+                    try self.readIntegerOperand(asg.value, rhs)
+                else
+                    rhs;
                 const target_info = try self.checkWriteTarget(asg.target, asg.span);
                 try self.expr_types.put(self.alloc, asg.target, target_info.ty);
                 if (asg.op == .assign) {
@@ -4407,7 +4810,7 @@ const Analyzer = struct {
                     }
                     if (self.active_fork_start) |fstart| {
                         if (!self.in_projection_base and vb.decl_span.start < fstart and vb.ty.* != .fn_ty) {
-                            try self.recordAccess(name, recordOfType(vb.ty), null, false, sp, null, vb.view_id);
+                            try self.recordBindingRead(sp, vb);
                         }
                     }
                     // Implicit affine consumption if value is non-copyable (and not explicitly borrowed via call/field).
@@ -4549,6 +4952,14 @@ const Analyzer = struct {
                 }
                 const lr = try self.checkExpr(b.left, null);
                 const rr = try self.checkExpr(b.right, null);
+                switch (b.op) {
+                    .eq, .ne, .lt, .le, .gt, .ge, .range, .range_eq, .sub_sat => {
+                        const left = try self.readIntegerOperand(b.left, lr);
+                        const right = try self.readIntegerOperand(b.right, rr);
+                        return try self.combineBinary(b.span, b.op, left, right, expected);
+                    },
+                    else => {},
+                }
                 return try self.combineBinary(b.span, b.op, lr, rr, expected);
             },
             .cast => |c| {
@@ -4675,6 +5086,7 @@ const Analyzer = struct {
                         }
                         return .{ .ty = field_ty, .range = field_ty.rangeOf() };
                     }
+                    self.addError(.unknown_ident, fld.name, "unknown field on record");
                 }
                 return .{ .ty = try self.allocTy(.err), .range = null };
             },
@@ -4959,7 +5371,11 @@ const Analyzer = struct {
             .case_expr => |ce| {
                 const sub_types = try self.alloc.alloc(*const Ty, ce.subjects.len);
                 for (ce.subjects, 0..) |subj, i| {
-                    sub_types[i] = (try self.checkExpr(subj, null)).ty;
+                    const subject = try self.checkExpr(subj, null);
+                    sub_types[i] = if (hasIntegerPattern(ce.arms, i))
+                        (try self.readIntegerOperand(subj, subject)).ty
+                    else
+                        subject.ty;
                 }
                 const saved_perms = try self.alloc.alloc(BorrowPerm, self.active_views.items.len);
                 const joined_perms = try self.alloc.alloc(BorrowPerm, self.active_views.items.len);
@@ -6460,6 +6876,11 @@ const Analyzer = struct {
                     _ = try self.checkExpr(args[recv_offset + 1].value, null);
                     try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_slice_bytes, .container_ty = str_ty });
                     return .{ .ty = str_ty, .range = null };
+                } else if (std.mem.eql(u8, mname, "repeat") and args.len == recv_offset + 1) {
+                    const cnt_res = try self.checkExpr(args[recv_offset].value, null);
+                    try self.checkAssignmentValue(args[recv_offset].span, u64_ty, cnt_res);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .str_repeat, .container_ty = str_ty });
+                    return .{ .ty = str_ty, .range = null };
                 }
                 return null;
             },
@@ -6470,8 +6891,20 @@ const Analyzer = struct {
                         self.addError(.type_mismatch, span, "invalid argument count for vec constructor");
                         return .{ .ty = try self.allocTy(.err), .range = null };
                     }
-                    if (is_cap) _ = try self.checkExpr(args[0].value, null);
+                    const cap_res = if (is_cap) try self.checkExpr(args[0].value, null) else null;
                     if (expected != null and expected.?.* == .vec) {
+                        if (cap_res) |cr_val| {
+                            if (cr_val.range) |cr| {
+                                if (cr == .bounded and cr.bounded.lo == cr.bounded.hi and cr.bounded.lo >= 0) {
+                                    if (std.math.cast(usize, cr.bounded.lo)) |n| {
+                                        if (recordOfType(expected.?.vec.elem_ty)) |ridx| {
+                                            const cur = self.record_defs.items[ridx].observed_collection_len;
+                                            self.record_defs.items[ridx].observed_collection_len = if (cur) |c| @max(c, n) else n;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         try self.std_intrinsic_calls.put(self.alloc, call_expr, .{
                             .kind = if (is_cap) .vec_with_capacity else .vec_new,
                             .container_ty = expected.?,
@@ -6513,9 +6946,27 @@ const Analyzer = struct {
                     try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_get, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
                     return .{ .ty = try self.allocTy(.{ .option = elem_ty }), .range = null };
                 } else if (std.mem.eql(u8, mname, "as_slice") and args.len == recv_offset) {
+                    if (inner_ty.vec.elem_record) |ri| {
+                        if (self.record_defs.items[ri].collection_layout) |cl| {
+                            if (cl == .soa or cl == .aosoa) {
+                                self.addError(.invalid_ffi_type, span, "vec.as_slice requires AoS backing; use vec.as_collection(...) for @layout(soa)/@layout(aosoa) vectors");
+                            }
+                        }
+                    }
                     try self.recordDynamicContainerRead(span, recv_expr);
                     try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_as_slice, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
                     return .{ .ty = try self.allocTy(.{ .slice = .{ .mutable = false, .elem = elem_ty } }), .range = null };
+                } else if (std.mem.eql(u8, mname, "as_mut_slice") and args.len == recv_offset) {
+                    if (inner_ty.vec.elem_record) |ri| {
+                        if (self.record_defs.items[ri].collection_layout) |cl| {
+                            if (cl == .soa or cl == .aosoa) {
+                                self.addError(.invalid_ffi_type, span, "vec.as_mut_slice requires AoS backing; use vec.as_collection(...) for @layout(soa)/@layout(aosoa) vectors");
+                            }
+                        }
+                    }
+                    _ = try self.checkDynamicContainerMut(span, recv_expr, true);
+                    try self.std_intrinsic_calls.put(self.alloc, call_expr, .{ .kind = .vec_as_mut_slice, .container_ty = inner_ty, .recv_is_ptr = recv_is_ptr });
+                    return .{ .ty = try self.allocTy(.{ .slice = .{ .mutable = true, .elem = elem_ty } }), .range = null };
                 } else if (std.mem.eql(u8, mname, "as_collection") and args.len == recv_offset) {
                     try self.recordDynamicContainerRead(span, recv_expr);
                     const col_ty = try self.allocTy(.{ .collection = .{ .elem_record = inner_ty.vec.elem_record, .elem_ty = elem_ty } });
@@ -7044,6 +7495,7 @@ const Analyzer = struct {
             }
             if (fsig.is_extern) {
                 try self.checkRustFFISliceAliasing(span, fsig.params, piped_recv_expr, args);
+                try self.checkRustFFICallbackArgs(fsig.params, piped_recv_expr, args);
             }
             // Propagate transitive callee reads/writes onto actual arguments (InterprocBorrow.lean).
             for (fsig.param_writes.items) |pw| {
@@ -7247,6 +7699,35 @@ const Analyzer = struct {
             _ = try self.checkExpr(arg.value, null);
         }
         return .{ .ty = try self.allocTy(.err), .range = null };
+    }
+
+    fn recordBindingRead(self: *Analyzer, span: ast.Span, binding: *const Binding) std.mem.Allocator.Error!void {
+        try self.recordAccess(
+            binding.view_root orelse span.slice(self.source),
+            binding.view_record_idx orelse recordOfType(binding.ty),
+            binding.view_field_idx,
+            false,
+            span,
+            binding.view_index_key,
+            binding.view_id,
+        );
+    }
+
+    fn readIntegerOperand(self: *Analyzer, expr: *const ast.Expr, operand: ExprResult) std.mem.Allocator.Error!ExprResult {
+        if (operand.ty.* != .view) return operand;
+        const target = operand.ty.view.target;
+        if (target.isInteger() == null) return operand;
+        if (expr.* == .ident) {
+            const binding = self.lookupVar(expr.ident.slice(self.source));
+            if (binding != null and binding.?.view_id != null) {
+                const captured = if (self.active_fork_start) |start|
+                    !self.in_projection_base and binding.?.decl_span.start < start
+                else
+                    false;
+                if (!captured) try self.recordBindingRead(expr.ident, binding.?);
+            }
+        }
+        return .{ .ty = target, .range = target.rangeOf() };
     }
 
     fn combineBinary(
@@ -7643,6 +8124,67 @@ const Analyzer = struct {
         }
     }
 
+    fn checkRustFFICallbackArgs(
+        self: *Analyzer,
+        param_types: []const *const Ty,
+        piped_recv_expr: ?*const ast.Expr,
+        args: []const ast.CallArg,
+    ) std.mem.Allocator.Error!void {
+        const recv_offset: usize = if (piped_recv_expr != null) 1 else 0;
+        for (param_types, 0..) |pt, pidx| {
+            if (pt.* != .fn_ty) continue;
+            const actual: *const ast.Expr = if (piped_recv_expr != null and pidx == 0)
+                piped_recv_expr.?
+            else if (pidx >= recv_offset and (pidx - recv_offset) < args.len)
+                args[pidx - recv_offset].value
+            else
+                continue;
+
+            switch (actual.*) {
+                .ident => |sp| {
+                    const name = sp.slice(self.source);
+                    if (self.lookupVar(name) != null) {
+                        self.addError(.invalid_ffi_type, actual.getSpan(), "Aethel -> Rust FFI callback cannot capture local closures; pass a top-level fn or capture-free fn(...)");
+                        continue;
+                    }
+                    if (self.resolved_idents.get(actual) == null and self.resolveCalleeFnIndex(actual, false) == null) {
+                        self.addError(.invalid_ffi_type, actual.getSpan(), "Aethel -> Rust FFI callback must reference a top-level function or capture-free fn(...)");
+                    }
+                },
+                .field => {
+                    if (self.resolved_idents.get(actual) == null) {
+                        self.addError(.invalid_ffi_type, actual.getSpan(), "Aethel -> Rust FFI callback must reference a top-level function or capture-free fn(...)");
+                    }
+                },
+                .lambda => |lam| {
+                    var raw_refs: std.ArrayList(FreeVarRef) = .empty;
+                    try self.collectFreeRefsBlock(&lam.body, &raw_refs);
+                    var has_capture = false;
+                    for (raw_refs.items) |r| {
+                        var is_param = false;
+                        for (lam.params) |lp| {
+                            if (std.mem.eql(u8, lp.name.slice(self.source), r.name)) {
+                                is_param = true;
+                                break;
+                            }
+                        }
+                        if (is_param) continue;
+                        if (self.lookupVar(r.name) != null) {
+                            has_capture = true;
+                            break;
+                        }
+                    }
+                    if (has_capture) {
+                        self.addError(.invalid_ffi_type, actual.getSpan(), "Aethel -> Rust FFI callback cannot capture local variables; pass a top-level fn or capture-free fn(...)");
+                    }
+                },
+                else => {
+                    self.addError(.invalid_ffi_type, actual.getSpan(), "Aethel -> Rust FFI callback must be a top-level fn reference or capture-free fn(...) lambda");
+                },
+            }
+        }
+    }
+
     fn checkRustFFISliceAliasing(
         self: *Analyzer,
         span: ast.Span,
@@ -7768,6 +8310,38 @@ const Analyzer = struct {
         if (self.inferred_return_origin == null) {
             self.inferred_return_origin = vb.param_index;
         }
+        const field = self.directReturnedByteField(expr, vb);
+        switch (self.inferred_return_field) {
+            .pending => self.inferred_return_field = if (field) |precise| .{ .precise = precise } else .whole,
+            .precise => |previous| {
+                if (field == null or !std.meta.eql(previous, field.?)) self.inferred_return_field = .whole;
+            },
+            .whole => {},
+        }
+    }
+
+    fn directReturnedByteField(self: *Analyzer, expr: *const ast.Expr, binding: *const Binding) ?ParamFieldEffect {
+        if (!binding.is_param or expr.* != .field or expr.field.target.* != .ident) return null;
+        const param = binding.param_index orelse return null;
+        const record = recordOfType(binding.ty) orelse return null;
+        const field = self.findRecordField(record, expr.field.name.slice(self.source)) orelse return null;
+        const ty = self.record_defs.items[record].fields[field].ty;
+        if (ty.* != .int or ty.int.signed or ty.int.bits != 8) return null;
+        if (binding.authorized_paths) |paths| {
+            if (std.mem.indexOfScalar(usize, paths, field) == null) {
+                self.addError(.unauthorized_field_access, expr.field.name, "returned field is outside the parameter path borrow contract");
+                return null;
+            }
+        }
+        return .{ .param_idx = param, .record_idx = record, .field_idx = field };
+    }
+
+    fn returnedFieldOnArgument(self: *Analyzer, field: ?ParamFieldEffect, arg: *const ast.Expr) ?ParamFieldEffect {
+        const precise = field orelse return null;
+        if (arg.* != .ident) return null;
+        const binding = self.lookupVar(arg.ident.slice(self.source)) orelse return null;
+        if (binding.view_root != null or recordOfType(binding.ty) != precise.record_idx) return null;
+        return precise;
     }
 
     fn attachReturnedViewBinding(
@@ -7790,7 +8364,9 @@ const Analyzer = struct {
                         else
                             null;
                         const init_perm: BorrowPerm = if (vty.mode == .exclusive) .reserved else .shared;
-                        const ridx = vty.target_record;
+                        const field = self.returnedFieldOnArgument(fsig.returned_field, arg_expr);
+                        const ridx = if (field) |precise| precise.record_idx else vty.target_record;
+                        const field_idx = if (field) |precise| precise.field_idx else null;
 
                         for (self.active_views.items) |av| {
                             if (!av.active) continue;
@@ -7798,7 +8374,7 @@ const Analyzer = struct {
                                 if (av.index_key != null and idx_key != null) {
                                     if (self.accessIndicesDisjoint(av.index_key.?, idx_key.?, true)) continue;
                                 }
-                                if (fieldsMayOverlap(av.field_idx, null) and !BorrowPerm.compatible(init_perm, av.perm)) {
+                                if (fieldsMayOverlap(av.field_idx, field_idx) and !BorrowPerm.compatible(init_perm, av.perm)) {
                                     self.addError(.borrow_conflict, span, "returned View conflicts with active borrow on the same argument");
                                 }
                             }
@@ -7812,7 +8388,7 @@ const Analyzer = struct {
                                 .view_id = vid,
                                 .root_name = root_name,
                                 .record_idx = ridx.?,
-                                .field_idx = null,
+                                .field_idx = field_idx,
                                 .perm = init_perm,
                             } });
                         }
@@ -7821,7 +8397,7 @@ const Analyzer = struct {
                             .binding_name = vb.name,
                             .root_name = root_name,
                             .record_idx = ridx,
-                            .field_idx = null,
+                            .field_idx = field_idx,
                             .index_key = idx_key,
                             .perm = init_perm,
                             .active = true,
@@ -7831,6 +8407,7 @@ const Analyzer = struct {
                         vb.view_id = vid;
                         vb.view_root = if (root_name.len > 0) root_name else null;
                         vb.view_record_idx = ridx;
+                        vb.view_field_idx = field_idx;
                         vb.view_index_key = idx_key;
                         if (self.lookupVar(root_name)) |src_vb| {
                             if (src_vb.view_is_caller_rooted or src_vb.is_param) {
@@ -8349,6 +8926,21 @@ const Analyzer = struct {
         };
     }
 
+    fn isSimdCmpOp(op: ast.BinaryOp) bool {
+        return switch (op) {
+            .eq, .ne, .lt, .le, .gt, .ge => true,
+            else => false,
+        };
+    }
+
+    fn isSimdCmpExpr(self: *const Analyzer, ridx: usize, elem_param: []const u8, cond: *const ast.Expr) bool {
+        if (cond.* != .binary) return false;
+        const b = cond.binary;
+        if (!isSimdCmpOp(b.op)) return false;
+        return self.isSimdVectorExpr(ridx, elem_param, b.left) and
+            self.isSimdVectorExpr(ridx, elem_param, b.right);
+    }
+
     fn isSimdVectorExpr(self: *const Analyzer, ridx: usize, elem_param: []const u8, expr: *const ast.Expr) bool {
         return switch (expr.*) {
             .int_lit, .float_lit => true,
@@ -8365,13 +8957,60 @@ const Analyzer = struct {
                 const fi = self.findRecordField(ridx, fld.name.slice(self.source)) orelse break :blk false;
                 break :blk isSimdFieldTy(self.record_defs.items[ridx].fields[fi].ty);
             },
+            .if_expr => |ie| blk: {
+                const eb = ie.else_branch orelse break :blk false;
+                if (eb.* != .block) break :blk false;
+                if (ie.then_block.stmts.len != 0 or ie.then_block.tail == null) break :blk false;
+                if (eb.block.stmts.len != 0 or eb.block.tail == null) break :blk false;
+                break :blk self.isSimdCmpExpr(ridx, elem_param, ie.cond) and
+                    self.isSimdVectorExpr(ridx, elem_param, ie.then_block.tail.?) and
+                    self.isSimdVectorExpr(ridx, elem_param, eb.block.tail.?);
+            },
             .cast => |c| self.isSimdVectorExpr(ridx, elem_param, c.expr),
             else => false,
         };
     }
 
+    fn isSimdAssignStmt(self: *const Analyzer, ridx: usize, elem_param: []const u8, st: ast.Stmt, allow_ident_target: bool) ?bool {
+        if (st != .assign_stmt) return null;
+        const asg = st.assign_stmt;
+        switch (asg.op) {
+            .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => {},
+            else => return null,
+        }
+        if (!self.isSimdVectorExpr(ridx, elem_param, asg.value)) return null;
+        if (asg.target.* == .field) {
+            const fld = asg.target.field;
+            if (fld.target.* != .ident) return null;
+            if (!std.mem.eql(u8, fld.target.ident.slice(self.source), elem_param)) return null;
+            const fi = self.findRecordField(ridx, fld.name.slice(self.source)) orelse return null;
+            if (!isSimdFieldTy(self.record_defs.items[ridx].fields[fi].ty)) return null;
+            return true;
+        }
+        if (allow_ident_target and asg.target.* == .ident) return false;
+        return null;
+    }
+
+    fn isSimdIfExpr(self: *const Analyzer, ridx: usize, elem_param: []const u8, ie: anytype) ?bool {
+        if (!self.isSimdCmpExpr(ridx, elem_param, ie.cond)) return null;
+        if (ie.then_block.tail != null or ie.then_block.stmts.len == 0) return null;
+        var has_field_write = false;
+        for (ie.then_block.stmts) |tst| {
+            const wf = self.isSimdAssignStmt(ridx, elem_param, tst, false) orelse return null;
+            if (wf) has_field_write = true;
+        }
+        if (ie.else_branch) |eb| {
+            if (eb.* != .block or eb.block.tail != null or eb.block.stmts.len == 0) return null;
+            for (eb.block.stmts) |est| {
+                const wf = self.isSimdAssignStmt(ridx, elem_param, est, false) orelse return null;
+                if (wf) has_field_write = true;
+            }
+        }
+        return has_field_write;
+    }
+
     fn isSimdVectorizableLambda(self: *const Analyzer, ridx: usize, elem_param: []const u8, body: *const ast.Block) bool {
-        if (body.tail != null or body.stmts.len == 0) return false;
+        if (body.stmts.len == 0 and body.tail == null) return false;
         var has_field_write = false;
         for (body.stmts) |st| {
             switch (st) {
@@ -8379,25 +9018,22 @@ const Analyzer = struct {
                     if (ls.pattern.* != .ident) return false;
                     if (!self.isSimdVectorExpr(ridx, elem_param, ls.value)) return false;
                 },
-                .assign_stmt => |asg| {
-                    switch (asg.op) {
-                        .assign, .add_assign, .sub_assign, .mul_assign, .div_assign => {},
-                        else => return false,
-                    }
-                    if (!self.isSimdVectorExpr(ridx, elem_param, asg.value)) return false;
-                    if (asg.target.* == .field) {
-                        const fld = asg.target.field;
-                        if (fld.target.* != .ident) return false;
-                        if (!std.mem.eql(u8, fld.target.ident.slice(self.source), elem_param)) return false;
-                        const fi = self.findRecordField(ridx, fld.name.slice(self.source)) orelse return false;
-                        if (!isSimdFieldTy(self.record_defs.items[ridx].fields[fi].ty)) return false;
-                        has_field_write = true;
-                    } else if (asg.target.* != .ident) {
-                        return false;
-                    }
+                .assign_stmt => {
+                    const wf = self.isSimdAssignStmt(ridx, elem_param, st, true) orelse return false;
+                    if (wf) has_field_write = true;
+                },
+                .expr_stmt => |es| {
+                    if (es.expr.* != .if_expr) return false;
+                    const wf = self.isSimdIfExpr(ridx, elem_param, es.expr.if_expr) orelse return false;
+                    if (wf) has_field_write = true;
                 },
                 else => return false,
             }
+        }
+        if (body.tail) |tail| {
+            if (tail.* != .if_expr) return false;
+            const wf = self.isSimdIfExpr(ridx, elem_param, tail.if_expr) orelse return false;
+            if (wf) has_field_write = true;
         }
         return has_field_write;
     }
@@ -8417,8 +9053,23 @@ const Analyzer = struct {
                     .is_subbyte_packable = info.packable,
                 };
             }
-            const base_planned = if (rdef.is_flat_c)
+            const base_naive = if (rdef.is_flat_c)
                 try layout.planFlatCLayout(self.alloc, schemas)
+            else
+                try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
+            var unpacked_any = false;
+            if (rdef.auto_layout_requested and !rdef.is_flat_c) {
+                for (schemas, 0..) |*sc, fi| {
+                    if (sc.is_subbyte_packable and fi < rdef.hot_fields.len and
+                        layout.shouldUnpackHotSubByteInL1(rdef.hot_fields[fi], rdef.observed_collection_len, base_naive.size))
+                    {
+                        sc.is_subbyte_packable = false;
+                        unpacked_any = true;
+                    }
+                }
+            }
+            const base_planned = if (rdef.is_flat_c or !unpacked_any)
+                base_naive
             else
                 try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
 
@@ -8474,6 +9125,20 @@ const Analyzer = struct {
                 };
             }
 
+            if (rdef.has_pod_derive) {
+                var sum_sizes: usize = 0;
+                var all_pod_safe = rdef.fields.len > 0;
+                for (rdef.fields, 0..) |f, fi| {
+                    sum_sizes += schemas[fi].addressable_size;
+                    if (!self.isPodBitPatternSafeTy(f.ty, 0)) {
+                        all_pod_safe = false;
+                    }
+                }
+                if (!all_pod_safe or sum_sizes != final_planned.size) {
+                    self.addError(.invalid_ffi_type, rdef.span, "@derive(rust, \"bytemuck::Pod\") requires non-empty @layout(flat) record with zero implicit padding and no bool/@opaque fields");
+                }
+            }
+
             out[ridx] = .{
                 .name = rdef.name,
                 .span = rdef.span,
@@ -8484,6 +9149,9 @@ const Analyzer = struct {
                 .hot_fields = rdef.hot_fields,
                 .auto_layout_decision = auto_decision,
                 .is_flat_c = rdef.is_flat_c,
+                .rust_derives = rdef.rust_derives,
+                .rust_attrs = rdef.rust_attrs,
+                .has_pod_derive = rdef.has_pod_derive,
             };
             if (rdef.collection_layout) |cl| {
                 if (!self.hasCollectionNamed(rdef.name)) {
@@ -8672,6 +9340,14 @@ const Analyzer = struct {
         dec: *const ast.Expr,
         body: ast.Block,
     ) std.mem.Allocator.Error!void {
+        if (self.expr_types.get(dec)) |ty| {
+            if (ty.* == .int and !ty.int.signed and ty.int.bits == 8) {
+                if (law_verifier.byteFieldCountdown(self.alloc, self.source, cond, dec, body)) |cert| {
+                    if (self.current_decreases_certs) |list| try list.append(self.alloc, cert);
+                    return;
+                }
+            }
+        }
         const bindings = try self.collectSymBindingsFromScopes();
         const fn_asts = try self.collectModuleFnAsts();
         switch (law_verifier.verifyWhileDecreases(self.alloc, self.source, fn_asts, cond, dec, body, bindings)) {
@@ -9130,6 +9806,29 @@ const Analyzer = struct {
 
 /// Run full semantic analysis (type/interval/borrow/layout/FFI/law verification)
 /// on a single parsed `ast.Ast`.
+fn isIntegerPattern(pattern: *const ast.Pattern) bool {
+    return switch (pattern.*) {
+        .literal => |literal| literal.tok.tag == .int_literal,
+        .range => |range| isIntegerPattern(range.lo) and isIntegerPattern(range.hi),
+        .or_pat => |alternatives| blk: {
+            for (alternatives.alternatives) |p| {
+                if (isIntegerPattern(p)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+pub fn hasIntegerPattern(arms: []const ast.CaseArm, subject: usize) bool {
+    for (arms) |arm| {
+        for (arm.alternatives) |row| {
+            if (subject < row.len and isIntegerPattern(row[subject])) return true;
+        }
+    }
+    return false;
+}
+
 pub fn analyze(allocator: std.mem.Allocator, tree: *const ast.Ast) std.mem.Allocator.Error!CheckedModule {
     return analyzeWithModules(allocator, tree, &.{}, 0);
 }
@@ -9140,6 +9839,18 @@ pub fn analyzeWithModules(
     tree: *const ast.Ast,
     modules: []const ModuleSliceInfo,
     entry_module_id: usize,
+) std.mem.Allocator.Error!CheckedModule {
+    return analyzeWithModulesAndManifest(allocator, tree, modules, entry_module_id, null, null);
+}
+
+/// Run full semantic analysis with optional Cargo project manifest package name and declared crates.
+pub fn analyzeWithModulesAndManifest(
+    allocator: std.mem.Allocator,
+    tree: *const ast.Ast,
+    modules: []const ModuleSliceInfo,
+    entry_module_id: usize,
+    project_pkg_name: ?[]const u8,
+    declared_rust_crates: ?[]const []const u8,
 ) std.mem.Allocator.Error!CheckedModule {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -9177,6 +9888,8 @@ pub fn analyzeWithModules(
         .let_types = .empty,
         .const_types = .empty,
         .current_fn_ret = null,
+        .project_pkg_name = project_pkg_name,
+        .declared_rust_crates = declared_rust_crates,
     };
 
     try az.registerImports();

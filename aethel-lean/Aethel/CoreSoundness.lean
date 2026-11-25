@@ -121,4 +121,11 @@ theorem run_append (s : State) (first rest : Program) :
   | cons instruction first ih =>
     simp [run, ih, Option.bind_assoc]
 
+theorem Runs.append {start middle final : State} {first rest : Program}
+    (prefixRun : Runs start first middle) (suffixRun : Runs middle rest final) :
+    Runs start (first ++ rest) final := by
+  induction prefixRun with
+  | nil => exact suffixRun
+  | cons first _ ih => exact .cons first (ih suffixRun)
+
 end Aethel.Core

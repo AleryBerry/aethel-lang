@@ -61,6 +61,17 @@ pub const LoopAccessProfile = struct {
     observed_len: ?usize,
 };
 
+pub const l1_data_cache_bytes: usize = 32768;
+
+/// Mirror `CacheLayout.selectSubBytePolicy`: unpack hot loop-mutated sub-byte fields when the
+/// naive record working set fits inside L1d (`32 KiB`), while always packing cold or streaming fields.
+pub fn shouldUnpackHotSubByteInL1(is_hot: bool, observed_len: ?usize, naive_record_bytes: usize) bool {
+    if (!is_hot) return false;
+    const len = observed_len orelse return false;
+    const ws = std.math.mul(usize, len, @max(@as(usize, 1), naive_record_bytes)) catch return false;
+    return ws <= l1_data_cache_bytes;
+}
+
 pub const AutoLayoutDecision = struct {
     selected: CollectionLayout,
     hot_ratio_pct: usize,

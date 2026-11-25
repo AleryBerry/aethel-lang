@@ -22,6 +22,8 @@ import Aethel.CoreAST
 import Aethel.CoreSemantics
 import Aethel.Representation
 import Aethel.CoreSoundnessFull
+import Aethel.CoreChecking
+import Aethel.CoreReduction
 import Aethel.PermissionLattice
 import Aethel.MultiPathViews
 import Aethel.AffineIndex
@@ -40,6 +42,7 @@ import Aethel.InterprocBorrow
 import Aethel.MIRValidator
 import Aethel.ScopedForkJoin
 import Aethel.RustFFI
+import Aethel.RustBorrowedCall
 import Aethel.IntInference
 import Aethel.CategoricalTraits
 import Aethel.RustBorrowBridge
@@ -49,3 +52,10 @@ import Aethel.DynamicMemory
 import Aethel.SegmentedAoSoA
 import Aethel.StdContainers
 import Aethel.SourceVerification
+import Aethel.SourceLoops
+import Aethel.SourceLaws
+import Aethel.SourceLayout
+import Aethel.SourcePure
+import Aethel.SourceRust
+import Aethel.CargoInterop
+import Aethel.ProcMacroInterop

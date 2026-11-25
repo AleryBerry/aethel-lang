@@ -93,6 +93,14 @@ fn runCli(
         return 0;
     }
 
+    if (std.mem.eql(u8, args[1], "new")) {
+        return try handleNew(io, arena, args[2..], stdout, stderr);
+    }
+
+    if (std.mem.eql(u8, args[1], "add")) {
+        return try handleAdd(io, arena, args[2..], stdout, stderr);
+    }
+
     if (std.mem.eql(u8, args[1], "check") or
         std.mem.eql(u8, args[1], "emit-mir") or
         std.mem.eql(u8, args[1], "emit-zig") or
@@ -104,23 +112,24 @@ fn runCli(
         const emit_rust = std.mem.eql(u8, args[1], "emit-rust-adapter");
         var explain_layout = false;
         var path_opt: ?[]const u8 = null;
-        if (args.len == 3) {
-            if (!std.mem.startsWith(u8, args[2], "--")) path_opt = args[2];
-        } else if (is_check and args.len == 4) {
-            if (std.mem.eql(u8, args[2], "--explain-layout")) {
+        for (args[2..]) |arg| {
+            if (is_check and std.mem.eql(u8, arg, "--explain-layout")) {
                 explain_layout = true;
-                path_opt = args[3];
-            } else if (std.mem.eql(u8, args[3], "--explain-layout")) {
-                explain_layout = true;
-                path_opt = args[2];
+            } else if (std.mem.startsWith(u8, arg, "--")) {
+                try stderr.print("error: unknown flag '{s}'\n", .{arg});
+                try stderr.flush();
+                return 2;
+            } else if (path_opt == null) {
+                path_opt = arg;
+            } else {
+                const flag_hint = if (is_check) "[--explain-layout] " else "";
+                try stderr.print("usage: aethel {s} {s}[<file.aethel|dir>]\n", .{ args[1], flag_hint });
+                try stderr.flush();
+                return 2;
             }
         }
-        const path = path_opt orelse {
-            const flag_hint = if (is_check) "[--explain-layout] " else "";
-            try stderr.print("usage: aethel {s} {s}<file.aethel>\n", .{ args[1], flag_hint });
-            try stderr.flush();
-            return 2;
-        };
+        const resolved = (try resolveCliTarget(io, arena, path_opt, stderr)) orelse return 1;
+        const path = resolved.entry_path;
 
         var loaded = try aethel.module_loader.loadProgram(arena, io, path, null);
         defer loaded.deinit();
@@ -143,7 +152,14 @@ fn runCli(
         }
 
         const mod_infos = try slicesToModuleInfos(arena, loaded.slices);
-        var checked = try aethel.checkWithModules(arena, &tree, mod_infos, loaded.entry_module_id);
+        var checked = try aethel.checkWithModulesAndManifest(
+            arena,
+            &tree,
+            mod_infos,
+            loaded.entry_module_id,
+            resolved.pkg_name,
+            resolved.declared_crates,
+        );
         defer checked.deinit();
         if (checked.hasErrors()) {
             for (checked.diagnostics) |diag| {
@@ -164,7 +180,15 @@ fn runCli(
             return 0;
         }
         if (emit_rust) {
-            try aethel.rust_ffi.emitRustAdapter(&tree, &checked, null, stdout);
+            if (resolved.manifest != null) {
+                var user_src: ?[]const u8 = null;
+                if (resolved.user_rust_bridge) |bp| {
+                    user_src = Io.Dir.cwd().readFileAllocOptions(io, bp, arena, .limited(16 * 1024 * 1024), .of(u8), 0) catch null;
+                }
+                try aethel.rust_ffi.emitCargoProjectAdapter(&tree, &checked, user_src, resolved.pkg_name, stdout);
+            } else {
+                try aethel.rust_ffi.emitRustAdapter(&tree, &checked, null, stdout);
+            }
             try stdout.flush();
             return 0;
         }
@@ -274,6 +298,11 @@ const OptLevel = enum {
     small,
 };
 
+const BackendKind = enum {
+    zig,
+    llvm,
+};
+
 fn handleBuildOrRun(
     io: Io,
     arena: std.mem.Allocator,
@@ -286,7 +315,10 @@ fn handleBuildOrRun(
     var out_path_opt: ?[]const u8 = null;
     var rust_path_opt: ?[]const u8 = null;
     var opt_level: OptLevel = .debug;
+    var backend_opt: ?BackendKind = null;
     var keep_zig = false;
+    var offline = false;
+    var release_flag = false;
 
     var i: usize = 0;
     while (i < rest.len) : (i += 1) {
@@ -328,8 +360,29 @@ fn handleBuildOrRun(
                 try stderr.flush();
                 return 2;
             }
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stderr.print("error: missing backend after '--backend' (zig|llvm)\n", .{});
+                try stderr.flush();
+                return 2;
+            }
+            const b = rest[i];
+            if (std.mem.eql(u8, b, "zig")) {
+                backend_opt = .zig;
+            } else if (std.mem.eql(u8, b, "llvm")) {
+                backend_opt = .llvm;
+            } else {
+                try stderr.print("error: invalid --backend '{s}' (expected zig or llvm)\n", .{b});
+                try stderr.flush();
+                return 2;
+            }
         } else if (std.mem.eql(u8, arg, "--keep-zig")) {
             keep_zig = true;
+        } else if (std.mem.eql(u8, arg, "--offline")) {
+            offline = true;
+        } else if (std.mem.eql(u8, arg, "--release")) {
+            release_flag = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             try stderr.print("error: unknown flag '{s}'\n", .{arg});
             try stderr.flush();
@@ -343,14 +396,8 @@ fn handleBuildOrRun(
         }
     }
 
-    const path = input_path orelse {
-        try stderr.print("usage: aethel {s} <file.aethel>{s} [--rust <lib.rs>] [-O debug|safe|fast|small] [--keep-zig]\n", .{
-            if (is_run) "run" else "build",
-            if (is_run) "" else " [-o <out>]",
-        });
-        try stderr.flush();
-        return 2;
-    };
+    const resolved = (try resolveCliTarget(io, arena, input_path, stderr)) orelse return 1;
+    const path = resolved.entry_path;
 
     var loaded = try aethel.module_loader.loadProgram(arena, io, path, null);
     defer loaded.deinit();
@@ -373,7 +420,14 @@ fn handleBuildOrRun(
     }
 
     const mod_infos = try slicesToModuleInfos(arena, loaded.slices);
-    var checked = try aethel.checkWithModules(arena, &tree, mod_infos, loaded.entry_module_id);
+    var checked = try aethel.checkWithModulesAndManifest(
+        arena,
+        &tree,
+        mod_infos,
+        loaded.entry_module_id,
+        resolved.pkg_name,
+        resolved.declared_crates,
+    );
     defer checked.deinit();
     if (checked.hasErrors()) {
         for (checked.diagnostics) |diag| {
@@ -401,21 +455,25 @@ fn handleBuildOrRun(
     const zig_src = zig_buf.written();
 
     const base_name = std.fs.path.basename(path);
-    const raw_stem = if (std.mem.endsWith(u8, base_name, ".aethel") and base_name.len > 7)
+    const raw_stem = if (resolved.pkg_name) |pn|
+        pn
+    else if (std.mem.endsWith(u8, base_name, ".aethel") and base_name.len > 7)
         base_name[0 .. base_name.len - 7]
     else if (base_name.len > 0)
         base_name
     else
         "aethel_prog";
 
-    Io.Dir.cwd().createDirPath(io, ".aethel-build/cache") catch |err| {
+    const build_root = try aethel.manifest.resolveFromDir(arena, resolved.project_root, ".aethel-build");
+    const cache_dir = try std.fmt.allocPrint(arena, "{s}/cache", .{build_root});
+    Io.Dir.cwd().createDirPath(io, cache_dir) catch |err| {
         try stderr.print("error: failed to create .aethel-build directory: {s}\n", .{@errorName(err)});
         try stderr.flush();
         return 1;
     };
 
-    const zig_path = try std.fmt.allocPrint(arena, ".aethel-build/{s}.zig", .{raw_stem});
-    const out_path = out_path_opt orelse try std.fmt.allocPrint(arena, ".aethel-build/{s}", .{raw_stem});
+    const zig_path = try std.fmt.allocPrint(arena, "{s}/{s}.zig", .{ build_root, raw_stem });
+    const out_path = out_path_opt orelse try std.fmt.allocPrint(arena, "{s}/{s}", .{ build_root, raw_stem });
 
     if (std.fs.path.dirname(out_path)) |parent| {
         if (parent.len > 0) {
@@ -436,42 +494,89 @@ fn handleBuildOrRun(
         Io.Dir.cwd().deleteFile(io, zig_path) catch {};
     };
 
+    const backend: BackendKind = backend_opt orelse if (release_flag or opt_level != .debug) .llvm else .zig;
+    const emit_bin_flag = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{out_path});
+
     var rust_lib_opt: ?[]const u8 = null;
+    var link_flags: []const []const u8 = &.{ "-lc", "-lgcc_s" };
+    var cargo_pm_opt: ?*const aethel.manifest.ProjectManifest = null;
+    var tried_cross_lto = false;
+
     if (rust_path_opt) |rp| {
         rust_lib_opt = (try aethel.rust_ffi.compileRustStaticlib(io, arena, &tree, &checked, rp, raw_stem, stderr)) orelse return 1;
+    } else if (resolved.manifest) |*pm| {
+        if (pm.rust_deps.len > 0 or resolved.user_rust_bridge != null) {
+            cargo_pm_opt = pm;
+            const cargo_release = release_flag or opt_level != .debug;
+            const want_cross_lto = (backend == .llvm) and (release_flag or opt_level == .fast or opt_level == .small);
+            if (want_cross_lto) {
+                if (try aethel.rust_ffi.compileCargoProjectStaticlibOpts(
+                    io,
+                    arena,
+                    &tree,
+                    &checked,
+                    resolved.project_root,
+                    pm,
+                    resolved.user_rust_bridge,
+                    cargo_release,
+                    offline,
+                    .{ .use_cross_lto = true, .quiet_on_fail = true },
+                    stderr,
+                )) |cargo_out| {
+                    rust_lib_opt = cargo_out.staticlib_path;
+                    link_flags = cargo_out.link_flags;
+                    tried_cross_lto = true;
+                }
+            }
+            if (!tried_cross_lto) {
+                const cargo_out = (try aethel.rust_ffi.compileCargoProjectStaticlibOpts(
+                    io,
+                    arena,
+                    &tree,
+                    &checked,
+                    resolved.project_root,
+                    pm,
+                    resolved.user_rust_bridge,
+                    cargo_release,
+                    offline,
+                    .{ .use_cross_lto = false, .quiet_on_fail = false },
+                    stderr,
+                )) orelse return 1;
+                rust_lib_opt = cargo_out.staticlib_path;
+                link_flags = cargo_out.link_flags;
+            }
+        }
     }
 
-    const emit_bin_flag = try std.fmt.allocPrint(arena, "-femit-bin={s}", .{out_path});
-    var argv_list: std.ArrayList([]const u8) = .empty;
-    try argv_list.appendSlice(arena, &.{
-        build_options.zig_exe,
-        "build-exe",
-        zig_path,
-        "-fno-llvm",
-        "-fno-lld",
-    });
-    if (rust_lib_opt) |rlib| {
-        try argv_list.appendSlice(arena, &.{ rlib, "-lc", "-lgcc_s" });
+    var build_res = try runZigBuildExe(io, arena, zig_path, emit_bin_flag, cache_dir, opt_level, backend, release_flag, rust_lib_opt, link_flags, true, tried_cross_lto, stderr) orelse return 1;
+    if (!build_res.term.success() and tried_cross_lto) {
+        if (cargo_pm_opt) |pm| {
+            // Fall back cleanly from Cross-Language ThinLTO bitcode to native staticlib `.a` linking
+            // (preserving `#[inline(never)]` `noalias` SoA boundaries) when linker bitcode versions differ.
+            const cargo_out = (try aethel.rust_ffi.compileCargoProjectStaticlibOpts(
+                io,
+                arena,
+                &tree,
+                &checked,
+                resolved.project_root,
+                pm,
+                resolved.user_rust_bridge,
+                release_flag or opt_level != .debug,
+                offline,
+                .{ .use_cross_lto = false, .quiet_on_fail = false },
+                stderr,
+            )) orelse return 1;
+            rust_lib_opt = cargo_out.staticlib_path;
+            link_flags = cargo_out.link_flags;
+            build_res = try runZigBuildExe(io, arena, zig_path, emit_bin_flag, cache_dir, opt_level, backend, release_flag, rust_lib_opt, link_flags, true, false, stderr) orelse return 1;
+        }
     }
-    switch (opt_level) {
-        .debug => {},
-        .safe => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseSafe" }),
-        .fast => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseFast" }),
-        .small => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseSmall" }),
+    if (!build_res.term.success() and rust_lib_opt != null and backend == .zig) {
+        // Retry without `-fno-lld` (still strictly `-fno-llvm`) for large external Cargo archives.
+        build_res = try runZigBuildExe(io, arena, zig_path, emit_bin_flag, cache_dir, opt_level, backend, release_flag, rust_lib_opt, link_flags, false, false, stderr) orelse return 1;
     }
-    try argv_list.appendSlice(arena, &.{
-        emit_bin_flag,
-        "--cache-dir",
-        ".aethel-build/cache",
-    });
-
-    const build_res = std.process.run(arena, io, .{ .argv = argv_list.items }) catch |err| {
-        try stderr.print("error: failed to invoke Zig compiler '{s}': {s}\n", .{ build_options.zig_exe, @errorName(err) });
-        try stderr.flush();
-        return 1;
-    };
     if (!build_res.term.success()) {
-        try stderr.print("error: Zig built-in compiler failed to build '{s}' ({f})\n{s}\n", .{
+        try stderr.print("error: Zig compiler failed to build '{s}' ({f})\n{s}\n", .{
             path,
             build_res.term,
             build_res.stderr,
@@ -481,7 +586,10 @@ fn handleBuildOrRun(
     }
 
     if (!is_run) {
-        try stdout.print("Built {s} (Zig built-in compiler, no LLVM)\n", .{out_path});
+        try stdout.print("Built {s} ({s})\n", .{
+            out_path,
+            if (backend == .llvm) "LLVM backend" else "Zig built-in compiler, no LLVM",
+        });
         try stdout.flush();
         return 0;
     }
@@ -571,11 +679,8 @@ fn handleVerify(
         }
     }
 
-    const path = input_path orelse {
-        try stderr.print("usage: aethel verify <file.aethel> [--laws <LAWS.aethel>] [--lean|--no-lean]\n", .{});
-        try stderr.flush();
-        return 2;
-    };
+    const resolved = (try resolveCliTarget(io, arena, input_path, stderr)) orelse return 1;
+    const path = resolved.entry_path;
 
     var companion_path: ?[]const u8 = null;
     if (explicit_laws) |lp| {
@@ -626,7 +731,14 @@ fn handleVerify(
     }
 
     const mod_infos = try slicesToModuleInfos(arena, loaded.slices);
-    var checked = try aethel.checkWithModules(arena, &tree, mod_infos, loaded.entry_module_id);
+    var checked = try aethel.checkWithModulesAndManifest(
+        arena,
+        &tree,
+        mod_infos,
+        loaded.entry_module_id,
+        resolved.pkg_name,
+        resolved.declared_crates,
+    );
     defer checked.deinit();
 
     var has_non_law_error = false;
@@ -729,6 +841,8 @@ fn handleVerify(
         for (checked.foreign_contracts) |fc| {
             if (fc.trait_name) |tn| {
                 try stdout.print("              - instance {s}: {s} -> rust \"{s}\"\n", .{ fc.aethel_name, tn, fc.rust_sym });
+            } else if (fc.rust_target) |rt| {
+                try stdout.print("              - fn {s} -> rust crate \"{s}::{s}\"\n", .{ fc.aethel_name, rt, fc.rust_sym });
             } else {
                 try stdout.print("              - fn {s} -> rust \"{s}\"\n", .{ fc.aethel_name, fc.rust_sym });
             }
@@ -821,17 +935,355 @@ fn printUsage(writer: *Io.Writer) Io.Writer.Error!void {
         \\
         \\Usage:
         \\  aethel --help
+        \\  aethel new <name> [--rust]
+        \\  aethel add --rust <crate>[@<version>] [--features f1,f2] [--no-default-features] [--path <dir>]
         \\  aethel lex <file.aethel>
         \\  aethel parse <file.aethel>
-        \\  aethel check [--explain-layout] <file.aethel>
-        \\  aethel verify <file.aethel> [--laws <LAWS.aethel>] [--lean|--no-lean]
-        \\  aethel emit-mir <file.aethel>
-        \\  aethel emit-zig <file.aethel>
-        \\  aethel emit-rust-adapter <file.aethel>
-        \\  aethel build <file.aethel> [--rust <lib.rs|crate_dir>] [-o <out>] [-O debug|safe|fast|small] [--keep-zig]
-        \\  aethel run <file.aethel> [--rust <lib.rs|crate_dir>] [-O debug|safe|fast|small] [--keep-zig]
+        \\  aethel check [--explain-layout] [<file.aethel|dir>]
+        \\  aethel verify [<file.aethel|dir>] [--laws <LAWS.aethel>] [--lean|--no-lean]
+        \\  aethel emit-mir [<file.aethel|dir>]
+        \\  aethel emit-zig [<file.aethel|dir>]
+        \\  aethel emit-rust-adapter [<file.aethel|dir>]
+        \\  aethel build [<file.aethel|dir>] [--rust <lib.rs|crate_dir>] [-o <out>] [-O debug|safe|fast|small] [--backend zig|llvm] [--release] [--offline] [--keep-zig]
+        \\  aethel run [<file.aethel|dir>] [--rust <lib.rs|crate_dir>] [-O debug|safe|fast|small] [--backend zig|llvm] [--release] [--offline] [--keep-zig]
         \\
     , .{});
+}
+
+const CliTarget = struct {
+    entry_path: []const u8,
+    project_root: []const u8,
+    manifest: ?aethel.manifest.ProjectManifest,
+    pkg_name: ?[]const u8,
+    declared_crates: ?[]const []const u8,
+    user_rust_bridge: ?[]const u8,
+};
+
+fn resolveCliTarget(
+    io: Io,
+    arena: std.mem.Allocator,
+    input_path: ?[]const u8,
+    stderr: *Io.Writer,
+) !?CliTarget {
+    const is_dir_or_omitted = if (input_path) |ip|
+        (aethel.manifest.isDirectory(io, ip) or std.mem.eql(u8, std.fs.path.basename(ip), "aethel.toml"))
+    else
+        true;
+
+    const manifest_path_opt = try aethel.manifest.discoverManifestPath(io, arena, input_path);
+    if (is_dir_or_omitted and manifest_path_opt == null) {
+        try stderr.print("error: no aethel.toml found in target directory or ancestors (pass a .aethel file or run 'aethel new <name>')\n", .{});
+        try stderr.flush();
+        return null;
+    }
+
+    if (manifest_path_opt) |mp| {
+        const toml_src = Io.Dir.cwd().readFileAllocOptions(io, mp, arena, .limited(2 * 1024 * 1024), .of(u8), 0) catch |err| {
+            try stderr.print("error: failed to read manifest '{s}': {s}\n", .{ mp, @errorName(err) });
+            try stderr.flush();
+            return null;
+        };
+        const pm = aethel.manifest.parseManifest(arena, toml_src) catch |err| {
+            try stderr.print("error: invalid aethel.toml '{s}' ({s})\n", .{ mp, @errorName(err) });
+            try stderr.flush();
+            return null;
+        };
+        const project_root = std.fs.path.dirname(mp) orelse ".";
+        const entry_path = if (!is_dir_or_omitted and input_path != null)
+            input_path.?
+        else
+            try aethel.manifest.resolveFromDir(arena, project_root, pm.entry);
+
+        const declared = try arena.alloc([]const u8, pm.rust_deps.len);
+        for (pm.rust_deps, 0..) |rd, di| declared[di] = rd.name;
+
+        var bridge_path: ?[]const u8 = null;
+        const bridge_cand = if (pm.rust_bridge) |rb|
+            try aethel.manifest.resolveFromDir(arena, project_root, rb)
+        else
+            try aethel.manifest.resolveFromDir(arena, project_root, "rust/src/lib.rs");
+        if (Io.Dir.cwd().access(io, bridge_cand, .{})) |_| {
+            bridge_path = bridge_cand;
+        } else |_| {
+            if (pm.rust_bridge != null) {
+                try stderr.print("error: configured [rust].bridge '{s}' not found\n", .{bridge_cand});
+                try stderr.flush();
+                return null;
+            }
+        }
+
+        return .{
+            .entry_path = entry_path,
+            .project_root = project_root,
+            .manifest = pm,
+            .pkg_name = pm.pkg_name,
+            .declared_crates = declared,
+            .user_rust_bridge = bridge_path,
+        };
+    }
+
+    return .{
+        .entry_path = input_path.?,
+        .project_root = ".",
+        .manifest = null,
+        .pkg_name = null,
+        .declared_crates = null,
+        .user_rust_bridge = null,
+    };
+}
+
+fn runZigBuildExe(
+    io: Io,
+    arena: std.mem.Allocator,
+    zig_path: []const u8,
+    emit_bin_flag: []const u8,
+    cache_dir: []const u8,
+    opt_level: OptLevel,
+    backend: BackendKind,
+    strip_symbols: bool,
+    rust_lib_opt: ?[]const u8,
+    link_flags: []const []const u8,
+    use_fno_lld: bool,
+    use_flto: bool,
+    stderr: *Io.Writer,
+) !?std.process.RunResult {
+    var argv_list: std.ArrayList([]const u8) = .empty;
+    try argv_list.appendSlice(arena, &.{
+        build_options.zig_exe,
+        "build-exe",
+        zig_path,
+    });
+    if (backend == .llvm) {
+        try argv_list.append(arena, "-fllvm");
+        if (use_flto) {
+            try argv_list.append(arena, "-flto");
+        }
+        try argv_list.append(arena, if (strip_symbols) "-fstrip" else "-fno-strip");
+    } else {
+        try argv_list.append(arena, "-fno-llvm");
+        if (use_fno_lld) {
+            try argv_list.append(arena, "-fno-lld");
+        }
+    }
+    if (rust_lib_opt) |rlib| {
+        try argv_list.append(arena, rlib);
+        for (link_flags) |lf| {
+            try argv_list.append(arena, lf);
+        }
+    }
+    switch (opt_level) {
+        .debug => {},
+        .safe => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseSafe" }),
+        .fast => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseFast" }),
+        .small => try argv_list.appendSlice(arena, &.{ "-O", "ReleaseSmall" }),
+    }
+    try argv_list.appendSlice(arena, &.{
+        emit_bin_flag,
+        "--cache-dir",
+        cache_dir,
+    });
+
+    return std.process.run(arena, io, .{ .argv = argv_list.items }) catch |err| {
+        try stderr.print("error: failed to invoke Zig compiler '{s}': {s}\n", .{ build_options.zig_exe, @errorName(err) });
+        try stderr.flush();
+        return null;
+    };
+}
+
+fn handleNew(
+    io: Io,
+    arena: std.mem.Allocator,
+    rest: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !u8 {
+    var dir_opt: ?[]const u8 = null;
+    var create_rust = false;
+    for (rest) |arg| {
+        if (std.mem.eql(u8, arg, "--rust")) {
+            create_rust = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try stderr.print("error: unknown flag '{s}' for 'aethel new'\n", .{arg});
+            try stderr.flush();
+            return 2;
+        } else if (dir_opt == null) {
+            dir_opt = arg;
+        } else {
+            try stderr.print("usage: aethel new <name> [--rust]\n", .{});
+            try stderr.flush();
+            return 2;
+        }
+    }
+    const dir = dir_opt orelse {
+        try stderr.print("usage: aethel new <name> [--rust]\n", .{});
+        try stderr.flush();
+        return 2;
+    };
+
+    const pkg_name = try aethel.manifest.normalizePkgName(arena, dir);
+    if (!aethel.manifest.isValidCrateIdent(pkg_name)) {
+        try stderr.print("error: invalid package name '{s}' (must start with ASCII lowercase letter)\n", .{pkg_name});
+        try stderr.flush();
+        return 1;
+    }
+
+    const src_dir = try aethel.manifest.resolveFromDir(arena, dir, "src");
+    try Io.Dir.cwd().createDirPath(io, src_dir);
+
+    const toml_path = try aethel.manifest.resolveFromDir(arena, dir, "aethel.toml");
+    if (Io.Dir.cwd().access(io, toml_path, .{})) |_| {
+        try stderr.print("error: '{s}' already exists\n", .{toml_path});
+        try stderr.flush();
+        return 1;
+    } else |_| {}
+
+    const pm = aethel.manifest.ProjectManifest{ .pkg_name = pkg_name };
+    const rendered_toml = try aethel.manifest.renderManifest(arena, &pm);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = toml_path, .data = rendered_toml });
+
+    const gitignore_path = try aethel.manifest.resolveFromDir(arena, dir, ".gitignore");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = gitignore_path, .data = ".aethel-build/\nzig-out/\n" });
+
+    const main_path = try aethel.manifest.resolveFromDir(arena, dir, "src/main.aethel");
+    const main_src = try std.fmt.allocPrint(arena,
+        \\pub fn main() {{
+        \\  println("Hello from {s}!")
+        \\}}
+        \\
+    , .{pkg_name});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = main_src });
+
+    if (create_rust) {
+        const rust_dir = try aethel.manifest.resolveFromDir(arena, dir, "rust/src");
+        try Io.Dir.cwd().createDirPath(io, rust_dir);
+        const rust_lib = try aethel.manifest.resolveFromDir(arena, dir, "rust/src/lib.rs");
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = rust_lib, .data = "// Optional Rust/Cargo bridge functions called via @external(rust, \"...\")\n" });
+    }
+
+    try stdout.print("Created Aethel project '{s}' at {s}\n", .{ pkg_name, dir });
+    try stdout.flush();
+    return 0;
+}
+
+fn handleAdd(
+    io: Io,
+    arena: std.mem.Allocator,
+    rest: []const []const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) !u8 {
+    var is_rust = false;
+    var spec_opt: ?[]const u8 = null;
+    var path_opt: ?[]const u8 = null;
+    var manifest_opt: ?[]const u8 = null;
+    var default_features = true;
+    var features_list: std.ArrayList([]const u8) = .empty;
+
+    var i: usize = 0;
+    while (i < rest.len) : (i += 1) {
+        const arg = rest[i];
+        if (std.mem.eql(u8, arg, "--rust")) {
+            is_rust = true;
+        } else if (std.mem.eql(u8, arg, "--no-default-features")) {
+            default_features = false;
+        } else if (std.mem.eql(u8, arg, "--features")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stderr.print("error: missing comma-separated features after '--features'\n", .{});
+                try stderr.flush();
+                return 2;
+            }
+            var it = std.mem.tokenizeAny(u8, rest[i], ", ");
+            while (it.next()) |feat| try features_list.append(arena, feat);
+        } else if (std.mem.eql(u8, arg, "--path")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stderr.print("error: missing crate path after '--path'\n", .{});
+                try stderr.flush();
+                return 2;
+            }
+            path_opt = rest[i];
+        } else if (std.mem.eql(u8, arg, "--manifest-path")) {
+            i += 1;
+            if (i >= rest.len) {
+                try stderr.print("error: missing path after '--manifest-path'\n", .{});
+                try stderr.flush();
+                return 2;
+            }
+            manifest_opt = rest[i];
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            try stderr.print("error: unknown flag '{s}' for 'aethel add'\n", .{arg});
+            try stderr.flush();
+            return 2;
+        } else if (spec_opt == null) {
+            spec_opt = arg;
+        } else {
+            try stderr.print("usage: aethel add --rust <crate>[@<version>] [--features f1,f2] [--no-default-features] [--path <dir>]\n", .{});
+            try stderr.flush();
+            return 2;
+        }
+    }
+
+    const spec = spec_opt orelse {
+        try stderr.print("usage: aethel add --rust <crate>[@<version>] [--features f1,f2] [--no-default-features] [--path <dir>]\n", .{});
+        try stderr.flush();
+        return 2;
+    };
+
+    if (!is_rust) {
+        try stderr.print(
+            \\error: native Aethel package registry ([dependencies]) is reserved for a future release;
+            \\to add a Rust/Cargo crate to [rust-dependencies], run:
+            \\  aethel add --rust {s}
+            \\
+        , .{spec});
+        try stderr.flush();
+        return 1;
+    }
+
+    const mp = manifest_opt orelse (try aethel.manifest.discoverManifestPath(io, arena, null)) orelse {
+        try stderr.print("error: no aethel.toml found in current directory or ancestors (run 'aethel new <name>' first)\n", .{});
+        try stderr.flush();
+        return 1;
+    };
+
+    const toml_src = Io.Dir.cwd().readFileAllocOptions(io, mp, arena, .limited(2 * 1024 * 1024), .of(u8), 0) catch |err| {
+        try stderr.print("error: failed to read '{s}': {s}\n", .{ mp, @errorName(err) });
+        try stderr.flush();
+        return 1;
+    };
+    const existing = aethel.manifest.parseManifest(arena, toml_src) catch |err| {
+        try stderr.print("error: failed to parse '{s}': {s}\n", .{ mp, @errorName(err) });
+        try stderr.flush();
+        return 1;
+    };
+
+    const parsed = aethel.manifest.parseAddCrateSpec(spec);
+    const ver_opt: ?[]const u8 = if (parsed.version != null)
+        parsed.version
+    else if (path_opt == null)
+        "*"
+    else
+        null;
+
+    const dep = aethel.manifest.RustDepSpec{
+        .name = parsed.name,
+        .version = ver_opt,
+        .path = path_opt,
+        .default_features = default_features,
+        .features = try features_list.toOwnedSlice(arena),
+    };
+    const updated = aethel.manifest.upsertRustDependency(arena, &existing, dep) catch |err| {
+        try stderr.print("error: invalid Rust dependency '{s}': {s}\n", .{ spec, @errorName(err) });
+        try stderr.flush();
+        return 1;
+    };
+    const rendered = try aethel.manifest.renderManifest(arena, &updated);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = mp, .data = rendered });
+
+    try stdout.print("Added Rust crate '{s}' to [rust-dependencies] in {s}\n", .{ dep.name, mp });
+    try stdout.flush();
+    return 0;
 }
 
 test "main CLI module sanity check" {

@@ -1,4 +1,5 @@
 import Aethel.RecordRuntime
+import Aethel.ByteLoans
 
 namespace Aethel.AutomaticLayout
 
@@ -34,26 +35,19 @@ def RecordView.byteTargets (scope : RecordView) : List AccessTarget :=
 
 private def RecordView.startTrace (scope : RecordView) (owner : OwnerId)
     (handle : HandleId) : Program :=
-  (List.range scope.width).flatMap fun i =>
-    [.alias handle owner (scope.offset + i) scope.mode,
-      .reserve (scope.firstView + i) handle scope.mode, .forget handle]
+  acquireViews handle ((List.range scope.width).map fun i =>
+    ⟨scope.firstView + i, ⟨owner, scope.offset + i⟩, scope.mode⟩)
 
 private def RecordView.stopTrace (scope : RecordView) : Program :=
-  (List.range scope.width).map fun i => .release (scope.firstView + i)
-
-private def freshHandle (state : State) : HandleId :=
-  ((state.handles.map Prod.fst).max?).getD 0 + 1
-
-private def freshView (state : State) : ViewId :=
-  ((state.views.map View.id).max?).getD 0 + 1
+  releaseViews ((List.range scope.width).map fun i => scope.firstView + i)
 
 def openView (record : RecordRef abi schema) (state : State)
     (path : List Nat) (mode : AccessMode) : Option (RecordView × State) := do
   let allocation ← state.allocation record.owner
   if allocation.bytes.length != record.layout.size then none else do
     let (offset, width) ← inferView record.layout path
-    let scope : RecordView := ⟨path, mode, offset, width, freshView state⟩
-    let opened ← Core.run state (scope.startTrace record.owner (freshHandle state))
+    let scope : RecordView := ⟨path, mode, offset, width, state.freshView⟩
+    let opened ← Core.run state (scope.startTrace record.owner state.freshHandle)
     if checkAccessTargets opened record.owner mode scope.byteOffsets scope.byteTargets then
       return (scope, opened)
     else none
@@ -68,7 +62,7 @@ theorem openView_sound {record : RecordRef abi schema} {state opened : State}
     (result : openView record state path mode = some (scope, opened)) :
     scope.path = path ∧ scope.mode = mode ∧
       inferView record.layout path = some (scope.offset, scope.width) ∧
-      Runs state (scope.startTrace record.owner (freshHandle state)) opened ∧
+      Runs state (scope.startTrace record.owner state.freshHandle) opened ∧
       AccessAllowed opened record.owner mode scope.byteOffsets scope.byteTargets := by
   simp only [openView, bind, pure, Option.bind_eq_some_iff, Option.some.injEq,
     Prod.exists, Prod.mk.injEq, Option.ite_none_left_eq_some,
@@ -152,63 +146,6 @@ theorem reborrowView_reuses_target {parent child : RecordView} {record : RecordR
       Nat.sub_add_sub_cancel inside.1 childLower]
   rw [same]
 
-private theorem run_startStep_views (s next : State) (owner : OwnerId)
-    (handle : HandleId) (offset : Nat) (mode : AccessMode) (vid : ViewId)
-    (hRun : Core.run s [.alias handle owner offset mode, .reserve vid handle mode, .forget handle] = some next) :
-    ∀ v ∈ next.views, v ∈ s.views ∨ v.location = ⟨owner, offset⟩ := by
-  simp only [Core.run, Option.bind_eq_some_iff, Option.some.injEq] at hRun
-  obtain ⟨s1, h1, s2, h2, s3, h3, rfl⟩ := hRun
-  have st1 := execute_sound h1
-  have st2 := execute_sound h2
-  have st3 := execute_sound h3
-  cases st1 with
-  | alias fresh live =>
-    have hLookup : (s.addHandle handle ⟨⟨owner, offset⟩, mode⟩).handle handle =
-        some ⟨⟨owner, offset⟩, mode⟩ := by
-      simp [State.handle, State.addHandle]
-    cases st2 with
-    | reserve _ found _ _ _ =>
-      have hSame := Option.some.inj (found.symm.trans hLookup)
-      cases st3 with
-      | forget _ =>
-        intro v hv
-        simp only [State.removeHandle, State.addView, State.addHandle, List.mem_cons] at hv
-        rcases hv with rfl | hOld
-        · right; rw [hSame]
-        · left; exact hOld
-
-private def startTraceSegment (owner : OwnerId) (handle : HandleId) (offset : Nat)
-    (mode : AccessMode) (firstView : ViewId) (indices : List Nat) : Program :=
-  indices.flatMap fun i =>
-    [.alias handle owner (offset + i) mode,
-      .reserve (firstView + i) handle mode, .forget handle]
-
-private theorem run_startTraceSegment_views (indices : List Nat) (s next : State)
-    (owner : OwnerId) (handle : HandleId) (offset : Nat) (mode : AccessMode) (firstView : ViewId)
-    (hRun : Core.run s (startTraceSegment owner handle offset mode firstView indices) = some next) :
-    ∀ v ∈ next.views, v ∈ s.views ∨
-      (v.location.allocation = owner ∧ ∃ i ∈ indices, v.location.offset = offset + i) := by
-  induction indices generalizing s with
-  | nil =>
-    simp [startTraceSegment, Core.run] at hRun
-    subst hRun
-    intro v hv
-    exact Or.inl hv
-  | cons i rest ih =>
-    have hSeg : startTraceSegment owner handle offset mode firstView (i :: rest) =
-        [.alias handle owner (offset + i) mode,
-          .reserve (firstView + i) handle mode, .forget handle] ++
-          startTraceSegment owner handle offset mode firstView rest := rfl
-    rw [hSeg, Core.run_append, Option.bind_eq_some_iff] at hRun
-    obtain ⟨mid, hStep, hRest⟩ := hRun
-    intro v hv
-    rcases ih mid hRest v hv with hInMid | ⟨hOwner, j, hjMem, hOff⟩
-    · rcases run_startStep_views s mid owner handle (offset + i) mode (firstView + i) hStep v hInMid with hInS | hLoc
-      · exact Or.inl hInS
-      · exact Or.inr ⟨congrArg ByteLocation.allocation hLoc, i, List.mem_cons_self,
-          congrArg ByteLocation.offset hLoc⟩
-    · exact Or.inr ⟨hOwner, j, List.mem_cons_of_mem _ hjMem, hOff⟩
-
 /-- Opening a `RecordView` only inserts views targeting bytes inside `scope.byteOffsets`
 of `record.owner`; all pre-existing views from `state` remain unaffected. -/
 theorem openView_views_subset {record : RecordRef abi schema} {state opened : State}
@@ -221,15 +158,13 @@ theorem openView_views_subset {record : RecordRef abi schema} {state opened : St
     Option.ite_none_right_eq_some] at result
   obtain ⟨_, _, _, offset, width, _, opened', executed, _, rfl, hOpenEq⟩ := result
   subst hOpenEq
-  have hSeg : (RecordView.mk path mode offset width (freshView state)).startTrace
-      record.owner (freshHandle state) =
-      startTraceSegment record.owner (freshHandle state) offset mode (freshView state)
-        (List.range width) := rfl
-  rw [hSeg] at executed
+  simp only [RecordView.startTrace] at executed
+  have same := acquireViews_exact (run_sound executed)
   intro v hv
-  rcases run_startTraceSegment_views (List.range width) state opened' record.owner
-      (freshHandle state) offset mode (freshView state) executed v hv with hInS | ⟨hOwner, i, hiMem, hOff⟩
-  · exact Or.inl hInS
-  · exact Or.inr ⟨hOwner, List.mem_map.mpr ⟨i, hiMem, hOff.symm⟩⟩
+  rw [same] at hv
+  simp only [List.mem_append, List.mem_reverse, List.mem_map] at hv
+  rcases hv with ⟨i, chosen, rfl⟩ | previous
+  · exact .inr ⟨rfl, List.mem_map.mpr ⟨i, chosen, rfl⟩⟩
+  · exact .inl previous
 
 end Aethel.AutomaticLayout

@@ -764,3 +764,44 @@ test "17. Stage C LNL once closures, rank-1 generics, fused pipelines, combinato
         \\}
     , .type_mismatch);
 }
+
+test "reading an undeclared record field reports a source diagnostic" {
+    try expectSemaError(
+        \\type Reading { known: u8 }
+        \\fn main() -> u8 {
+        \\  let reading = Reading { known: 1u8 }
+        \\  reading.missing
+        \\}
+    , .unknown_ident);
+}
+
+test "returned scalar field views preserve the caller's sibling access" {
+    var accepted = try analyzeOk(
+        \\type Pair { left: u8, right: u8 }
+        \\fn fetch(pair: Pair ~>.{left}) -> View(u8, Shared) { pair.left }
+        \\fn main() -> u8 {
+        \\  let mut pair = Pair { left: 7u8, right: 0u8 };
+        \\  let held = fetch(pair);
+        \\  pair.right = held;
+        \\  pair.right
+        \\}
+    );
+    defer accepted.deinit();
+    try expectSemaError(
+        \\type Pair { left: u8, right: u8 }
+        \\fn fetch(pair: Pair ~>.{left}) -> View(u8, Shared) { pair.right }
+    , .unauthorized_field_access);
+    try expectSemaError(
+        \\type Pair { left: u8, right: u8 }
+        \\fn select(pair: Pair ~>.{left, right}, first: bool) -> View(u8, Shared) {
+        \\  if first { return pair.left; };
+        \\  pair.right
+        \\}
+        \\fn main() -> u8 {
+        \\  let mut pair = Pair { left: 7u8, right: 0u8 };
+        \\  let held = select(pair, false);
+        \\  pair.right = 1u8;
+        \\  if held == 0u8 { 0u8 } else { 1u8 }
+        \\}
+    , .borrow_conflict);
+}

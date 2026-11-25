@@ -2,10 +2,12 @@ import Aethel.DynamicMemory
 import Aethel.SegmentedAoSoA
 import Aethel.StdContainers
 import Aethel.MIRValidator
+import Aethel.CargoInterop
+import Aethel.ProcMacroInterop
 
 namespace Aethel.Phase8.Tests
 
-open Aethel Aethel.Core Aethel.CacheLayout Aethel.DynamicMemory Aethel.StdContainers Aethel.MIRValidator
+open Aethel Aethel.Core Aethel.CacheLayout Aethel.DynamicMemory Aethel.StdContainers Aethel.MIRValidator Aethel.CargoInterop Aethel.ProcMacroInterop
 
 private def require (msg : String) (ok : Bool) : IO Unit := do
   unless ok do throw (IO.userError msg)
@@ -134,10 +136,55 @@ private def runDynVecMIRTests : IO Unit := do
   | .ok _ => throw (IO.userError "expected realloc under active view to be rejected")
   | .error _ => pure ()
 
+private def runCargoInteropTests : IO Unit := do
+  let st : Core.State := { allocations := [⟨0, [0x48, 0x69, 0x21]⟩], issued := [0] }
+  require "valid UTF-8 borrowed &str accepted"
+    (checkRustStr st ⟨⟨0, 0, 3, 1, 1, .shared, false⟩, [0x48, 0x69, 0x21]⟩)
+  require "invalid UTF-8 rejected"
+    (!checkRustStr st ⟨⟨0, 0, 1, 1, 1, .shared, false⟩, [0xFF]⟩)
+  require "exclusive &mut str rejected"
+    (!checkRustStr st ⟨⟨0, 0, 0, 1, 1, .exclusive, false⟩, []⟩)
+
+  let okCb : AethelCallbackSpec := ⟨"greet_person", 0, false, [.borrowedStr], .unit⟩
+  let badCb : AethelCallbackSpec := ⟨"leaky_cb", 1, false, [.borrowedStr], .unit⟩
+  require "stateless Aethel -> Rust callback accepted" (checkStatelessCallback okCb)
+  require "capturing callback rejected" (!checkStatelessCallback badCb)
+
+  let bevyDep : CargoDepSpec := ⟨"bevy", true, false, false, ["bevy_state"]⟩
+  let manifest : ProjectManifestSpec := ⟨"bevy_hello", "src/main.aethel", [bevyDep]⟩
+  require "valid Cargo manifest accepted" (checkManifestValid manifest)
+  require "declared crate bevy allowed" (checkCrateTargetDeclared manifest "bevy")
+  require "undeclared crate rejected" (!checkCrateTargetDeclared manifest "tokio")
+
+private def runProcMacroInteropTests : IO Unit := do
+  let serdeDerive : RustMacroAttachment := .deriveTrait (some "serde") "Serialize"
+  let serdeHelper : RustMacroAttachment := .inertHelperAttr "serde" "rename = \"target_fps\""
+  let reprAttr : RustMacroAttachment := .inertHelperAttr "repr" "packed"
+  let badAttr : RustMacroAttachment := .rewritingAttrMacro "tokio::main"
+  require "derive + serde helper allowed on flat record"
+    (checkMirroredRecordDerives true [serdeDerive, serdeHelper])
+  require "non-flat record derive rejected"
+    (!checkMirroredRecordDerives false [serdeDerive])
+  require "repr helper override rejected" (!checkMacroAttachment reprAttr)
+  require "rewriting attribute macro rejected" (!checkMacroAttachment badAttr)
+
+  let depSerde : CargoDepSpec := ⟨"serde", true, false, false, ["derive"]⟩
+  let manifest : ProjectManifestSpec := ⟨"ecs_app", "src/main.aethel", [depSerde]⟩
+  require "declared serde derive accepted" (checkAttachmentCrateDeclared manifest serdeDerive)
+  require "undeclared bevy derive rejected"
+    (!checkAttachmentCrateDeclared manifest (.deriveTrait (some "bevy") "Component"))
+
+  let extCb : ExtendedCallbackSpec :=
+    ⟨"move_entities", 0, false,
+      [.borrowedFlatView .exclusive 8 4, .borrowedSlice .shared 4 4], .unit⟩
+  require "extended view/slice callback accepted" (checkExtendedCallback extCb)
+
 def run : IO Unit := do
   runDynamicMemoryTests
   runSegmentedGrowthTests
   runStdContainerTests
   runDynVecMIRTests
+  runCargoInteropTests
+  runProcMacroInteropTests
 
 end Aethel.Phase8.Tests

@@ -2,10 +2,12 @@ const std = @import("std");
 const Io = std.Io;
 const ast = @import("ast.zig");
 const sema = @import("sema.zig");
+const manifest = @import("manifest.zig");
 
 const RustFFIEntry = struct {
     sym_name: []const u8,
     call_path: []const u8,
+    is_external_crate_call: bool = false,
     param_names: []const []const u8,
     param_types: []const *const sema.Ty,
     ret_type: *const sema.Ty,
@@ -37,7 +39,28 @@ pub fn emitRustAdapter(
     user_rust_source: ?[]const u8,
     writer: *Io.Writer,
 ) Io.Writer.Error!void {
-    return emitRustAdapterInner(tree, checked, user_rust_source, null, writer);
+    return emitRustAdapterInner(tree, checked, user_rust_source, null, null, false, writer);
+}
+
+pub fn emitCargoProjectAdapter(
+    tree: *const ast.Ast,
+    checked: *const sema.CheckedModule,
+    user_rust_source: ?[]const u8,
+    project_pkg_name: ?[]const u8,
+    writer: *Io.Writer,
+) Io.Writer.Error!void {
+    return emitRustAdapterInner(tree, checked, user_rust_source, null, project_pkg_name, false, writer);
+}
+
+pub fn emitCargoProjectAdapterWithOptions(
+    tree: *const ast.Ast,
+    checked: *const sema.CheckedModule,
+    user_rust_source: ?[]const u8,
+    project_pkg_name: ?[]const u8,
+    use_cross_lto: bool,
+    writer: *Io.Writer,
+) Io.Writer.Error!void {
+    return emitRustAdapterInner(tree, checked, user_rust_source, null, project_pkg_name, use_cross_lto, writer);
 }
 
 fn emitRustAdapterInner(
@@ -45,6 +68,8 @@ fn emitRustAdapterInner(
     checked: *const sema.CheckedModule,
     user_rust_source: ?[]const u8,
     cargo_crate_ident: ?[]const u8,
+    project_pkg_name: ?[]const u8,
+    use_cross_lto: bool,
     writer: *Io.Writer,
 ) Io.Writer.Error!void {
     try writer.writeAll("// Auto-generated Aethel -> Rust C-ABI adapter (verified against Aethel Rust Bridge proofs)\n");
@@ -104,9 +129,25 @@ fn emitRustAdapterInner(
         const cf = matched_cf orelse continue;
         const sym = cf.rust_sym orelse cname;
         var call_path = sym;
+        var is_ext_crate = false;
         for (checked.foreign_contracts) |fc| {
-            if (std.mem.eql(u8, fc.aethel_name, cname) and fc.rust_target != null) {
-                call_path = std.fmt.allocPrint(alloc, "{s}::{s}", .{ fc.rust_target.?, sym }) catch sym;
+            if (std.mem.eql(u8, fc.aethel_name, cname)) {
+                call_path = fc.rust_sym;
+                if (fc.rust_target) |tgt| {
+                    const is_local = std.mem.eql(u8, tgt, "self") or
+                        std.mem.eql(u8, tgt, "bridge") or
+                        (project_pkg_name != null and manifest.cratesMatch(tgt, project_pkg_name.?)) or
+                        (cargo_crate_ident != null and manifest.cratesMatch(tgt, cargo_crate_ident.?));
+                    if (is_local) {
+                        call_path = fc.rust_sym;
+                    } else if (project_pkg_name != null) {
+                        const norm_tgt = manifest.normalizeCrateIdentAlloc(alloc, tgt) catch tgt;
+                        call_path = std.fmt.allocPrint(alloc, "::{s}::{s}", .{ norm_tgt, fc.rust_sym }) catch fc.rust_sym;
+                        is_ext_crate = true;
+                    } else {
+                        call_path = std.fmt.allocPrint(alloc, "{s}::{s}", .{ tgt, fc.rust_sym }) catch fc.rust_sym;
+                    }
+                }
                 break;
             }
         }
@@ -115,6 +156,7 @@ fn emitRustAdapterInner(
         entries[entries_len] = .{
             .sym_name = sym,
             .call_path = call_path,
+            .is_external_crate_call = is_ext_crate,
             .param_names = pnames,
             .param_types = cf.param_types,
             .ret_type = cf.ret_type,
@@ -176,11 +218,29 @@ fn emitRustAdapterInner(
         if (!rec.is_flat_c) continue;
         if (cargo_crate_ident == null and user_rust_source != null and hasRustStructDef(user_rust_source.?, rec.name)) continue;
         if (!emitted_header) {
-            try writer.writeAll("\n// Verified flat C-ABI mirror structs (RustComplexABI.lean)\n");
+            try writer.writeAll("\n// Verified flat C-ABI mirror structs (RustComplexABI.lean / ProcMacroInterop.lean)\n");
             emitted_header = true;
         }
-        try writer.print("#[repr(C)]\n#[derive(Copy, Clone, Debug)]\npub struct {s} {{\n", .{rec.name});
+        try writer.writeAll("#[repr(C)]\n#[derive(Copy, Clone, Debug");
+        for (rec.rust_derives) |raw_drv| {
+            if (std.mem.eql(u8, raw_drv, "Copy") or std.mem.eql(u8, raw_drv, "Clone") or std.mem.eql(u8, raw_drv, "Debug")) {
+                continue;
+            }
+            if (std.mem.indexOf(u8, raw_drv, "::") != null and !std.mem.startsWith(u8, raw_drv, "::")) {
+                try writer.print(", ::{s}", .{raw_drv});
+            } else {
+                try writer.print(", {s}", .{raw_drv});
+            }
+        }
+        try writer.writeAll(")]\n");
+        for (rec.rust_attrs) |ra| {
+            try writer.print("#[{s}]\n", .{ra});
+        }
+        try writer.print("pub struct {s} {{\n", .{rec.name});
         for (rec.fields) |f| {
+            for (f.rust_attrs) |fa| {
+                try writer.print("    #[{s}]\n", .{fa});
+            }
             try writer.print("    pub {s}: ", .{f.name});
             try emitRustABITy(checked, f.ty, writer);
             try writer.writeAll(",\n");
@@ -255,7 +315,7 @@ fn emitRustAdapterInner(
         if (user_rust_source != null and hasExplicitExternCExport(user_rust_source.?, ent.sym_name)) {
             continue;
         }
-        try emitExternCShimEntry(alloc, tree.source, checked, ent, cargo_crate_ident != null, writer);
+        try emitExternCShimEntry(alloc, tree.source, checked, ent, cargo_crate_ident != null, use_cross_lto, writer);
         try writer.writeByte('\n');
     }
 }
@@ -370,24 +430,97 @@ fn collectSoAAoSoASpecs(
     }
 }
 
+fn emitRustCallbackFnPtrTy(
+    checked: *const sema.CheckedModule,
+    ft: sema.FnTy,
+    writer: *Io.Writer,
+) Io.Writer.Error!void {
+    try writer.writeAll("unsafe extern \"C\" fn(");
+    var first = true;
+    for (ft.params) |cp| {
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        if (cp.* == .string) {
+            try writer.writeAll("*const u8, usize");
+        } else if (isSliceTy(cp)) {
+            const sl = unwrapSliceTy(cp);
+            try writer.writeAll(if (sl.mutable) "*mut " else "*const ");
+            try emitRustABITy(checked, sl.elem, writer);
+            try writer.writeAll(", usize");
+        } else {
+            try emitRustABITy(checked, cp, writer);
+        }
+    }
+    try writer.writeByte(')');
+    if (ft.ret.* != .unit and ft.ret.* != .err) {
+        try writer.writeAll(" -> ");
+        try emitRustABITy(checked, ft.ret, writer);
+    }
+}
+
+fn emitRustClosureParamAndRet(
+    checked: *const sema.CheckedModule,
+    ft: sema.FnTy,
+    writer: *Io.Writer,
+) Io.Writer.Error!void {
+    try writer.writeByte('(');
+    for (ft.params, 0..) |cp, ci| {
+        if (ci > 0) try writer.writeAll(", ");
+        if (cp.* == .string) {
+            try writer.writeAll("&str");
+        } else if (isSliceTy(cp)) {
+            const sl = unwrapSliceTy(cp);
+            try writer.writeAll(if (sl.mutable) "&mut [" else "&[");
+            try emitRustABITy(checked, sl.elem, writer);
+            try writer.writeByte(']');
+        } else if (cp.* == .view and (cp.view.target.* == .record or cp.view.target.* == .applied)) {
+            try writer.writeAll(if (cp.view.mode == .shared) "&" else "&mut ");
+            try emitRustABITy(checked, cp.view.target, writer);
+        } else {
+            try emitRustABITy(checked, cp, writer);
+        }
+    }
+    try writer.writeByte(')');
+    if (ft.ret.* != .unit and ft.ret.* != .err) {
+        try writer.writeAll(" -> ");
+        try emitRustABITy(checked, ft.ret, writer);
+    }
+}
+
 fn emitExternCShimEntry(
     alloc: std.mem.Allocator,
     source: [:0]const u8,
     checked: *const sema.CheckedModule,
     ent: RustFFIEntry,
     is_cargo_crate: bool,
+    use_cross_lto: bool,
     writer: *Io.Writer,
 ) Io.Writer.Error!void {
-    try writer.print("#[no_mangle]\npub unsafe extern \"C\" fn {s}(\n", .{ent.sym_name});
+    try writer.print("#[allow(improper_ctypes_definitions)]\n#[no_mangle]\npub unsafe extern \"C\" fn {s}(\n", .{ent.sym_name});
     const pcount = if (ent.ast_extern) |ef| ef.params.len else ent.param_types.len;
+    var has_soa_param = false;
+    for (0..pcount) |pi| {
+        const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
+        if (pty != null) {
+            if (collectionBackingRecord(checked, pty.?)) |col| {
+                if (col.layout.layout == .soa) has_soa_param = true;
+            }
+        }
+    }
     for (0..pcount) |pi| {
         const pname = if (pi < ent.param_names.len) ent.param_names[pi] else "arg";
         const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
-        if (pty != null and isSliceTy(pty.?)) {
+        if (pty != null and pty.?.* == .string) {
+            try writer.print("    {s}_ptr: *const u8,\n    {s}_len: usize,\n", .{ pname, pname });
+        } else if (pty != null and pty.?.* == .fn_ty) {
+            try writer.print("    {s}_cb: ", .{pname});
+            try emitRustCallbackFnPtrTy(checked, pty.?.fn_ty, writer);
+            try writer.writeAll(",\n");
+        } else if (pty != null and isSliceTy(pty.?)) {
             const sl = unwrapSliceTy(pty.?);
             const qual = if (sl.mutable) "*mut " else "*const ";
             try writer.print("    {s}_ptr: {s}", .{ pname, qual });
-            try emitRustScalarTy(sl.elem, writer);
+            try emitRustABITy(checked, sl.elem, writer);
             try writer.print(",\n    {s}_len: usize,\n", .{pname});
         } else if (ent.ast_extern != null and pi < ent.ast_extern.?.params.len and ent.ast_extern.?.params[pi].ty != null and ent.ast_extern.?.params[pi].ty.?.* == .slice) {
             const sl = ent.ast_extern.?.params[pi].ty.?.slice;
@@ -441,13 +574,54 @@ fn emitExternCShimEntry(
     for (0..pcount) |pi| {
         const pname = if (pi < ent.param_names.len) ent.param_names[pi] else "arg";
         const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
-        if (pty != null and isSliceTy(pty.?)) {
+        if (pty != null and pty.?.* == .string) {
+            try writer.print("    let {s}: &str = if {s}_len == 0 {{ \"\" }} else {{ core::str::from_utf8(core::slice::from_raw_parts({s}_ptr, {s}_len)).expect(\"aethel: invalid UTF-8 string across FFI\") }};\n", .{ pname, pname, pname, pname });
+        } else if (pty != null and pty.?.* == .fn_ty) {
+            const ft = pty.?.fn_ty;
+            try writer.print("    let {s} = move |", .{pname});
+            for (ft.params, 0..) |cp, ci| {
+                if (ci > 0) try writer.writeAll(", ");
+                if (cp.* == .string) {
+                    try writer.print("__c_{d}: &str", .{ci});
+                } else if (isSliceTy(cp)) {
+                    const sl = unwrapSliceTy(cp);
+                    try writer.print("__c_{d}: {s}", .{ ci, if (sl.mutable) "&mut [" else "&[" });
+                    try emitRustABITy(checked, sl.elem, writer);
+                    try writer.writeByte(']');
+                } else if (cp.* == .view and (cp.view.target.* == .record or cp.view.target.* == .applied)) {
+                    try writer.print("__c_{d}: {s}", .{ ci, if (cp.view.mode == .shared) "&" else "&mut " });
+                    try emitRustABITy(checked, cp.view.target, writer);
+                } else {
+                    try writer.print("__c_{d}: ", .{ci});
+                    try emitRustABITy(checked, cp, writer);
+                }
+            }
+            try writer.print("| {{ unsafe {{ {s}_cb(", .{pname});
+            for (ft.params, 0..) |cp, ci| {
+                if (ci > 0) try writer.writeAll(", ");
+                if (cp.* == .string) {
+                    try writer.print("if __c_{d}.is_empty() {{ core::ptr::NonNull::<u8>::dangling().as_ptr() }} else {{ __c_{d}.as_ptr() }}, __c_{d}.len()", .{ ci, ci, ci });
+                } else if (isSliceTy(cp)) {
+                    const sl = unwrapSliceTy(cp);
+                    if (sl.mutable) {
+                        try writer.print("if __c_{d}.is_empty() {{ core::ptr::NonNull::dangling().as_ptr() }} else {{ __c_{d}.as_mut_ptr() }}, __c_{d}.len()", .{ ci, ci, ci });
+                    } else {
+                        try writer.print("if __c_{d}.is_empty() {{ core::ptr::NonNull::dangling().as_ptr() }} else {{ __c_{d}.as_ptr() }}, __c_{d}.len()", .{ ci, ci, ci });
+                    }
+                } else if (cp.* == .view and (cp.view.target.* == .record or cp.view.target.* == .applied)) {
+                    try writer.print("__c_{d} as {s}_", .{ ci, if (cp.view.mode == .shared) "*const " else "*mut " });
+                } else {
+                    try writer.print("__c_{d}", .{ci});
+                }
+            }
+            try writer.writeAll(") } };\n");
+        } else if (pty != null and isSliceTy(pty.?)) {
             const sl = unwrapSliceTy(pty.?);
             const slice_ref = if (sl.mutable) "&mut [" else "&[";
             const empty_expr = if (sl.mutable) "&mut []" else "&[]";
             const raw_fn = if (sl.mutable) "from_raw_parts_mut" else "from_raw_parts";
             try writer.print("    let {s}: {s}", .{ pname, slice_ref });
-            try emitRustScalarTy(sl.elem, writer);
+            try emitRustABITy(checked, sl.elem, writer);
             try writer.print("] = if {s}_len == 0 {{ {s} }} else {{ core::slice::{s}({s}_ptr, {s}_len) }};\n", .{
                 pname,
                 empty_expr,
@@ -475,14 +649,14 @@ fn emitExternCShimEntry(
             switch (col.layout.layout) {
                 .soa => {
                     const fidxs = collectFieldIndices(alloc, source, rec, pty.?);
-                    const qname = makeSoaQueryName(alloc, rec, fidxs, col.is_mut);
                     const empty_expr = if (col.is_mut) "&mut []" else "&[]";
                     const raw_fn = if (col.is_mut) "from_raw_parts_mut" else "from_raw_parts";
-                    try writer.print("    let {s} = {s} {{\n", .{ pname, qname });
+                    const slice_pre = if (col.is_mut) "&mut [" else "&[";
                     for (fidxs) |fi| {
                         const f = rec.fields[fi];
-                        try writer.print("        {s}: if {s}_len == 0 {{ {s} }} else {{ core::slice::{s}({s}_{s}_ptr, {s}_len) }},\n", .{
-                            f.name,
+                        try writer.print("    let __soa_{d}_{s}: {s}", .{ pi, f.name, slice_pre });
+                        try emitRustABITy(checked, f.ty, writer);
+                        try writer.print("] = if {s}_len == 0 {{ {s} }} else {{ core::slice::{s}({s}_{s}_ptr, {s}_len) }};\n", .{
                             pname,
                             empty_expr,
                             raw_fn,
@@ -491,7 +665,6 @@ fn emitExternCShimEntry(
                             pname,
                         });
                     }
-                    try writer.print("        len: {s}_len,\n    }};\n", .{pname});
                 },
                 .aosoa => |w| {
                     const vname = std.fmt.allocPrint(alloc, "{s}AoSoA{s}", .{ rec.name, if (col.is_mut) "Mut" else "" }) catch rec.name;
@@ -523,8 +696,98 @@ fn emitExternCShimEntry(
     }
 
     const wrap_ret = is_cargo_crate and (ent.ret_type.* == .record or ent.ret_type.* == .applied);
+    if (has_soa_param) {
+        // Call the Rust callee inside a helper whose `&'a mut [T]` / `&'a [T]` slice parameters
+        // preserve LLVM `noalias` / `!noalias` metadata across optimization. Under Cross-LTO
+        // `#[inline(always)]` exposes `noalias` across the LTO module; otherwise `#[inline(never)]`
+        // keeps the `noalias` parameter boundary intact without overlap checks.
+        try writer.print("    {s}\n    fn __aethel_soa_noalias_call<'a", .{
+            if (use_cross_lto) "#[inline(always)]" else "#[inline(never)]",
+        });
+        for (0..pcount) |pi| {
+            const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
+            if (pty != null and pty.?.* == .fn_ty) {
+                try writer.print(", F{d}: Fn", .{pi});
+                try emitRustClosureParamAndRet(checked, pty.?.fn_ty, writer);
+            }
+        }
+        try writer.writeAll(">(\n");
+        for (0..pcount) |pi| {
+            const pname = if (pi < ent.param_names.len) ent.param_names[pi] else "arg";
+            const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
+            if (pty != null and collectionBackingRecord(checked, pty.?) != null) {
+                const col = collectionBackingRecord(checked, pty.?).?;
+                const rec = checked.records[col.ridx];
+                if (col.layout.layout == .soa) {
+                    const fidxs = collectFieldIndices(alloc, source, rec, pty.?);
+                    const ref_ty = if (col.is_mut) "&'a mut [" else "&'a [";
+                    for (fidxs) |fi| {
+                        const f = rec.fields[fi];
+                        try writer.print("        __soa_{d}_{s}: {s}", .{ pi, f.name, ref_ty });
+                        try emitRustABITy(checked, f.ty, writer);
+                        try writer.writeAll("],\n");
+                    }
+                    try writer.print("        __soa_{d}_len: usize,\n", .{pi});
+                } else {
+                    const w = col.layout.layout.aosoa;
+                    _ = w;
+                    const vname = std.fmt.allocPrint(alloc, "{s}AoSoA{s}", .{ rec.name, if (col.is_mut) "Mut" else "" }) catch rec.name;
+                    try writer.print("        {s}: {s}<'a>,\n", .{ pname, vname });
+                }
+            } else if (pty != null and pty.?.* == .string) {
+                try writer.print("        {s}: &'a str,\n", .{pname});
+            } else if (pty != null and pty.?.* == .fn_ty) {
+                try writer.print("        {s}: F{d},\n", .{ pname, pi });
+            } else if (pty != null and isSliceTy(pty.?)) {
+                const sl = unwrapSliceTy(pty.?);
+                const slice_ref = if (sl.mutable) "&'a mut [" else "&'a [";
+                try writer.print("        {s}: {s}", .{ pname, slice_ref });
+                try emitRustABITy(checked, sl.elem, writer);
+                try writer.writeAll("],\n");
+            } else if (pty) |t| {
+                try writer.print("        {s}: ", .{pname});
+                try emitRustABITy(checked, t, writer);
+                try writer.writeAll(",\n");
+            }
+        }
+        try writer.writeByte(')');
+        if (ent.ret_type.* != .unit and ent.ret_type.* != .err) {
+            try writer.writeAll(" -> ");
+            try emitRustABITy(checked, ent.ret_type, writer);
+        } else if (ent.ast_extern != null and ent.ast_extern.?.ret != null) {
+            try writer.writeAll(" -> ");
+            try emitRustAstTy(source, ent.ast_extern.?.ret.?, writer);
+        }
+        try writer.writeAll(" {\n");
+        for (0..pcount) |pi| {
+            const pname = if (pi < ent.param_names.len) ent.param_names[pi] else "arg";
+            const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
+            if (pty != null and collectionBackingRecord(checked, pty.?) != null) {
+                const col = collectionBackingRecord(checked, pty.?).?;
+                const rec = checked.records[col.ridx];
+                if (col.layout.layout == .soa) {
+                    const fidxs = collectFieldIndices(alloc, source, rec, pty.?);
+                    const qname = makeSoaQueryName(alloc, rec, fidxs, col.is_mut);
+                    try writer.print("        let {s} = {s} {{\n", .{ pname, qname });
+                    for (fidxs) |fi| {
+                        const f = rec.fields[fi];
+                        try writer.print("            {s}: __soa_{d}_{s},\n", .{ f.name, pi, f.name });
+                    }
+                    try writer.print("            len: __soa_{d}_len,\n        }};\n", .{pi});
+                }
+            }
+        }
+        try writer.writeAll("    ");
+    }
+
     if (wrap_ret) {
-        try writer.print("    core::mem::transmute(aethel_rust_user::{s}(", .{ent.call_path});
+        if (ent.is_external_crate_call) {
+            try writer.print("    core::mem::transmute({s}(", .{ent.call_path});
+        } else {
+            try writer.print("    core::mem::transmute(aethel_rust_user::{s}(", .{ent.call_path});
+        }
+    } else if (ent.is_external_crate_call) {
+        try writer.print("    {s}(", .{ent.call_path});
     } else {
         try writer.print("    aethel_rust_user::{s}(", .{ent.call_path});
     }
@@ -541,7 +804,38 @@ fn emitExternCShimEntry(
     if (wrap_ret) {
         try writer.writeAll(")");
     }
-    try writer.writeAll(")\n}\n");
+    try writer.writeAll(")\n");
+
+    if (has_soa_param) {
+        try writer.writeAll("    }\n    __aethel_soa_noalias_call(");
+        var need_comma = false;
+        for (0..pcount) |pi| {
+            const pname = if (pi < ent.param_names.len) ent.param_names[pi] else "arg";
+            const pty: ?*const sema.Ty = if (pi < ent.param_types.len) ent.param_types[pi] else null;
+            if (pty != null and collectionBackingRecord(checked, pty.?) != null) {
+                const col = collectionBackingRecord(checked, pty.?).?;
+                const rec = checked.records[col.ridx];
+                if (col.layout.layout == .soa) {
+                    const fidxs = collectFieldIndices(alloc, source, rec, pty.?);
+                    for (fidxs) |fi| {
+                        const f = rec.fields[fi];
+                        if (need_comma) try writer.writeAll(", ");
+                        try writer.print("__soa_{d}_{s}", .{ pi, f.name });
+                        need_comma = true;
+                    }
+                    if (need_comma) try writer.writeAll(", ");
+                    try writer.print("{s}_len", .{pname});
+                    need_comma = true;
+                    continue;
+                }
+            }
+            if (need_comma) try writer.writeAll(", ");
+            try writer.writeAll(pname);
+            need_comma = true;
+        }
+        try writer.writeAll(")\n");
+    }
+    try writer.writeAll("}\n");
 }
 
 fn isSliceTy(ty: *const sema.Ty) bool {
@@ -739,15 +1033,15 @@ pub fn compileRustStaticlib(
     const bridge_path = try std.fmt.allocPrint(arena, ".aethel-build/{s}_rust_bridge.rs", .{stem});
     const lib_path = try std.fmt.allocPrint(arena, ".aethel-build/lib{s}_rust.a", .{stem});
 
-    if (manifest_opt) |manifest| {
+    if (manifest_opt) |manifest_path| {
         const crate_dir = crate_dir_opt.?;
-        const toml_src = Io.Dir.cwd().readFileAllocOptions(io, manifest, arena, .limited(2 * 1024 * 1024), .of(u8), 0) catch |err| {
-            try stderr.print("error: failed to read Cargo manifest '{s}': {s}\n", .{ manifest, @errorName(err) });
+        const toml_src = Io.Dir.cwd().readFileAllocOptions(io, manifest_path, arena, .limited(2 * 1024 * 1024), .of(u8), 0) catch |err| {
+            try stderr.print("error: failed to read Cargo manifest '{s}': {s}\n", .{ manifest_path, @errorName(err) });
             try stderr.flush();
             return null;
         };
         const crate_ident = parseCargoPackageName(arena, toml_src) orelse {
-            try stderr.print("error: missing [package] name in '{s}'\n", .{manifest});
+            try stderr.print("error: missing [package] name in '{s}'\n", .{manifest_path});
             try stderr.flush();
             return null;
         };
@@ -756,7 +1050,7 @@ pub fn compileRustStaticlib(
         var cargo_res_opt: ?std.process.RunResult = null;
         for (cargo_bins) |cb| {
             if (std.process.run(arena, io, .{
-                .argv = &.{ cb, "build", "--release", "--offline", "--manifest-path", manifest },
+                .argv = &.{ cb, "build", "--release", "--offline", "--manifest-path", manifest_path },
             })) |res| {
                 cargo_res_opt = res;
                 break;
@@ -773,7 +1067,7 @@ pub fn compileRustStaticlib(
             return null;
         };
         if (!cargo_res.term.success()) {
-            try stderr.print("error: cargo offline build failed for '{s}':\n{s}\n", .{ manifest, cargo_res.stderr });
+            try stderr.print("error: cargo offline build failed for '{s}':\n{s}\n", .{ manifest_path, cargo_res.stderr });
             try stderr.flush();
             return null;
         }
@@ -782,7 +1076,7 @@ pub fn compileRustStaticlib(
         const lib_rs_src: ?[]const u8 = Io.Dir.cwd().readFileAllocOptions(io, lib_rs_path, arena, .limited(8 * 1024 * 1024), .of(u8), 0) catch null;
 
         var bridge_buf: Io.Writer.Allocating = .init(arena);
-        try emitRustAdapterInner(tree, checked, lib_rs_src, crate_ident, &bridge_buf.writer);
+        try emitRustAdapterInner(tree, checked, lib_rs_src, crate_ident, null, false, &bridge_buf.writer);
         Io.Dir.cwd().writeFile(io, .{ .sub_path = bridge_path, .data = bridge_buf.written() }) catch |err| {
             try stderr.print("error: failed to write Rust adapter '{s}': {s}\n", .{ bridge_path, @errorName(err) });
             try stderr.flush();
@@ -848,6 +1142,8 @@ pub fn compileRustStaticlib(
                 "staticlib",
                 "-C",
                 "panic=abort",
+                "-C",
+                "target-cpu=native",
                 "-O",
                 "-o",
                 lib_path,
@@ -881,4 +1177,227 @@ pub fn compileRustStaticlib(
     }
 
     return lib_path;
+}
+
+pub const CargoBuildResult = struct {
+    staticlib_path: []const u8,
+    link_flags: []const []const u8,
+};
+
+fn writeCargoTomlQuoted(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '\\' => try writer.writeAll("\\\\"),
+            '"' => try writer.writeAll("\\\""),
+            '\n' => try writer.writeAll("\\n"),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+pub fn parseNativeStaticLibs(alloc: std.mem.Allocator, stderr_text: []const u8) ![]const []const u8 {
+    var flags: std.ArrayList([]const u8) = .empty;
+    var seen_lc = false;
+    var lines = std.mem.splitScalar(u8, stderr_text, '\n');
+    while (lines.next()) |line| {
+        const needle = "native-static-libs:";
+        const idx = std.mem.indexOf(u8, line, needle) orelse continue;
+        const rest = std.mem.trim(u8, line[idx + needle.len ..], " \t\r");
+        var toks = std.mem.tokenizeAny(u8, rest, " \t\r");
+        while (toks.next()) |tok| {
+            if (!std.mem.startsWith(u8, tok, "-l")) continue;
+            if (std.mem.eql(u8, tok, "-lBstatic") or std.mem.eql(u8, tok, "-lBdynamic")) continue;
+            if (std.mem.eql(u8, tok, "-lc")) seen_lc = true;
+            var dup = false;
+            for (flags.items) |prev| {
+                if (std.mem.eql(u8, prev, tok)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) try flags.append(alloc, try alloc.dupe(u8, tok));
+        }
+    }
+    if (!seen_lc) try flags.append(alloc, "-lc");
+    var has_gcc_s = false;
+    for (flags.items) |f| {
+        if (std.mem.eql(u8, f, "-lgcc_s")) {
+            has_gcc_s = true;
+            break;
+        }
+    }
+    if (!has_gcc_s) try flags.append(alloc, "-lgcc_s");
+    return try flags.toOwnedSlice(alloc);
+}
+
+/// Generate a managed Cargo `staticlib` crate inside `<project_root>/.aethel-build/cargo_<pkg>/`
+/// combining `aethel.toml` `[rust-dependencies]`, optional `rust/src/lib.rs`, and generated
+/// C-ABI shims, compile it with `cargo rustc -- --print=native-static-libs`, and return the
+/// `.a` archive path plus discovered native system link flags.
+pub const CargoBuildOptions = struct {
+    use_cross_lto: bool = false,
+    quiet_on_fail: bool = false,
+};
+
+pub fn compileCargoProjectStaticlib(
+    io: Io,
+    arena: std.mem.Allocator,
+    tree: *const ast.Ast,
+    checked: *const sema.CheckedModule,
+    project_root: []const u8,
+    proj_manifest: *const manifest.ProjectManifest,
+    user_bridge_path: ?[]const u8,
+    release_mode: bool,
+    offline: bool,
+    stderr: *Io.Writer,
+) !?CargoBuildResult {
+    return compileCargoProjectStaticlibOpts(
+        io,
+        arena,
+        tree,
+        checked,
+        project_root,
+        proj_manifest,
+        user_bridge_path,
+        release_mode,
+        offline,
+        .{},
+        stderr,
+    );
+}
+
+pub fn compileCargoProjectStaticlibOpts(
+    io: Io,
+    arena: std.mem.Allocator,
+    tree: *const ast.Ast,
+    checked: *const sema.CheckedModule,
+    project_root: []const u8,
+    proj_manifest: *const manifest.ProjectManifest,
+    user_bridge_path: ?[]const u8,
+    release_mode: bool,
+    offline: bool,
+    opts: CargoBuildOptions,
+    stderr: *Io.Writer,
+) !?CargoBuildResult {
+    const norm_pkg = try manifest.normalizeCrateIdentAlloc(arena, proj_manifest.pkg_name);
+    const cargo_dir = try manifest.resolveFromDir(arena, project_root, try std.fmt.allocPrint(arena, ".aethel-build/cargo_{s}", .{norm_pkg}));
+    const cargo_src_dir = try std.fmt.allocPrint(arena, "{s}/src", .{cargo_dir});
+    Io.Dir.cwd().createDirPath(io, cargo_src_dir) catch |err| {
+        try stderr.print("error: failed to create Cargo adapter directory '{s}': {s}\n", .{ cargo_src_dir, @errorName(err) });
+        try stderr.flush();
+        return null;
+    };
+
+    const cargo_toml_path = try std.fmt.allocPrint(arena, "{s}/Cargo.toml", .{cargo_dir});
+    const cargo_lib_rs_path = try std.fmt.allocPrint(arena, "{s}/src/lib.rs", .{cargo_dir});
+    const cargo_config_path = try std.fmt.allocPrint(arena, "{s}/cargo_build.toml", .{cargo_dir});
+
+    var toml_buf: Io.Writer.Allocating = .init(arena);
+    const tw = &toml_buf.writer;
+    try tw.writeAll("[package]\nname = \"aethel_cargo_bridge\"\nversion = \"0.1.0\"\nedition = ");
+    try writeCargoTomlQuoted(tw, proj_manifest.rust_edition);
+    try tw.writeAll("\n\n[workspace]\n\n[lib]\nname = \"aethel_cargo_bridge\"\npath = \"src/lib.rs\"\ncrate-type = [\"staticlib\"]\n\n");
+    try tw.writeAll("[profile.dev]\npanic = \"abort\"\n\n[profile.release]\nopt-level = 3\ncodegen-units = 1\npanic = \"abort\"\n\n[dependencies]\n");
+
+    for (proj_manifest.rust_deps) |rd| {
+        var resolved_dep = rd;
+        if (rd.path) |rp| {
+            const joined = try manifest.resolveFromDir(arena, project_root, rp);
+            const abs = Io.Dir.cwd().realPathFileAlloc(io, joined, arena) catch joined;
+            resolved_dep.path = abs;
+        }
+        try manifest.renderRustDepLine(tw, resolved_dep);
+    }
+
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = cargo_toml_path, .data = toml_buf.written() }) catch |err| {
+        try stderr.print("error: failed to write '{s}': {s}\n", .{ cargo_toml_path, @errorName(err) });
+        try stderr.flush();
+        return null;
+    };
+
+    if (release_mode) {
+        const cfg_data: []const u8 = if (opts.use_cross_lto)
+            "[build]\nrustflags = [\"-C\", \"target-cpu=native\", \"-C\", \"linker-plugin-lto\"]\n"
+        else
+            "[build]\nrustflags = [\"-C\", \"target-cpu=native\"]\n";
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = cargo_config_path, .data = cfg_data }) catch |err| {
+            try stderr.print("error: failed to write '{s}': {s}\n", .{ cargo_config_path, @errorName(err) });
+            try stderr.flush();
+            return null;
+        };
+    }
+
+    var user_rust_src: ?[]const u8 = null;
+    if (user_bridge_path) |bp| {
+        user_rust_src = Io.Dir.cwd().readFileAllocOptions(io, bp, arena, .limited(16 * 1024 * 1024), .of(u8), 0) catch |err| {
+            try stderr.print("error: failed to read Rust bridge '{s}': {s}\n", .{ bp, @errorName(err) });
+            try stderr.flush();
+            return null;
+        };
+    }
+
+    var adapter_buf: Io.Writer.Allocating = .init(arena);
+    try emitCargoProjectAdapterWithOptions(tree, checked, user_rust_src, proj_manifest.pkg_name, opts.use_cross_lto, &adapter_buf.writer);
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = cargo_lib_rs_path, .data = adapter_buf.written() }) catch |err| {
+        try stderr.print("error: failed to write '{s}': {s}\n", .{ cargo_lib_rs_path, @errorName(err) });
+        try stderr.flush();
+        return null;
+    };
+
+    const proj_lock = try manifest.resolveFromDir(arena, project_root, "Cargo.lock");
+    const gen_lock = try std.fmt.allocPrint(arena, "{s}/Cargo.lock", .{cargo_dir});
+    if (Io.Dir.cwd().readFileAllocOptions(io, proj_lock, arena, .limited(16 * 1024 * 1024), .of(u8), 0)) |lock_data| {
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = gen_lock, .data = lock_data }) catch {};
+    } else |_| {}
+
+    const cargo_bins = [_][]const u8{ "cargo", "/sbin/cargo" };
+    var cargo_res_opt: ?std.process.RunResult = null;
+    for (cargo_bins) |cb| {
+        var argv: std.ArrayList([]const u8) = .empty;
+        try argv.appendSlice(arena, &.{ cb, "rustc" });
+        if (release_mode) {
+            try argv.append(arena, "--release");
+            try argv.appendSlice(arena, &.{ "--config", cargo_config_path });
+        }
+        if (offline) try argv.append(arena, "--offline");
+        try argv.appendSlice(arena, &.{ "--manifest-path", cargo_toml_path, "--lib", "--", "--print=native-static-libs" });
+
+        if (std.process.run(arena, io, .{ .argv = argv.items })) |res| {
+            cargo_res_opt = res;
+            break;
+        } else |err| {
+            if (err == error.FileNotFound) continue;
+            try stderr.print("error: failed to invoke '{s}': {s}\n", .{ cb, @errorName(err) });
+            try stderr.flush();
+            return null;
+        }
+    }
+
+    const cargo_res = cargo_res_opt orelse {
+        try stderr.print("error: 'cargo' not found in PATH or /sbin/cargo\n", .{});
+        try stderr.flush();
+        return null;
+    };
+    if (!cargo_res.term.success()) {
+        if (!opts.quiet_on_fail) {
+            try stderr.print("error: cargo build failed for '{s}':\n{s}\n", .{ proj_manifest.pkg_name, cargo_res.stderr });
+            try stderr.flush();
+        }
+        return null;
+    }
+
+    if (Io.Dir.cwd().readFileAllocOptions(io, gen_lock, arena, .limited(16 * 1024 * 1024), .of(u8), 0)) |new_lock| {
+        Io.Dir.cwd().writeFile(io, .{ .sub_path = proj_lock, .data = new_lock }) catch {};
+    } else |_| {}
+
+    const profile_dir = if (release_mode) "release" else "debug";
+    const staticlib_path = try std.fmt.allocPrint(arena, "{s}/target/{s}/libaethel_cargo_bridge.a", .{ cargo_dir, profile_dir });
+    const link_flags = try parseNativeStaticLibs(arena, cargo_res.stderr);
+
+    return .{
+        .staticlib_path = staticlib_path,
+        .link_flags = link_flags,
+    };
 }

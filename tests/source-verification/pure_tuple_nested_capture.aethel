@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let settings = (false, (48, 23));
+  let select = fn(first: bool) {
+    if first { settings.1.0 } else { settings.1.1 }
+  };
+  select(true)
+}

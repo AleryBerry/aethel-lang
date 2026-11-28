@@ -39,14 +39,19 @@ def CoBorrowGraph.ofEffects (fieldCount : Nat) (pairs : List (Effect × Effect))
       if i != j && pairs.any (fun (e1, e2) => effectFieldConflicts e1 e2 i j) then some (i, j) else none
   ⟨fieldCount, edges⟩
 
-def synthesizePolicy (g : CoBorrowGraph) (i : Nat) : StoragePolicy :=
-  if g.hasAnyConflict i then .addressable else .mayShareByte
+def synthesizePolicy (g : CoBorrowGraph) (i : Nat) (s : Schema)
+    (forceAddressable : Bool := false) : StoragePolicy :=
+  if forceAddressable || g.hasAnyConflict i || !s.defaultPackable then .addressable
+  else .mayShareByte
 
-def applyPolicies (g : CoBorrowGraph) (fields : List Schema) : Schema :=
-  .record (fields.zipIdx.map fun (s, idx) => (synthesizePolicy g idx, s))
+def applyPolicies (g : CoBorrowGraph) (fields : List Schema)
+    (addressable : List Nat := []) : Schema :=
+  .record (fields.zipIdx.map fun (s, idx) =>
+    (synthesizePolicy g idx s (addressable.contains idx), s))
 
-def autoPlan (abi : TargetIntegerABI) (g : CoBorrowGraph) (fields : List Schema) : Option Layout :=
-  AutomaticLayout.plan abi (applyPolicies g fields)
+def autoPlan (abi : TargetIntegerABI) (g : CoBorrowGraph) (fields : List Schema)
+    (addressable : List Nat := []) : Option Layout :=
+  AutomaticLayout.plan abi (applyPolicies g fields addressable)
 
 def ByteSpanDisjoint (a b : Field) : Prop :=
   a.bytes = 0 ∨ b.bytes = 0 ∨
@@ -63,8 +68,9 @@ theorem CoBorrowGraph.interferes_symm {g : CoBorrowGraph} {i j : Nat}
   exact ⟨hj, hi, hne.symm, hor.symm⟩
 
 theorem synthesizePolicy_conflict_addressable {g : CoBorrowGraph} {i j : Nat}
+    {si sj : Schema} {fa fb : Bool}
     (h : g.interferes i j = true) :
-    synthesizePolicy g i = .addressable ∧ synthesizePolicy g j = .addressable := by
+    synthesizePolicy g i si fa = .addressable ∧ synthesizePolicy g j sj fb = .addressable := by
   have hInfo := h
   simp only [CoBorrowGraph.interferes, decide_eq_true_eq] at hInfo
   obtain ⟨hi, hj, _, _⟩ := hInfo
@@ -76,16 +82,26 @@ theorem synthesizePolicy_conflict_addressable {g : CoBorrowGraph} {i j : Nat}
     exact ⟨i, hi, CoBorrowGraph.interferes_symm h⟩
   simp [synthesizePolicy, hiAny, hjAny]
 
+theorem synthesizePolicy_byteAligned_addressable {g : CoBorrowGraph} {i : Nat} {s : Schema}
+    {fa : Bool} (hNoPack : s.defaultPackable = false) :
+    synthesizePolicy g i s fa = .addressable := by
+  simp [synthesizePolicy, hNoPack]
+
+theorem synthesizePolicy_forced_addressable (g : CoBorrowGraph) (i : Nat) (s : Schema) :
+    synthesizePolicy g i s true = .addressable := by
+  simp [synthesizePolicy]
+
 theorem autoPlan_conforms {abi : TargetIntegerABI} {g : CoBorrowGraph}
-    {fields : List Schema} {layout : Layout}
-    (hPlan : autoPlan abi g fields = some layout) :
-    Conforms abi (applyPolicies g fields) layout :=
+    {fields : List Schema} {addressable : List Nat} {layout : Layout}
+    (hPlan : autoPlan abi g fields addressable = some layout) :
+    Conforms abi (applyPolicies g fields addressable) layout :=
   AutomaticLayout.plan_sound hPlan
 
 private theorem applyPolicies_field_policy {g : CoBorrowGraph} {fields : List Schema}
-    {i : Nat} {policy : StoragePolicy} {child : Schema}
-    (hAt : (fields.zipIdx.map fun (s, idx) => (synthesizePolicy g idx, s))[i]? = some (policy, child)) :
-    policy = synthesizePolicy g i := by
+    {addressable : List Nat} {i : Nat} {policy : StoragePolicy} {child : Schema}
+    (hAt : (fields.zipIdx.map fun (s, idx) =>
+      (synthesizePolicy g idx s (addressable.contains idx), s))[i]? = some (policy, child)) :
+    policy = synthesizePolicy g i child (addressable.contains i) := by
   rw [List.getElem?_map] at hAt
   cases hZip : fields.zipIdx[i]? with
   | none => simp [hZip] at hAt
@@ -96,7 +112,8 @@ private theorem applyPolicies_field_policy {g : CoBorrowGraph} {fields : List Sc
     have hIdx : i = entry.2 := by
       have := congrArg Prod.snd atZip
       simpa using this
-    rw [hIdx]
+    have hChild : child = entry.1 := (Prod.mk.inj hAt).2.symm
+    rw [hIdx, hChild]
     exact (Prod.mk.inj hAt).1.symm
 
 private theorem field_valid_addressable_no_bit {total align : Nat} {f : Field}
@@ -113,7 +130,7 @@ private theorem separate_no_bit_disjoint {a b : Field}
     (ha : a.1.bitOffset = none) (hb : b.1.bitOffset = none) :
     ByteSpanDisjoint a b := by
   unfold Field.Separate at hSep
-  rcases hSep with h0 | h0 | h1 | h2 | ⟨_, hBits⟩
+  rcases hSep with h0 | h0 | h1 | h2 | hBits
   · exact Or.inl h0
   · exact Or.inr (Or.inl h0)
   · exact Or.inr (Or.inr (Or.inl h1))
@@ -121,15 +138,15 @@ private theorem separate_no_bit_disjoint {a b : Field}
   · rw [ha, hb] at hBits
     contradiction
 
-theorem autoPlan_conflict_free {abi : TargetIntegerABI} {g : CoBorrowGraph}
-    {fields : List Schema} {size alignment : Nat} {placed : List Field}
-    (hPlan : autoPlan abi g fields = some (.record size alignment placed)) :
+theorem conforms_conflict_free {abi : TargetIntegerABI} {g : CoBorrowGraph}
+    {fields : List Schema} {addressable : List Nat} {size alignment : Nat} {placed : List Field}
+    (hConf : Conforms abi (applyPolicies g fields addressable) (.record size alignment placed)) :
     PackingConflictFree g placed := by
-  have hConf := autoPlan_conforms hPlan
   intro i j hi hj hNe hInt
-  obtain ⟨hPolI, hPolJ⟩ := synthesizePolicy_conflict_addressable hInt
-  obtain ⟨policyI, _, hSrcI, hValidI, _⟩ := hConf.field (List.getElem?_eq_getElem hi)
-  obtain ⟨policyJ, _, hSrcJ, hValidJ, _⟩ := hConf.field (List.getElem?_eq_getElem hj)
+  obtain ⟨policyI, childI, hSrcI, hValidI, _⟩ := hConf.field (List.getElem?_eq_getElem hi)
+  obtain ⟨policyJ, childJ, hSrcJ, hValidJ, _⟩ := hConf.field (List.getElem?_eq_getElem hj)
+  obtain ⟨hPolI, hPolJ⟩ := synthesizePolicy_conflict_addressable
+    (si := childI) (sj := childJ) (fa := addressable.contains i) (fb := addressable.contains j) hInt
   have hPi : policyI = .addressable := (applyPolicies_field_policy hSrcI).trans hPolI
   have hPj : policyJ = .addressable := (applyPolicies_field_policy hSrcJ).trans hPolJ
   have hBitI := field_valid_addressable_no_bit (hPi ▸ hValidI)
@@ -142,6 +159,12 @@ theorem autoPlan_conflict_free {abi : TargetIntegerABI} {g : CoBorrowGraph}
     · exact List.pairwise_iff_getElem.mp hPair i j hi hj hLt
     · exact (List.pairwise_iff_getElem.mp hPair j i hj hi hGt).symm
   exact separate_no_bit_disjoint hSep hBitI hBitJ
+
+theorem autoPlan_conflict_free {abi : TargetIntegerABI} {g : CoBorrowGraph}
+    {fields : List Schema} {addressable : List Nat} {size alignment : Nat} {placed : List Field}
+    (hPlan : autoPlan abi g fields addressable = some (.record size alignment placed)) :
+    PackingConflictFree g placed :=
+  conforms_conflict_free (autoPlan_conforms hPlan)
 
 theorem byteSpanDisjoint_implies_no_shared_byte {a b : Field}
     (hDisj : ByteSpanDisjoint a b) :

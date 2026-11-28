@@ -1,0 +1,4 @@
+law original_value_preserved(row: Pair) {
+  when row.left > 100
+  always limit(row) == row.left
+}

@@ -1,0 +1,11 @@
+type Meter { count: u8, signal: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { count: 255, signal: 12, };
+  view shared signal = meter.signal {
+    while meter.count > 0 decreases meter.count {
+      meter.count = meter.count -| 64;
+    };
+    if signal == 12 { let _ = meter.count; } else { meter.count = 1; };
+  };
+  meter.count
+}

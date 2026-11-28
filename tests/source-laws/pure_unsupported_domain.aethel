@@ -1,0 +1,3 @@
+law callbacks(value: fn(bool) -> bool) {
+  always admit_callback(value)
+}

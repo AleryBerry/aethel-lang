@@ -1,0 +1,3 @@
+law capped_output(row: Pair) {
+  always limit(row) <= 100
+}

@@ -1,0 +1,6 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 0, };
+  if pair.left != pair.left { pair.absent = 10; } else { pair.right = 61; };
+  pair.right
+}

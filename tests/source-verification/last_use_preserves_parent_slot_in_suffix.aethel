@@ -1,0 +1,13 @@
+type Row { input: u8, sibling: u8, output: u8, copied: u8, }
+fn main() -> u8 {
+  let mut row = Row { input: 41, sibling: 98, output: 0, copied: 0, };
+  view shared parent = row.sibling {
+    view exclusive sample = row.input {
+      row.copied = sample;
+      row.input = 9;
+      row.output = parent;
+    };
+  };
+  if row.copied != 41 { row.output = 0; } else { };
+  row.output
+}

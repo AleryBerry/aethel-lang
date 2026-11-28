@@ -1,0 +1,11 @@
+type Pair { left: u8, right: u8, }
+fn inspect(pair: Pair ~>.{left}) -> View(u8, Shared) { pair.left }
+fn overwrite(pair: Pair ~>.{left}) { pair.left = 4; }
+fn main() -> u8 {
+  let mut pair = Pair { left: 62, right: 0, };
+  let held = inspect(pair);
+  pair.right = held;
+  overwrite(pair);
+  if pair.right == 62 { pair.right = held; } else { };
+  pair.right
+}

@@ -1,0 +1,4 @@
+fn main() -> u8 {
+  let number = 63;
+  number.0
+}

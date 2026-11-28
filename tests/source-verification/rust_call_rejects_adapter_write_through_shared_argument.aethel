@@ -1,0 +1,9 @@
+@external(rust, "batch", "inspect")
+pub fn inspect(input: [u8]) -> ()
+
+type One { value: u8, }
+fn main() -> u8 {
+  let mut row = One { value: 35, };
+  inspect(row.value);
+  row.value
+}

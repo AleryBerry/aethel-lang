@@ -1,0 +1,15 @@
+type Pair { left: u8, right: u8, }
+fn fetch(pair: Pair ~>.{left}) -> View(u8, Shared) {
+  pair.left
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 42, right: 11, };
+  if pair.left == 42 {
+    let held = fetch(pair);
+    let _ = held;
+  } else {
+    pair.right = 9;
+  };
+  pair.right = held;
+  pair.right
+}

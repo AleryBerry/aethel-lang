@@ -15,7 +15,7 @@ fn strike(u: Unit ~>.{hp}, raw_dmg: u32) {
 }
 
 fn main() {
-  let mut unit = Unit { id: 7u32, hp: 50u32, armor: 10u32 }
-  strike(unit, 18u32)
+  let mut unit = Unit { id: 7, hp: 50, armor: 10 }
+  strike(unit, 18)
   println("Unit hp=", unit.hp, " armor=", unit.armor, " id=", unit.id)
 }

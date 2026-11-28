@@ -1,0 +1,15 @@
+@layout(flat)
+type Flat { first: u8, word: u32, }
+type Tagged { Empty, Full(Flat), Small(u8), }
+type Row { flag: u1, tagged: Tagged, wide: u33, }
+
+fn main() -> u32 {
+  let mut row = Row {
+    flag: 1,
+    tagged: Full(Flat { first: 5, word: 305419896, }),
+    wide: 8589934591,
+  };
+  row.tagged = Small(42);
+  row.tagged = Full(Flat { first: 7, word: 2864434397, });
+  row.tagged as Full[0].word
+}

@@ -1,0 +1,5 @@
+fn again(flag: bool) -> u8 {
+  if flag { 44 } else { again(true) }
+}
+
+fn main() -> u8 { again(false) }

@@ -1,0 +1,6 @@
+type Thermostat { target: u8, ambient: u8, }
+fn main() -> u8 {
+  let mut settings = Thermostat { target: 56, ambient: 43, };
+  settings.target = 34;
+  settings.target
+}

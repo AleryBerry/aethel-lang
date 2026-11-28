@@ -1,0 +1,6 @@
+type Sample { level: u8, }
+fn main() -> u8 {
+  let mut sample = Sample { level: 45, };
+  fork {} join;
+  sample.level
+}

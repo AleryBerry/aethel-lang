@@ -1,0 +1,4 @@
+law stage_under_guard(triple: Triple) {
+  when triple.first == 73
+  always stage(triple) == 83
+}

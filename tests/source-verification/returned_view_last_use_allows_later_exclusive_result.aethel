@@ -1,0 +1,14 @@
+type Pair { left: u8, right: u8, }
+fn inspect(pair: Pair ~>.{left}) -> View(u8, Shared) { pair.left }
+fn replace(pair: Pair ~>.{left}) -> View(u8, Exclusive) {
+  pair.left = 93;
+  pair.left
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 52, right: 0, };
+  let shared = inspect(pair);
+  pair.right = shared;
+  let unique = replace(pair);
+  if unique != 93 { pair.right = 0; } else { };
+  pair.right
+}

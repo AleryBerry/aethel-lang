@@ -1,0 +1,18 @@
+@layout(soa)
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut rows: Collection(Pair) = [
+    Pair { left: 17, right: 0, },
+    Pair { left: 29, right: 51, },
+  ];
+  let index = rows[0].right;
+  if index < 2 {
+    view exclusive lhs = rows[index].left {
+      view exclusive rhs = rows[index].right {
+        lhs = 88;
+        rhs = lhs;
+      };
+    };
+  } else { };
+  rows[0].right
+}

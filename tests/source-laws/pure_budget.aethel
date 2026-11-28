@@ -1,0 +1,3 @@
+law too_many_triples(value: (u8, (u8, u8))) {
+  always admit_triple(value)
+}

@@ -1,0 +1,10 @@
+type Pair { input: u8, output: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { input: 61, output: 0, };
+  view exclusive sample = pair.input {
+    view shared borrowed = sample { pair.output = borrowed; };
+    pair.input = 0;
+  };
+  if pair.input != 0 { pair.output = 0; } else { };
+  pair.output
+}

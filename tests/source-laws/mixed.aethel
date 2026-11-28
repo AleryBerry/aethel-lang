@@ -1,0 +1,11 @@
+law no_seven(row: Pair) {
+  never limit(row) == 7
+}
+
+law unrelated_output(row: Pair) {
+  always absent(row) == 100
+}
+
+law capped_output(row: Pair) {
+  always limit(row) <= 100
+}

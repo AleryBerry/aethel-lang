@@ -1,0 +1,13 @@
+type Meter { remaining: u8, pulses: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { remaining: 5, pulses: 31, };
+  while meter.remaining > 0 decreases meter.remaining {
+    meter.remaining = meter.remaining -| 2;
+    if meter.remaining <= 255 {
+      meter.pulses = meter.pulses -| 1;
+    } else {
+      meter.remaining = 255;
+    };
+  };
+  meter.pulses
+}

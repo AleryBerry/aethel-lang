@@ -1,0 +1,13 @@
+type Child { leading: u8, word: u32, trailing: u8, }
+@layout(flat)
+type Row { head: u8, child: Child, tail: u8, }
+
+fn main() -> u8 {
+  let mut row = Row {
+    head: 1,
+    child: Child { leading: 2, word: 4294967295, trailing: 3, },
+    tail: 4,
+  };
+  row.child.leading = 23;
+  row.child.leading
+}

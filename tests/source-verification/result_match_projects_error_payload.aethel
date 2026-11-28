@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let failure = Err((false, 85)): Result(u8, (bool, u8));
+  case failure {
+    Ok(value) -> value
+    Err(detail) -> if detail.0 { 1 } else { detail.1 }
+  }
+}

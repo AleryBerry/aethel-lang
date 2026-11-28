@@ -1,0 +1,2 @@
+use law Laws.CharacterLaws.x_and_y_same
+type Character { x: u8, y: u8, }

@@ -76,7 +76,7 @@ theorem SourceMIR.byteLayout_minimal (mir : SourceMIR) (abi : TargetIntegerABI)
     (conforms : Conforms abi mir.byteSchema candidate) :
     (mir.byteLayout abi).size ≤ candidate.size := by
   cases candidate with
-  | integer _ _ => cases conforms
+  | integer _ _ | fixed _ _ => cases conforms
   | record size alignment fields =>
     let offsets := fields.map fun field => field.1.byteOffset
     have geometry := fun {field} member => field_geometry conforms byteSize (field := field) member

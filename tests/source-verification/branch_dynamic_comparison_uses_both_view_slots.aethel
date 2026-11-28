@@ -1,0 +1,11 @@
+type Pair { left: u8, right: u8, out: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 31, right: 18, out: 0, };
+  view shared lesser = pair.left {
+    view exclusive greater = pair.right {
+      greater = 52;
+      if lesser < greater { pair.out = 61; } else { pair.out = 22; };
+    };
+  };
+  pair.out
+}

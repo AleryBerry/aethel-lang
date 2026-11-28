@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const ExprTypes = std.AutoHashMapUnmanaged(*const ast.Expr, *const @import("sema.zig").Ty);
 const ast = @import("ast.zig");
 const int_range = @import("int_range.zig");
 const lexer = @import("lexer.zig");
@@ -23,18 +24,6 @@ pub const LawExpr = union(enum) {
         c: u64,
         e: *const LawExpr,
     };
-
-    pub fn eval(self: *const LawExpr, env: []const u64) u64 {
-        return switch (self.*) {
-            .var_id => |id| if (id < env.len) env[id] else 0,
-            .const_val => |n| n,
-            .add => |p| p.a.eval(env) +| p.b.eval(env),
-            .sub => |p| p.a.eval(env) -| p.b.eval(env),
-            .mul_const => |mc| mc.c *| mc.e.eval(env),
-            .min => |p| @min(p.a.eval(env), p.b.eval(env)),
-            .max => |p| @max(p.a.eval(env), p.b.eval(env)),
-        };
-    }
 
     pub fn eql(self: *const LawExpr, other: *const LawExpr) bool {
         if (@intFromEnum(self.*) != @intFromEnum(other.*)) return false;
@@ -73,20 +62,6 @@ pub const LawProp = union(enum) {
         q: *const LawProp,
     };
 
-    pub fn evalBool(self: *const LawProp, env: []const u64) bool {
-        return switch (self.*) {
-            .tt => true,
-            .ff => false,
-            .eq => |ep| ep.a.eval(env) == ep.b.eval(env),
-            .ne => |ep| ep.a.eval(env) != ep.b.eval(env),
-            .le => |ep| ep.a.eval(env) <= ep.b.eval(env),
-            .lt => |ep| ep.a.eval(env) < ep.b.eval(env),
-            .not => |inner| !inner.evalBool(env),
-            .and_op => |pp| pp.p.evalBool(env) and pp.q.evalBool(env),
-            .or_op => |pp| pp.p.evalBool(env) or pp.q.evalBool(env),
-            .imp => |pp| !pp.p.evalBool(env) or pp.q.evalBool(env),
-        };
-    }
 };
 
 pub const SymbolicLawKind = enum {
@@ -222,7 +197,7 @@ const LinearForm = struct {
     }
 };
 
-fn insertTerm(alloc: std.mem.Allocator, v: u16, c: u64, xs: []const Term) std.mem.Allocator.Error![]const Term {
+fn insertTerm(alloc: std.mem.Allocator, v: u16, c: u64, xs: []const Term) (std.mem.Allocator.Error || error{Overflow})![]const Term {
     if (c == 0) return xs;
     var out: std.ArrayList(Term) = .empty;
     var inserted = false;
@@ -232,7 +207,7 @@ fn insertTerm(alloc: std.mem.Allocator, v: u16, c: u64, xs: []const Term) std.me
             inserted = true;
             try out.append(alloc, t);
         } else if (!inserted and v == t.v) {
-            try out.append(alloc, .{ .v = v, .c = c +| t.c });
+            try out.append(alloc, .{ .v = v, .c = try std.math.add(u64, c, t.c) });
             inserted = true;
         } else {
             try out.append(alloc, t);
@@ -244,7 +219,7 @@ fn insertTerm(alloc: std.mem.Allocator, v: u16, c: u64, xs: []const Term) std.me
     return try out.toOwnedSlice(alloc);
 }
 
-fn mergeTerms(alloc: std.mem.Allocator, xs: []const Term, ys: []const Term) std.mem.Allocator.Error![]const Term {
+fn mergeTerms(alloc: std.mem.Allocator, xs: []const Term, ys: []const Term) (std.mem.Allocator.Error || error{Overflow})![]const Term {
     var acc = ys;
     for (xs) |t| {
         acc = try insertTerm(alloc, t.v, t.c, acc);
@@ -252,11 +227,11 @@ fn mergeTerms(alloc: std.mem.Allocator, xs: []const Term, ys: []const Term) std.
     return acc;
 }
 
-fn scaleTerms(alloc: std.mem.Allocator, c: u64, xs: []const Term) std.mem.Allocator.Error![]const Term {
+fn scaleTerms(alloc: std.mem.Allocator, c: u64, xs: []const Term) (std.mem.Allocator.Error || error{Overflow})![]const Term {
     if (c == 0 or xs.len == 0) return &.{};
     var out = try alloc.alloc(Term, xs.len);
     for (xs, 0..) |t, i| {
-        out[i] = .{ .v = t.v, .c = c *| t.c };
+        out[i] = .{ .v = t.v, .c = try std.math.mul(u64, c, t.c) };
     }
     return out;
 }
@@ -273,7 +248,7 @@ fn toLinear(alloc: std.mem.Allocator, e: *const LawExpr) ?LinearForm {
             const la = toLinear(alloc, p.a) orelse return null;
             const lb = toLinear(alloc, p.b) orelse return null;
             return .{
-                .constant = la.constant +| lb.constant,
+                .constant = std.math.add(u64, la.constant, lb.constant) catch return null,
                 .terms = mergeTerms(alloc, la.terms, lb.terms) catch return null,
             };
         },
@@ -281,7 +256,7 @@ fn toLinear(alloc: std.mem.Allocator, e: *const LawExpr) ?LinearForm {
             if (mc.c == 0) return .{ .constant = 0, .terms = &.{} };
             const le = toLinear(alloc, mc.e) orelse return null;
             return .{
-                .constant = mc.c *| le.constant,
+                .constant = std.math.mul(u64, mc.c, le.constant) catch return null,
                 .terms = scaleTerms(alloc, mc.c, le.terms) catch return null,
             };
         },
@@ -347,7 +322,7 @@ pub fn normalizeLawExpr(alloc: std.mem.Allocator, e: *const LawExpr) *const LawE
             if (na.* == .const_val and na.const_val == 0) return nb;
             if (nb.* == .const_val and nb.const_val == 0) return na;
             if (na.* == .const_val and nb.* == .const_val) {
-                return mkLawExpr(alloc, .{ .const_val = na.const_val +| nb.const_val });
+                return mkLawExpr(alloc, .{ .const_val = std.math.add(u64, na.const_val, nb.const_val) catch return e });
             }
             return mkLawExpr(alloc, .{ .add = .{ .a = na, .b = nb } });
         },
@@ -366,7 +341,7 @@ pub fn normalizeLawExpr(alloc: std.mem.Allocator, e: *const LawExpr) *const LawE
             const ne = normalizeLawExpr(alloc, mc.e);
             if (mc.c == 0) return mkLawExpr(alloc, .{ .const_val = 0 });
             if (mc.c == 1) return ne;
-            if (ne.* == .const_val) return mkLawExpr(alloc, .{ .const_val = mc.c *| ne.const_val });
+            if (ne.* == .const_val) return mkLawExpr(alloc, .{ .const_val = std.math.mul(u64, mc.c, ne.const_val) catch return e });
             return mkLawExpr(alloc, .{ .mul_const = .{ .c = mc.c, .e = ne } });
         },
         .min => |p| {
@@ -638,7 +613,7 @@ pub const LawParamDomain = struct {
             adt_name: []const u8,
             variant_count: usize,
         },
-        option_ty,
+        option_ty: *const LawParamDomain,
         fn_scalar_ty,
         fn_opt_ty,
         other,
@@ -683,6 +658,8 @@ pub const SymCtx = struct {
     vars: std.ArrayList(VarSlot) = .empty,
     subst: std.StringHashMapUnmanaged(*const LawExpr) = .empty,
     inline_depth: u8 = 0,
+    expr_types: ?*const ExprTypes = null,
+    termination: bool = false,
 
     pub fn bindVar(self: *SymCtx, key: []const u8, non_negative: bool) ?u16 {
         for (self.vars.items) |v| {
@@ -698,6 +675,7 @@ pub const SymCtx = struct {
 
     pub fn lookupOrReject(self: *SymCtx, key: []const u8) ?*const LawExpr {
         if (self.subst.get(key)) |bound| return bound;
+        if (self.inline_depth != 0) return null;
         for (self.vars.items) |v| {
             if (std.mem.eql(u8, v.key, key)) {
                 return if (v.non_negative) mkLawExpr(self.alloc, .{ .var_id = v.id }) else null;
@@ -729,11 +707,14 @@ pub fn astToLawExpr(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawExpr {
             const key = keyForPathExpr(ctx.alloc, ctx.source, expr) orelse return null;
             return ctx.lookupOrReject(key);
         },
-        .cast => |c| return astToLawExpr(ctx, c.expr),
+        .cast => return null,
         .block => |blk| {
             var saved = std.ArrayList(struct { k: []const u8, prev: ?*const LawExpr }).empty;
             defer {
-                for (saved.items) |item| {
+                var i = saved.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const item = saved.items[i];
                     if (item.prev) |p| {
                         ctx.subst.put(ctx.alloc, item.k, p) catch {};
                     } else {
@@ -796,9 +777,18 @@ pub fn astToLawExpr(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawExpr {
             return null;
         },
         .binary => |b| {
-            // IMPORTANT: Wrapping operators (+%, -%, *%) MUST NOT lower to Nat math!
+            // Plain subtraction may produce a negative result. Saturating
+            // subtraction agrees with Nat subtraction only for an unsigned result.
+            if (b.op == .sub or b.op == .sub_sat) {
+                if (!ctx.termination) {
+                    const types = ctx.expr_types orelse return null;
+                    const ty = types.get(expr) orelse return null;
+                    const it = ty.isInteger() orelse return null;
+                    if (it.signed) return null;
+                }
+            }
             switch (b.op) {
-                .add, .add_sat => {
+                .add => {
                     const a = astToLawExpr(ctx, b.left) orelse return null;
                     const bv = astToLawExpr(ctx, b.right) orelse return null;
                     return mkLawExpr(ctx.alloc, .{ .add = .{ .a = a, .b = bv } });
@@ -808,7 +798,7 @@ pub fn astToLawExpr(ctx: *SymCtx, expr: *const ast.Expr) ?*const LawExpr {
                     const bv = astToLawExpr(ctx, b.right) orelse return null;
                     return mkLawExpr(ctx.alloc, .{ .sub = .{ .a = a, .b = bv } });
                 },
-                .mul, .mul_sat => {
+                .mul => {
                     const a = astToLawExpr(ctx, b.left) orelse return null;
                     const bv = astToLawExpr(ctx, b.right) orelse return null;
                     if (a.* == .const_val) return mkLawExpr(ctx.alloc, .{ .mul_const = .{ .c = a.const_val, .e = bv } });
@@ -956,7 +946,7 @@ pub const ConcreteVal = union(enum) {
     unit_val,
 };
 
-fn concreteValEql(a: ConcreteVal, b: ConcreteVal) bool {
+fn concreteValEql(a: ConcreteVal, b: ConcreteVal) ?bool {
     if (@intFromEnum(a) != @intFromEnum(b)) return false;
     return switch (a) {
         .int_val => |iv| iv.val == b.int_val.val,
@@ -973,26 +963,27 @@ fn concreteValEql(a: ConcreteVal, b: ConcreteVal) bool {
             const rb = b.record_val;
             if (ra.len != rb.len) break :blk false;
             for (ra, rb) |fa, fb| {
-                if (!std.mem.eql(u8, fa.name, fb.name) or !concreteValEql(fa.val, fb.val)) break :blk false;
+                if (!std.mem.eql(u8, fa.name, fb.name) or !(concreteValEql(fa.val, fb.val) orelse return null)) break :blk false;
             }
             break :blk true;
         },
-        else => false,
+        else => null,
     };
 }
 
 fn evalBuiltinFnVal(tag: u8, arg: ConcreteVal, alloc: std.mem.Allocator) ?ConcreteVal {
     if (arg != .int_val) return null;
     const x = arg.int_val.val;
-    const it = arg.int_val.int_ty;
+    if (x < 0 or x > 255) return null;
+    const it: int_range.IntType = .{ .bits = 8, .signed = false };
     return switch (tag) {
         0 => arg, // id
-        1 => .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x + 1, t) else x + 1, .int_ty = it } }, // + 1
-        2 => .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x * 2 + 1, t) else x * 2 + 1, .int_ty = it } }, // *2 + 1
+        1 => .{ .int_val = .{ .val = @mod(x + 1, 256), .int_ty = it } }, // + 1
+        2 => .{ .int_val = .{ .val = @mod(x * 2 + 1, 256), .int_ty = it } }, // *2 + 1
         3 => .{ .int_val = .{ .val = 7, .int_ty = it } }, // const 7
         10 => blk: { // some(x + 1)
             const p = alloc.create(ConcreteVal) catch return null;
-            p.* = .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x + 1, t) else x + 1, .int_ty = it } };
+            p.* = .{ .int_val = .{ .val = @mod(x + 1, 256), .int_ty = it } };
             break :blk .{ .option_val = p };
         },
         11 => blk: { // none if x == 0 else some(x - 1)
@@ -1003,7 +994,7 @@ fn evalBuiltinFnVal(tag: u8, arg: ConcreteVal, alloc: std.mem.Allocator) ?Concre
         },
         12 => blk: { // some(x * 2)
             const p = alloc.create(ConcreteVal) catch return null;
-            p.* = .{ .int_val = .{ .val = if (it) |t| wrapIntValue(x * 2, t) else x * 2, .int_ty = it } };
+            p.* = .{ .int_val = .{ .val = @mod(x * 2, 256), .int_ty = it } };
             break :blk .{ .option_val = p };
         },
         else => null,
@@ -1018,6 +1009,7 @@ pub const ConcreteEnv = struct {
     resolved_calls: ?*const std.AutoHashMapUnmanaged(*const ast.Expr, []const u8) = null,
     bindings: std.StringHashMapUnmanaged(ConcreteVal) = .empty,
     call_depth: u8 = 0,
+    expr_types: ?*const ExprTypes = null,
 };
 
 fn resolveLawCalleeName(
@@ -1032,28 +1024,15 @@ fn resolveLawCalleeName(
     return null;
 }
 
-fn wrapIntValue(v: i128, it: int_range.IntType) i128 {
-    if (it.bits >= 127) return v;
-    const modulus: i128 = @as(i128, 1) << @intCast(it.bits);
-    if (!it.signed) {
-        var r = @mod(v, modulus);
-        if (r < 0) r += modulus;
-        return r;
-    }
-    const half: i128 = @as(i128, 1) << @intCast(it.bits - 1);
-    var r = @mod(v + half, modulus);
-    if (r < 0) r += modulus;
-    return r - half;
-}
-
-fn clampIntValue(v: i128, it: int_range.IntType) i128 {
-    if (it.bits >= 127) return v;
-    if (!it.signed) {
-        const hi: i128 = (@as(i128, 1) << @intCast(it.bits)) - 1;
-        return std.math.clamp(v, 0, hi);
-    }
-    const half: i128 = @as(i128, 1) << @intCast(it.bits - 1);
-    return std.math.clamp(v, -half, half - 1);
+// Compute the mathematical result before applying the selected machine width.
+// Products of two i128 operands fit i256.
+fn machineResult(value: i256, it: int_range.IntType, saturating: bool) ?i128 {
+    if (it.bits == 0 or it.bits > 128) return null;
+    const modulus = @as(i256, 1) << @intCast(it.bits);
+    const lo = if (it.signed) -@divExact(modulus, 2) else 0;
+    const hi = lo + modulus - 1;
+    const result = if (saturating) std.math.clamp(value, lo, hi) else @mod(value - lo, modulus) + lo;
+    return std.math.cast(i128, result);
 }
 
 fn intTypeFromAstType(source: [:0]const u8, te: ?*const ast.TypeExpr) ?int_range.IntType {
@@ -1167,7 +1146,7 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
         .int_lit => |sp| {
             const parsed = int_range.parseIntLiteral(sp.slice(env.source)) orelse return null;
             if (parsed.value > std.math.maxInt(i128)) return null;
-            return .{ .int_val = .{ .val = @intCast(parsed.value), .int_ty = parsed.suffix } };
+            return .{ .int_val = .{ .val = @intCast(parsed.value), .int_ty = null } };
         },
         .bool_lit => |bl| return .{ .bool_val = bl.value },
         .ident => |sp| return env.bindings.get(sp.slice(env.source)),
@@ -1186,7 +1165,7 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
             if (ce.subjects.len != 1) return null;
             const subj = evalConcreteExpr(env, ce.subjects[0]) orelse return null;
             for (ce.arms) |arm| {
-                if (arm.alternatives.len == 0 or arm.alternatives[0].len != 1) continue;
+                if (arm.guard != null or arm.alternatives.len != 1 or arm.alternatives[0].len != 1) return null;
                 const pat = arm.alternatives[0][0];
                 const saved = env.bindings;
                 env.bindings = saved.clone(env.alloc) catch return null;
@@ -1199,8 +1178,16 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
                         matched = true;
                     },
                     .constructor => |ctor| {
-                        if (ctor.path.len > 0) {
+                        if (ctor.path.len != 1 or subj != .option_val) return null;
+                        {
                             const cname = ctor.path[ctor.path.len - 1].slice(env.source);
+                            if (std.mem.eql(u8, cname, "Some")) {
+                                if (ctor.args.len != 1) return null;
+                                switch (ctor.args[0].pattern.*) {
+                                    .ident, .wildcard => {},
+                                    else => return null,
+                                }
+                            } else if (!std.mem.eql(u8, cname, "None") or ctor.args.len != 0) return null;
                             if (std.mem.eql(u8, cname, "None") and subj == .option_val and subj.option_val == null) {
                                 matched = true;
                             } else if (std.mem.eql(u8, cname, "Some") and subj == .option_val and subj.option_val != null) {
@@ -1211,7 +1198,7 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
                             }
                         }
                     },
-                    else => {},
+                    else => return null,
                 }
                 if (matched) return evalConcreteExpr(env, arm.body);
             }
@@ -1219,11 +1206,9 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
         },
         .cast => |c| {
             const inner = evalConcreteExpr(env, c.expr) orelse return null;
-            const dst_it = intTypeFromAstType(env.source, c.ty) orelse return inner;
-            if (inner == .int_val) {
-                return .{ .int_val = .{ .val = wrapIntValue(inner.int_val.val, dst_it), .int_ty = dst_it } };
-            }
-            return inner;
+            const dst_it = intTypeFromAstType(env.source, c.ty) orelse return null;
+            if (inner != .int_val or !int_range.fitsI128(inner.int_val.val, dst_it)) return null;
+            return .{ .int_val = .{ .val = inner.int_val.val, .int_ty = dst_it } };
         },
         .field => |fld| {
             const base = evalConcreteExpr(env, fld.target) orelse return null;
@@ -1250,9 +1235,9 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
             const opv = evalConcreteExpr(env, u.operand) orelse return null;
             return switch (u.op) {
                 .not => if (opv == .bool_val) .{ .bool_val = !opv.bool_val } else null,
-                .neg => if (opv == .int_val) .{ .int_val = .{ .val = -opv.int_val.val, .int_ty = opv.int_val.int_ty } } else null,
+                .neg => if (opv == .int_val) .{ .int_val = .{ .val = std.math.negate(opv.int_val.val) catch return null, .int_ty = opv.int_val.int_ty } } else null,
                 .bit_not => if (opv == .int_val) .{ .int_val = .{
-                    .val = if (opv.int_val.int_ty) |it| wrapIntValue(~opv.int_val.val, it) else ~opv.int_val.val,
+                    .val = if (opv.int_val.int_ty) |it| machineResult(~opv.int_val.val, it, false) orelse return null else return null,
                     .int_ty = opv.int_val.int_ty,
                 } } else null,
                 else => null,
@@ -1294,11 +1279,11 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
                             env.bindings.put(env.alloc, nm, rhs) catch return null;
                         } else if (cur == .int_val and rhs == .int_val) {
                             const nv: i128 = switch (asg.op) {
-                                .add_assign => cur.int_val.val + rhs.int_val.val,
-                                .sub_assign => cur.int_val.val - rhs.int_val.val,
-                                .mul_assign => cur.int_val.val * rhs.int_val.val,
-                                .div_assign => if (rhs.int_val.val != 0) @divTrunc(cur.int_val.val, rhs.int_val.val) else return null,
-                                .rem_assign => if (rhs.int_val.val != 0) @rem(cur.int_val.val, rhs.int_val.val) else return null,
+                                .add_assign => std.math.add(i128, cur.int_val.val, rhs.int_val.val) catch return null,
+                                .sub_assign => std.math.sub(i128, cur.int_val.val, rhs.int_val.val) catch return null,
+                                .mul_assign => std.math.mul(i128, cur.int_val.val, rhs.int_val.val) catch return null,
+                                .div_assign => if (rhs.int_val.val != 0) std.math.divTrunc(i128, cur.int_val.val, rhs.int_val.val) catch return null else return null,
+                                .rem_assign => if (rhs.int_val.val != 0) @intCast(@rem(@as(i256, cur.int_val.val), rhs.int_val.val)) else return null,
                                 else => return null,
                             };
                             env.bindings.put(env.alloc, nm, .{ .int_val = .{ .val = nv, .int_ty = cur.int_val.int_ty } }) catch return null;
@@ -1374,15 +1359,15 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
             }
             if (lv == .option_val and rv == .option_val) {
                 return switch (b.op) {
-                    .eq => .{ .bool_val = concreteValEql(lv, rv) },
-                    .ne => .{ .bool_val = !concreteValEql(lv, rv) },
+                    .eq => .{ .bool_val = concreteValEql(lv, rv) orelse return null },
+                    .ne => .{ .bool_val = !(concreteValEql(lv, rv) orelse return null) },
                     else => null,
                 };
             }
             if (lv != .int_val or rv != .int_val) return null;
             const a = lv.int_val.val;
             const bv = rv.int_val.val;
-            const common_ty = lv.int_val.int_ty orelse rv.int_val.int_ty;
+            const common_ty = if (env.expr_types) |types| (if (types.get(expr)) |ty| ty.isInteger() else null) else null;
             return switch (b.op) {
                 .eq => .{ .bool_val = a == bv },
                 .ne => .{ .bool_val = a != bv },
@@ -1390,17 +1375,17 @@ pub fn evalConcreteExpr(env: *ConcreteEnv, expr: *const ast.Expr) ?ConcreteVal {
                 .le => .{ .bool_val = a <= bv },
                 .gt => .{ .bool_val = a > bv },
                 .ge => .{ .bool_val = a >= bv },
-                .add => .{ .int_val = .{ .val = a + bv, .int_ty = common_ty } },
-                .sub => .{ .int_val = .{ .val = a - bv, .int_ty = common_ty } },
-                .mul => .{ .int_val = .{ .val = a * bv, .int_ty = common_ty } },
-                .div => if (bv != 0) .{ .int_val = .{ .val = @divTrunc(a, bv), .int_ty = common_ty } } else null,
-                .rem => if (bv != 0) .{ .int_val = .{ .val = @rem(a, bv), .int_ty = common_ty } } else null,
-                .add_wrap => .{ .int_val = .{ .val = if (common_ty) |it| wrapIntValue(a + bv, it) else a + bv, .int_ty = common_ty } },
-                .sub_wrap => .{ .int_val = .{ .val = if (common_ty) |it| wrapIntValue(a - bv, it) else a - bv, .int_ty = common_ty } },
-                .mul_wrap => .{ .int_val = .{ .val = if (common_ty) |it| wrapIntValue(a * bv, it) else a * bv, .int_ty = common_ty } },
-                .add_sat => .{ .int_val = .{ .val = if (common_ty) |it| clampIntValue(a + bv, it) else a + bv, .int_ty = common_ty } },
-                .sub_sat => .{ .int_val = .{ .val = if (common_ty) |it| clampIntValue(a - bv, it) else @max(@as(i128, 0), a - bv), .int_ty = common_ty } },
-                .mul_sat => .{ .int_val = .{ .val = if (common_ty) |it| clampIntValue(a * bv, it) else a * bv, .int_ty = common_ty } },
+                .add => .{ .int_val = .{ .val = std.math.add(i128, a, bv) catch return null, .int_ty = common_ty } },
+                .sub => .{ .int_val = .{ .val = std.math.sub(i128, a, bv) catch return null, .int_ty = common_ty } },
+                .mul => .{ .int_val = .{ .val = std.math.mul(i128, a, bv) catch return null, .int_ty = common_ty } },
+                .div => if (bv != 0) .{ .int_val = .{ .val = std.math.divTrunc(i128, a, bv) catch return null, .int_ty = common_ty } } else null,
+                .rem => if (bv != 0) .{ .int_val = .{ .val = @intCast(@rem(@as(i256, a), bv)), .int_ty = common_ty } } else null,
+                .add_wrap => .{ .int_val = .{ .val = machineResult(@as(i256, a) + bv, common_ty orelse return null, false) orelse return null, .int_ty = common_ty } },
+                .sub_wrap => .{ .int_val = .{ .val = machineResult(@as(i256, a) - bv, common_ty orelse return null, false) orelse return null, .int_ty = common_ty } },
+                .mul_wrap => .{ .int_val = .{ .val = machineResult(@as(i256, a) * bv, common_ty orelse return null, false) orelse return null, .int_ty = common_ty } },
+                .add_sat => .{ .int_val = .{ .val = machineResult(@as(i256, a) + bv, common_ty orelse return null, true) orelse return null, .int_ty = common_ty } },
+                .sub_sat => .{ .int_val = .{ .val = machineResult(@as(i256, a) - bv, common_ty orelse return null, true) orelse return null, .int_ty = common_ty } },
+                .mul_sat => .{ .int_val = .{ .val = machineResult(@as(i256, a) * bv, common_ty orelse return null, true) orelse return null, .int_ty = common_ty } },
                 .bit_and => .{ .int_val = .{ .val = a & bv, .int_ty = common_ty } },
                 .bit_or => .{ .int_val = .{ .val = a | bv, .int_ty = common_ty } },
                 .bit_xor => .{ .int_val = .{ .val = a ^ bv, .int_ty = common_ty } },
@@ -1423,46 +1408,20 @@ fn buildCandidatesForInt(
     rng: ?int_range.IntRange,
     exhaustive: bool,
 ) ?[]const ConcreteVal {
-    var lo: i128 = 0;
-    var hi: i128 = 0;
-    if (rng != null and rng.? == .bounded) {
-        lo = rng.?.bounded.lo;
-        hi = rng.?.bounded.hi;
-    } else if (it.bits <= 16) {
-        if (it.signed) {
-            const half: i128 = @as(i128, 1) << @intCast(it.bits - 1);
-            lo = -half;
-            hi = half - 1;
-        } else {
-            lo = 0;
-            hi = (@as(i128, 1) << @intCast(it.bits)) - 1;
-        }
-    } else {
-        if (it.signed) {
-            lo = -(@as(i128, 1) << 31);
-            hi = (@as(i128, 1) << 31) - 1;
-        } else {
-            lo = 0;
-            hi = (@as(i128, 1) << 32) - 1;
-        }
-    }
+    const bounds = rng orelse int_range.IntRange.ofType(it);
+    if (bounds != .bounded) return null;
+    const lo = bounds.bounded.lo;
+    const hi = bounds.bounded.hi;
+    if (hi < lo) return null;
     if (exhaustive) {
-        if (hi < lo) return &.{};
-        const span = hi - lo + 1;
+        const span = @as(i256, hi) - lo + 1;
         if (span > 256) return null;
-        var vals = alloc.alloc(ConcreteVal, @intCast(span)) catch return null;
-        var cur = lo;
-        var idx: usize = 0;
-        while (cur <= hi) : ({
-            cur += 1;
-            idx += 1;
-        }) {
-            vals[idx] = .{ .int_val = .{ .val = cur, .int_ty = it } };
-        }
+        const vals = alloc.alloc(ConcreteVal, @intCast(span)) catch return null;
+        for (vals, 0..) |*slot, i| slot.* = .{ .int_val = .{ .val = lo + @as(i128, @intCast(i)), .int_ty = it } };
         return vals;
     }
     var list: std.ArrayList(ConcreteVal) = .empty;
-    const raw_samples = [_]i128{ lo, lo + 1, -2, -1, 0, 1, 2, 3, 5, 10, 42, 100, hi - 1, hi };
+    const raw_samples = [_]i128{ lo, lo +| 1, -2, -1, 0, 1, 2, 3, 5, 10, 42, 100, hi -| 1, hi };
     for (raw_samples) |s| {
         if (s < lo or s > hi) continue;
         var dup = false;
@@ -1484,11 +1443,6 @@ fn buildParamCandidates(alloc: std.mem.Allocator, dom: LawParamDomain, exhaustiv
             return vals;
         },
         .int_ty => |ii| {
-            if (exhaustive) {
-                const fits_small = (ii.range != null and ii.range.? == .bounded and
-                    (ii.range.?.bounded.hi - ii.range.?.bounded.lo + 1) <= 256) or ii.int_ty.bits <= 8;
-                if (!fits_small) return null;
-            }
             return buildCandidatesForInt(alloc, ii.int_ty, ii.range, exhaustive);
         },
         .enum_ty => |et| {
@@ -1497,18 +1451,15 @@ fn buildParamCandidates(alloc: std.mem.Allocator, dom: LawParamDomain, exhaustiv
             for (0..et.variant_count) |vi| vals[vi] = .{ .enum_val = vi };
             return vals;
         },
-        .option_ty => {
-            var vals = alloc.alloc(ConcreteVal, 6) catch return null;
+        .option_ty => |inner| {
+            const payloads = buildParamCandidates(alloc, inner.*, exhaustive) orelse return null;
+            const vals = alloc.alloc(ConcreteVal, payloads.len + 1) catch return null;
             vals[0] = .{ .option_val = null };
-            const samples = [_]i128{ 0, 1, 2, 7, 255 };
-            for (samples, 0..) |sv, si| {
-                const p = alloc.create(ConcreteVal) catch return null;
-                p.* = .{ .int_val = .{ .val = sv, .int_ty = .{ .signed = false, .bits = 8 } } };
-                vals[si + 1] = .{ .option_val = p };
-            }
+            for (payloads, vals[1..]) |*payload, *slot| slot.* = .{ .option_val = payload };
             return vals;
         },
         .fn_scalar_ty => {
+            if (exhaustive) return null;
             var vals = alloc.alloc(ConcreteVal, 4) catch return null;
             vals[0] = .{ .builtin_fn = 0 };
             vals[1] = .{ .builtin_fn = 1 };
@@ -1517,6 +1468,7 @@ fn buildParamCandidates(alloc: std.mem.Allocator, dom: LawParamDomain, exhaustiv
             return vals;
         },
         .fn_opt_ty => {
+            if (exhaustive) return null;
             var vals = alloc.alloc(ConcreteVal, 3) catch return null;
             vals[0] = .{ .builtin_fn = 10 };
             vals[1] = .{ .builtin_fn = 11 };
@@ -1603,6 +1555,7 @@ fn checkConcreteClause(
     is_never: bool,
     exhaustive: bool,
     max_states: usize,
+    expr_types: ?*const ExprTypes,
 ) Tier1Outcome {
     if (params.len == 0 or params.len > 12) return .inconclusive;
     var cand_lists: [12][]const ConcreteVal = undefined;
@@ -1624,6 +1577,7 @@ fn checkConcreteClause(
         .source = source,
         .fns = fns,
         .records = records,
+        .expr_types = expr_types,
         .resolved_calls = resolved_calls,
     };
 
@@ -1686,19 +1640,6 @@ fn checkConcreteClause(
     return .inconclusive;
 }
 
-pub fn runTier1Clause(
-    alloc: std.mem.Allocator,
-    source: [:0]const u8,
-    fns: []const FnAstEntry,
-    records: []const RecordAstInfo,
-    params: []const LawParamDomain,
-    guards: []const *const ast.Expr,
-    goal: *const ast.Expr,
-    is_never: bool,
-) Tier1Outcome {
-    return runTier1ClauseResolved(alloc, source, fns, records, null, params, guards, goal, is_never);
-}
-
 pub fn runTier1ClauseResolved(
     alloc: std.mem.Allocator,
     source: [:0]const u8,
@@ -1709,26 +1650,11 @@ pub fn runTier1ClauseResolved(
     guards: []const *const ast.Expr,
     goal: *const ast.Expr,
     is_never: bool,
+    expr_types: ?*const ExprTypes,
 ) Tier1Outcome {
-    const exh = checkConcreteClause(alloc, source, fns, records, resolved_calls, params, guards, goal, is_never, true, 65536);
+    const exh = checkConcreteClause(alloc, source, fns, records, resolved_calls, params, guards, goal, is_never, true, 65536, expr_types);
     if (exh != .inconclusive) return exh;
-    return checkConcreteClause(alloc, source, fns, records, resolved_calls, params, guards, goal, is_never, false, 4096);
-}
-
-pub fn runTier1BoundedFalsify(
-    alloc: std.mem.Allocator,
-    source: [:0]const u8,
-    fns: []const FnAstEntry,
-    records: []const RecordAstInfo,
-    params: []const LawParamDomain,
-    guards: []const *const ast.Expr,
-    goal: *const ast.Expr,
-    is_never: bool,
-) ?[]const u8 {
-    return switch (checkConcreteClause(alloc, source, fns, records, null, params, guards, goal, is_never, false, 4096)) {
-        .falsified => |w| w,
-        else => null,
-    };
+    return checkConcreteClause(alloc, source, fns, records, resolved_calls, params, guards, goal, is_never, false, 4096, expr_types);
 }
 
 // =========================================================================
@@ -1759,7 +1685,7 @@ fn initSymCtxFromBindings(
     fns: []const FnAstEntry,
     bindings: []const SymBinding,
 ) struct { ctx: SymCtx, guards: std.ArrayList(*const LawProp) } {
-    var ctx = SymCtx{ .alloc = alloc, .source = source, .fns = fns };
+    var ctx = SymCtx{ .alloc = alloc, .source = source, .fns = fns, .termination = true };
     var guards: std.ArrayList(*const LawProp) = .empty;
     for (bindings) |b| {
         if (ctx.bindVar(b.name, b.non_negative)) |vid| {
@@ -1807,7 +1733,7 @@ pub fn byteFieldCountdown(
         return null;
     const guard = condition.binary;
     if (!sameDirectField(source, measure, guard.left) or guard.right.* != .int_lit or
-        !std.mem.eql(u8, guard.right.int_lit.slice(source), "0u8"))
+        !std.mem.eql(u8, guard.right.int_lit.slice(source), "0"))
         return null;
     const update = body.stmts[0].assign_stmt;
     if (update.op != .assign or !sameDirectField(source, measure, update.target) or
@@ -1815,7 +1741,7 @@ pub fn byteFieldCountdown(
         return null;
     const rhs = update.value.binary;
     if (!sameDirectField(source, measure, rhs.left) or rhs.right.* != .int_lit or
-        !std.mem.eql(u8, rhs.right.int_lit.slice(source), "1u8"))
+        !std.mem.eql(u8, rhs.right.int_lit.slice(source), "1"))
         return null;
 
     const current = mkLawExpr(alloc, .{ .var_id = 0 });

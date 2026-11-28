@@ -1,0 +1,5 @@
+fn main() -> u8 {
+  let apply = fn(transform: fn(u8) -> u8) { transform(73) };
+  let take_flag = fn(flag: bool) { if flag { 1 } else { 0 } };
+  apply(take_flag)
+}

@@ -1,0 +1,91 @@
+// Stage H/I: Real Cargo `bevy = "0.17.3"` Hello World + @derive(rust, "bevy::prelude::Component")!
+// Pure Aethel systems (`hello_world`, `greet_person`, and `move_entity`) execute directly
+// inside Bevy's `Startup` and `Update` schedules over Aethel-defined Bevy Components
+// (`Position`, `Velocity`) alongside `@layout(soa)` column mutation.
+
+pub opaque type BevyApp
+
+@layout(flat)
+@derive(rust, "bevy::prelude::Component")
+pub type Position {
+  pub x: f32,
+  pub y: f32,
+}
+
+@layout(flat)
+@derive(rust, "bevy::prelude::Component")
+pub type Velocity {
+  pub vx: f32,
+  pub vy: f32,
+}
+
+@layout(soa)
+pub type Transform2D {
+  x: f32,
+  y: f32,
+}
+
+@external(rust, "self", "app_new")
+pub fn app_new() -> BevyApp
+
+@external(rust, "self", "add_startup_system")
+pub fn add_startup_system(app: View(BevyApp, Exclusive), sys: fn() -> ())
+
+@external(rust, "self", "spawn_person")
+pub fn spawn_person(app: View(BevyApp, Exclusive), name: String)
+
+@external(rust, "self", "spawn_body")
+pub fn spawn_body(app: View(BevyApp, Exclusive), pos: Position, vel: Velocity)
+
+@external(rust, "self", "add_person_query_system")
+pub fn add_person_query_system(app: View(BevyApp, Exclusive), greet: fn(String) -> ())
+
+@external(rust, "self", "add_movement_system")
+pub fn add_movement_system(app: View(BevyApp, Exclusive), step: fn(View(Position, Exclusive), Velocity) -> ())
+
+@external(rust, "self", "app_update")
+pub fn app_update(app: View(BevyApp, Exclusive))
+
+@external(rust, "self", "app_free")
+pub fn app_free(app: BevyApp)
+
+@external(rust, "self", "step_positions_soa")
+pub fn step_positions_soa(q: Collection(Transform2D) ~> mut .{x, y}, vx: f32, vy: f32)
+
+pub fn hello_world() {
+  println("hello world!")
+}
+
+pub fn greet_person(name: String) {
+  println("hello ", name, "!")
+}
+
+pub fn move_entity(pos: View(Position, Exclusive), vel: Velocity) {
+  pos.x = pos.x + vel.vx
+  pos.y = pos.y + vel.vy
+  println("bevy Component Position=(", pos.x, ", ", pos.y, ")")
+}
+
+pub fn main() {
+  let app = app_new()
+  add_startup_system(app, hello_world)
+  add_person_query_system(app, greet_person)
+  add_movement_system(app, move_entity)
+
+  spawn_person(app, "Elaina Proctor")
+  spawn_person(app, "Renzo Hume")
+  spawn_person(app, "Zayna Nieves")
+  spawn_body(app, Position { x: 1.0, y: 2.0 }, Velocity { vx: 3.5, vy: -0.5 })
+
+  app_update(app)
+
+  let mut transforms: Collection(Transform2D) = [
+    Transform2D { x: 0.0, y: 1.0 },
+    Transform2D { x: 2.0, y: 3.0 },
+    Transform2D { x: 4.0, y: 5.0 },
+  ]
+  step_positions_soa(transforms, 1.5, 2.0)
+  println("SoA Transform2D[0]=(", transforms[0].x, ", ", transforms[0].y, ")")
+
+  app_free(app)
+}

@@ -80,18 +80,92 @@ theorem Runs.references_live {s final : State} {program : Program}
   | nil => exact live
   | cons first _ ih => exact ih (first.owners_valid owners) (first.references_live owners live)
 
+theorem Runs.prefix_safe {first rest : Program} {final : State}
+    (traced : Runs {} (first ++ rest) final) :
+    ∃ middle, Runs {} first middle ∧ Runs middle rest final ∧
+      middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible := by
+  have executed := run_complete traced
+  rw [run_append, Option.bind_eq_some_iff] at executed
+  obtain ⟨middle, initial, remaining⟩ := executed
+  have initialTrace := run_sound initial
+  exact ⟨middle, initialTrace, run_sound remaining,
+    initialTrace.owners_valid State.empty_owners_valid,
+    initialTrace.references_live State.empty_owners_valid State.empty_references_live,
+    initialTrace.views_compatible State.empty_views_compatible⟩
+
 theorem verified_prefix_safe {first rest : Program}
     (verified : verifyResources (first ++ rest) = true) :
     ∃ middle final, Runs {} first middle ∧ Runs middle rest final ∧ final.views = [] ∧
       middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible := by
   obtain ⟨final, traced, closed⟩ := (verifyResources_correct _).mp verified
-  have executed := run_complete traced
-  rw [run_append, Option.bind_eq_some_iff] at executed
-  obtain ⟨middle, initial, remaining⟩ := executed
-  have initialTrace := run_sound initial
-  exact ⟨middle, final, initialTrace, run_sound remaining, closed,
-    initialTrace.owners_valid State.empty_owners_valid,
-    initialTrace.references_live State.empty_owners_valid State.empty_references_live,
-    initialTrace.views_compatible State.empty_views_compatible⟩
+  obtain ⟨middle, initial, rest, owners, live, compatible⟩ := traced.prefix_safe
+  exact ⟨middle, final, initial, rest, closed, owners, live, compatible⟩
+
+def State.withoutObservations (state : State) : State :=
+  { state with observations := [] }
+
+private theorem Step.withObservations {state next : State} {op : Instruction}
+    (step : Step state op next) (observations : List UInt8) :
+    ∃ reached, Step { state with observations } op reached ∧
+      reached.withoutObservations = next.withoutObservations := by
+  cases step with
+  | alloc fresh => exact ⟨_, .alloc fresh, rfl⟩
+  | alias fresh live => exact ⟨_, .alias fresh live, rfl⟩
+  | read found live available => exact ⟨_, .read found live available, rfl⟩
+  | write found live authority available => exact ⟨_, .write found live authority available, rfl⟩
+  | reserve fresh found live authority available => exact ⟨_, .reserve fresh found live authority available, rfl⟩
+  | readView found live available => exact ⟨_, .readView found live available, rfl⟩
+  | writeView found live authority available => exact ⟨_, .writeView found live authority available, rfl⟩
+  | release found => exact ⟨_, .release found, rfl⟩
+  | forget found => exact ⟨_, .forget found, rfl⟩
+  | destroy found unreserved => exact ⟨_, .destroy found unreserved, rfl⟩
+
+private theorem Runs.withOtherObservations {state final other : State} {program : Program}
+    (trace : Runs state program final) (same : other.withoutObservations = state.withoutObservations) :
+    ∃ reached, Runs other program reached ∧ reached.withoutObservations = final.withoutObservations := by
+  induction trace generalizing other with
+  | nil => exact ⟨other, .nil, same⟩
+  | cons first _ ih =>
+    obtain ⟨middle, step, middleSame⟩ := first.withObservations other.observations
+    have replace (original : State) (agrees : other.withoutObservations = original.withoutObservations) :
+        { original with observations := other.observations } = other :=
+      congrArg (fun s : State => { s with observations := other.observations }) agrees.symm
+    rw [replace _ same] at step
+    obtain ⟨reached, rest, ending⟩ := ih middleSame
+    exact ⟨reached, .cons step rest, ending⟩
+
+/-- A kernel trace can retain the byte observations that its enclosing
+typed operation consumes, while agreeing on all storage and authority. -/
+def RunsOnStorage (state : State) (program : Program) (final : State) : Prop :=
+  ∃ reached, Runs state program reached ∧ reached.withoutObservations = final.withoutObservations
+
+theorem Runs.onStorage {state final : State} {program : Program} (trace : Runs state program final) :
+    RunsOnStorage state program final := ⟨final, trace, rfl⟩
+
+theorem RunsOnStorage.append {state middle final : State} {first rest : Program}
+    (left : RunsOnStorage state first middle) (right : RunsOnStorage middle rest final) :
+    RunsOnStorage state (first ++ rest) final := by
+  obtain ⟨boundary, begun, same⟩ := left
+  obtain ⟨_, continued, ending⟩ := right
+  obtain ⟨reached, suffix, storage⟩ := continued.withOtherObservations same
+  exact ⟨reached, begun.append suffix, storage.trans ending⟩
+
+theorem RunsOnStorage.safe {final : State} {program : Program} (trace : RunsOnStorage {} program final) :
+    final.OwnersValid ∧ final.ReferencesLive ∧ final.ViewsCompatible := by
+  obtain ⟨reached, ran, same⟩ := trace
+  change final.withoutObservations.OwnersValid ∧ final.withoutObservations.ReferencesLive ∧
+    final.withoutObservations.ViewsCompatible
+  rw [← same]
+  exact ⟨ran.owners_valid State.empty_owners_valid,
+    ran.references_live State.empty_owners_valid State.empty_references_live,
+    ran.views_compatible State.empty_views_compatible⟩
+
+theorem RunsOnStorage.checkResources {state final : State} {program : Program}
+    (trace : RunsOnStorage state program final) :
+    checkResources state.resources program = some final.resources := by
+  obtain ⟨reached, ran, same⟩ := trace
+  rw [checkResources_correct, run_complete ran, Option.map_some]
+  change some reached.withoutObservations.resources = some final.withoutObservations.resources
+  exact congrArg (fun s : State => some s.resources) same
 
 end Aethel.Core

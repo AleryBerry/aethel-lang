@@ -1,4 +1,5 @@
 import Aethel.Functions
+import Aethel.Disjointness
 
 namespace Aethel.Structured
 
@@ -700,5 +701,174 @@ theorem BranchFacts.checkArms_sound {facts : BranchFacts ctx} {env : Env ctx}
     have equal := (resolve_sound valid found).symm.trans evaluated
     subst known
     cases result <;> simpa [checkArms, found] using checked
+
+private def Guard.bytePeer (guard : Guard ctx) (v : Var ctx .byte) : Option (Var ctx .byte) :=
+  match guard with
+  | .byteVar left right =>
+    if v = left then some right else if v = right then some left else none
+  | _ => none
+
+private theorem Guard.bytePeer_sound {guard : Guard ctx} {v peer : Var ctx .byte}
+    (found : guard.bytePeer v = some peer) (env : Env ctx) : guard.eval env = (env.get v == env.get peer) := by
+  cases guard <;> simp only [bytePeer, reduceCtorEq] at found
+  case byteVar left right =>
+    split at found
+    · rename_i same
+      subst v
+      cases found
+      rfl
+    · obtain ⟨rfl, same⟩ := Option.ite_none_right_eq_some.mp found
+      cases same
+      exact Bool.eq_iff_iff.mpr (by simp only [Guard.eval, beq_iff_eq]; exact eq_comm)
+
+private def BranchFacts.excludesBytePeer (facts : BranchFacts ctx) : Term ctx .byte → UInt8 → Bool
+  | .var v, value =>
+    facts.any fun fact => (fact.guard.bytePeer v).any fun peer =>
+      facts.resolve (.byteEq (.var peer) (.byte value)) == some (!fact.result)
+  | _, _ => false
+
+private theorem BranchFacts.excludesBytePeer_sound {facts : BranchFacts ctx} {env : Env ctx}
+    (valid : facts.Valid env) {term : Term ctx .byte} {value : UInt8}
+    (observed : term.eval env = value) : facts.excludesBytePeer term value = false := by
+  cases term <;> try rfl
+  case var v =>
+    apply Bool.eq_false_iff.mpr
+    intro excluded
+    obtain ⟨fact, member, excluded⟩ := List.any_eq_true.mp excluded
+    obtain ⟨peer, found, disagrees⟩ := (Option.any_eq_true _ _).mp excluded
+    have relation := (Guard.bytePeer_sound found env).symm.trans (valid fact member)
+    have other := BranchFacts.resolve_sound valid (beq_iff_eq.mp disagrees)
+    change (env.get peer == value) = !fact.result at other
+    change env.get v = value at observed
+    rw [observed] at relation
+    rw [BEq.comm] at relation
+    have impossible := relation.symm.trans other
+    generalize fact.result = result at impossible
+    cases result <;> contradiction
+
+/-- A byte dispatch checks reachability and records the value of a
+captured operand. Equality and inequality facts can constrain its peers. -/
+def BranchFacts.byteCase (facts : BranchFacts ctx) (operand : Term ctx .byte) (index : Fin 256) :
+    Option (BranchFacts ctx) :=
+  let value := UInt8.ofFin index
+  let selected := Term.byteEq operand (.byte value)
+  if facts.resolve selected == some false || facts.excludesBytePeer operand value then none
+  else some (facts.learn selected true)
+
+theorem BranchFacts.byteCase_reachable {facts : BranchFacts ctx} {env : Env ctx}
+    (valid : facts.Valid env) (operand : Term ctx .byte) :
+    ∃ selected, facts.byteCase operand (operand.eval env : UInt8).toFin = some selected ∧ selected.Valid env := by
+  let condition := Term.byteEq operand (.byte (UInt8.ofFin (operand.eval env : UInt8).toFin))
+  have evaluated : condition.eval env = true := by
+    change ((operand.eval env : UInt8) == UInt8.ofFin (operand.eval env : UInt8).toFin) = true
+    simp
+  have possible : facts.resolve condition ≠ some false := by
+    intro impossible
+    exact Bool.noConfusion ((BranchFacts.resolve_sound valid impossible).symm.trans evaluated)
+  refine ⟨facts.learn condition true, ?_, valid.learn evaluated⟩
+  have peer := BranchFacts.excludesBytePeer_sound valid (term := operand)
+    (value := UInt8.ofFin (operand.eval env : UInt8).toFin) (by simp)
+  change (if facts.resolve condition == some false ||
+      facts.excludesBytePeer operand (UInt8.ofFin (operand.eval env : UInt8).toFin) then none
+    else some (facts.learn condition true)) = some (facts.learn condition true)
+  rw [beq_false_of_ne possible, peer]
+  rfl
+
+private def allBytes : Interval := ⟨0, 256⟩
+
+private def oneByte (byte : UInt8) : Interval := ⟨byte.toNat, byte.toNat + 1⟩
+
+private def byteCut (exclusiveBound : Nat) (result : Bool) : Interval :=
+  if result then ⟨0, exclusiveBound⟩ else ⟨exclusiveBound, 256⟩
+
+private theorem allBytes_contains (byte : UInt8) : allBytes.Contains byte.toNat :=
+  ⟨Nat.zero_le _, byte.toNat_lt⟩
+
+private theorem oneByte_contains (byte : UInt8) : (oneByte byte).Contains byte.toNat :=
+  ⟨Nat.le_refl _, Nat.lt_succ_self _⟩
+
+private theorem byteCut_contains {byte : UInt8} {bound : Nat} {result : Bool}
+    (tested : decide (byte.toNat < bound) = result) : (byteCut bound result).Contains byte.toNat := by
+  cases result
+  · exact ⟨Nat.le_of_not_lt (of_decide_eq_false tested), byte.toNat_lt⟩
+  · exact ⟨Nat.zero_le _, of_decide_eq_true tested⟩
+
+private def BranchFact.byteInterval (fact : BranchFact ctx) (slot : Var ctx .byte) : Interval :=
+  match fact.guard with
+  | .byteConst tested value =>
+    if tested = slot ∧ fact.result = true then oneByte value else allBytes
+  | .byteLtConst tested bound =>
+    if tested = slot then byteCut bound.toNat fact.result else allBytes
+  | .byteLeConst tested bound =>
+    if tested = slot then byteCut (bound.toNat + 1) fact.result else allBytes
+  | _ => allBytes
+
+private theorem BranchFact.byteInterval_sound {fact : BranchFact ctx} {env : Env ctx}
+    (valid : fact.guard.eval env = fact.result) (target : Var ctx .byte) :
+    (fact.byteInterval target).Contains (env.get target).toNat := by
+  cases fact with
+  | mk guard result =>
+    cases guard <;> try exact allBytes_contains (env.get target)
+    case byteConst tested value =>
+      simp only [byteInterval]
+      split
+      · rename_i same
+        obtain ⟨rfl, rfl⟩ := same
+        exact (beq_iff_eq.mp valid) ▸ oneByte_contains value
+      · exact allBytes_contains _
+    case byteLtConst tested bound =>
+      simp only [byteInterval]
+      split
+      · rename_i same
+        subst tested
+        exact byteCut_contains valid
+      · exact allBytes_contains _
+    case byteLeConst tested bound =>
+      simp only [byteInterval]
+      split
+      · rename_i same
+        subst tested
+        apply byteCut_contains
+        change decide ((env.get target).toNat ≤ bound.toNat) = result at valid
+        simpa only [Nat.lt_succ_iff] using valid
+      · exact allBytes_contains _
+
+private def BranchFacts.byteBounds (facts : BranchFacts ctx) : Term ctx .byte → Interval
+  | .byte byte => oneByte byte
+  | .var v => facts.foldr (fun fact remaining => (fact.byteInterval v).intersect remaining) allBytes
+  | _ => allBytes
+
+private theorem BranchFacts.byteBounds_sound {facts : BranchFacts ctx} {env : Env ctx}
+    (valid : facts.Valid env) (operand : Term ctx .byte) :
+    (facts.byteBounds operand).Contains (operand.eval env : UInt8).toNat := by
+  cases operand <;> try exact allBytes_contains _
+  case byte => exact oneByte_contains _
+  case var v =>
+    induction facts with
+    | nil => exact allBytes_contains _
+    | cons head rest ih =>
+      exact (Interval.intersect_contains ..).mpr
+        ⟨BranchFact.byteInterval_sound (valid head List.mem_cons_self) v,
+          ih (fun fact member => valid fact (.tail _ member))⟩
+
+/-- Enumerate only the interval still allowed by the captured byte facts. -/
+def BranchFacts.byteCandidates (facts : BranchFacts ctx) (operand : Term ctx .byte) : List (Fin 256) :=
+  let bounds := facts.byteBounds operand
+  (List.range' bounds.lo (bounds.hi - bounds.lo)).filterMap fun value =>
+    if fits : value < 256 then some ⟨value, fits⟩ else none
+
+theorem BranchFacts.byteCandidates_contains {facts : BranchFacts ctx} {env : Env ctx}
+    (valid : facts.Valid env) (operand : Term ctx .byte) :
+    (operand.eval env : UInt8).toFin ∈ facts.byteCandidates operand := by
+  let value : UInt8 := operand.eval env
+  have ⟨low, high⟩ := BranchFacts.byteBounds_sound valid operand
+  change (facts.byteBounds operand).lo ≤ value.toNat at low
+  change value.toNat < (facts.byteBounds operand).hi at high
+  apply List.mem_filterMap.mpr
+  refine ⟨value.toNat, List.mem_range'_1.mpr ⟨low, ?_⟩, ?_⟩
+  · omega
+  · change (if fits : value.toNat < 256 then some (⟨value.toNat, fits⟩ : Fin 256) else none) = some value.toFin
+    rw [dite_eq_left value.toNat_lt]
+    rfl
 
 end Aethel.Structured

@@ -1,0 +1,12 @@
+type Meter { remaining: u8, }
+fn reset(meter: Meter ~>.{remaining}) {
+  meter.remaining = 40;
+}
+fn main() -> u8 {
+  let mut meter = Meter { remaining: 40, };
+  while meter.remaining > 0 decreases meter.remaining {
+    meter.remaining = meter.remaining -| 9;
+    reset(meter);
+  };
+  meter.remaining
+}

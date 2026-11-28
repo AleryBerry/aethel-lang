@@ -253,6 +253,21 @@ private def runRustFFITests : IO Unit := do
   let readable : RustSliceSpec := ⟨0, 1, 2, 1, 1, .shared, false⟩
   let empty := { writable with len := 0 }
   let slices := [writable, empty, readable]
+  require "Rust borrow plan releases the exact caller state after an empty trace"
+    (checkRustBorrowPlan stWithView slices &&
+      runRustBorrowedCall stWithView slices [] == some stWithView)
+  require "Rust borrow plan rejects duplicate exclusive argument occurrences"
+    (!checkRustBorrowPlan stWithView [writable, writable])
+  let atCallerView := { readable with byteOffset := 0, len := 1 }
+  require "Rust shared arguments may overlap a live shared caller view"
+    (checkRustBorrowPlan stWithView [atCallerView, atCallerView])
+  let firstShared := stWithView.freshView
+  let sharedReaders := [.readView (firstShared + 1), .readView firstShared]
+  require "Rust shared arguments can each read a byte already shared by the caller"
+    ((runRustBorrowedCall stWithView [atCallerView, atCallerView] sharedReaders).any fun returned =>
+      returned.views == stWithView.views && returned.observations == [1, 1])
+  require "Rust borrow plan accepts the byte just beyond a caller reservation"
+    (checkRustBorrowPlan stWithView [{ atCallerView with byteOffset := 1, mode := .exclusive }])
   let grants := rustCallViews stWithView slices
   let some written := grants[0]? | throw (IO.userError "missing mutable Rust loan")
   let some read := grants[3]? | throw (IO.userError "missing last shared Rust loan")
@@ -265,6 +280,8 @@ private def runRustFFITests : IO Unit := do
     (decide (after.resources = stWithView.resources) && after.byte ⟨0, 7⟩ == some 8)
   require "Rust trace cannot write through a shared slice"
     (runRustBorrowedCall stWithView slices [.writeView read.id 20]).isNone
+  require "A denied Rust write rejects a trace containing an earlier authorized write"
+    (runRustBorrowedCall stWithView slices [.writeView written.id 92, .writeView read.id 20]).isNone
   require "Rust trace rejects the ID just after the last granted byte"
     (runRustBorrowedCall stWithView slices [.readView (read.id + 1)]).isNone
   require "A zero-length Rust slice grants no byte IDs"
@@ -275,6 +292,14 @@ private def runRustFFITests : IO Unit := do
     (runRustBorrowedCall stWithView [⟨0, 0, 1, 1, 1, .exclusive, false⟩] []).isNone
   require "Rust call rejects two overlapping slice arguments without executing accesses"
     (runRustBorrowedCall stWithView [writable, ⟨0, 5, 1, 1, 1, .shared, false⟩] []).isNone
+
+  let access : List RustAdapterAccess := [⟨⟨0, 1⟩, some 83⟩, ⟨⟨2, 1⟩, none⟩]
+  require "Argument-relative Rust trace translates a byte past an empty argument"
+    ((runRustAdapterTrace stWithView slices access).any fun returned =>
+      returned.byte ⟨0, 4⟩ == some 5 && returned.byte ⟨0, 5⟩ == some 83 &&
+      returned.observations == [3] && decide (returned.resources = stWithView.resources))
+  require "Argument-relative Rust trace rejects even the first byte of an empty argument"
+    (runRustAdapterTrace stWithView slices [⟨⟨1, 0⟩, none⟩]).isNone
 
   require "RustOwn alive use succeeds"
     (rustOwnStep .alive .useHandle == some .alive)

@@ -1,0 +1,9 @@
+type Meter { count: u8, out: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { count: 16, out: 38, };
+  while meter.count > 7 decreases meter.count {
+    meter.count = meter.count -| 2;
+    view exclusive counter = meter.count { counter = 16; };
+  };
+  meter.out
+}

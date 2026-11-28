@@ -1,5 +1,6 @@
 import Aethel.Structured
 import Aethel.ResourceFrame
+import Aethel.ByteLoans
 import Aethel.SourceForkJoin
 import Lean.Elab.Deriving.FromToJson
 
@@ -27,6 +28,8 @@ scoped instance : FromJson AccessMode where
     | "shared" => return .shared
     | "exclusive" => return .exclusive
     | _ => throw "expected shared or exclusive"
+
+deriving instance ToJson, FromJson for TaskAccess
 
 inductive Place where
   | field (offset : Nat)
@@ -98,6 +101,17 @@ theorem Place.view_read_origin {index offset depth : Nat} {state final : State} 
   have loaded := AccessTarget.read_current_byte ((target.read_correct state value final).mpr ⟨step, observed⟩)
   rw [location] at loaded
   exact ⟨location, loaded, observed⟩
+
+private theorem Place.reads_same_value {place : Place} {depth : Nat} {state middle after : State}
+    {left right : UInt8} (first : place.runRead depth state = some (left, middle))
+    (second : place.runRead depth middle = some (right, after)) : left = right := by
+  obtain ⟨_, readLeft, observedLeft⟩ := Place.runRead_correct.mp first
+  obtain ⟨_, readRight, observedRight⟩ := Place.runRead_correct.mp second
+  let access := place.target depth
+  have original := AccessTarget.read_current_byte ((access.read_correct _ _ _).mpr ⟨readLeft, observedLeft⟩)
+  have again := AccessTarget.read_current_byte ((access.read_correct _ _ _).mpr ⟨readRight, observedRight⟩)
+  rw [observedLeft] at again
+  exact Option.some.inj (original.symm.trans again)
 
 def Place.runWrite (target : Place) (depth : Nat) (state : State)
     (value : UInt8) : Option State :=
@@ -172,17 +186,36 @@ theorem ByteOperand.read_correct {operand : ByteOperand Place} {depth : Nat} {st
 
 private def ByteOperand.fixedRangeLength : ByteOperand Place → ByteOperand Place → Option Nat
   | .literal first, .literal stop => some (stop.toNat - first.toNat)
-  | _, _ => none
+  | .literal first, .place _ => if first = 255 then some 0 else none
+  | .place _, .literal stop => if stop = 0 then some 0 else none
+  | .place first, .place stop => if first = stop then some 0 else none
 
 private theorem ByteOperand.fixedRangeLength_sound {first stop : ByteOperand Place} {depth count : Nat}
     {state middle after : State} {a b : UInt8} (fixed : first.fixedRangeLength stop = some count)
     (readFirst : first.read depth state = some (a, middle)) (readStop : stop.read depth middle = some (b, after)) :
     b.toNat - a.toNat = count := by
-  cases first <;> cases stop <;> simp [ByteOperand.fixedRangeLength, ByteOperand.read, Prod.mk.injEq] at *
+  cases first <;> cases stop
   case literal.literal =>
-    obtain ⟨rfl, _⟩ := readFirst
-    obtain ⟨rfl, _⟩ := readStop
-    exact fixed
+    obtain ⟨rfl, _⟩ := Prod.mk.inj (Option.some.inj readFirst)
+    obtain ⟨rfl, _⟩ := Prod.mk.inj (Option.some.inj readStop)
+    exact Option.some.inj fixed
+  case literal.place =>
+    obtain ⟨rfl, _⟩ := Prod.mk.inj (Option.some.inj readFirst)
+    obtain ⟨rfl, length⟩ := Option.ite_none_right_eq_some.mp fixed
+    rw [← Option.some.inj length]
+    change b.toNat - 255 = 0
+    have := b.toNat_lt
+    omega
+  case place.literal =>
+    obtain ⟨rfl, _⟩ := Prod.mk.inj (Option.some.inj readStop)
+    obtain ⟨rfl, length⟩ := Option.ite_none_right_eq_some.mp fixed
+    rw [← Option.some.inj length]
+    exact Nat.zero_sub _
+  case place.place =>
+    obtain ⟨rfl, length⟩ := Option.ite_none_right_eq_some.mp fixed
+    rw [← Option.some.inj length]
+    obtain rfl := Place.reads_same_value readFirst readStop
+    exact Nat.sub_self _
 
 inductive Comparison where
   | equal
@@ -193,7 +226,7 @@ inductive Comparison where
   | greaterEqual
   deriving Repr, DecidableEq, ToJson, FromJson
 
-private def Comparison.term (comparison : Comparison) (left right : Term ctx .byte) : Term ctx .bool :=
+def Comparison.term (comparison : Comparison) (left right : Term ctx .byte) : Term ctx .bool :=
   match comparison with
   | .equal => .byteEq left right
   | .unequal => .branch (.byteEq left right) (.bool false) (.bool true)
@@ -256,17 +289,6 @@ private def Comparison.guardResult (comparison : Comparison) (left : Place)
   | .literal _ => comparison.knownResult operand
   | .place right => if left = right then some comparison.selfResult else none
 
-private theorem Place.reads_same_value {place : Place} {depth : Nat} {state middle after : State}
-    {left right : UInt8} (first : place.runRead depth state = some (left, middle))
-    (second : place.runRead depth middle = some (right, after)) : left = right := by
-  obtain ⟨_, readLeft, observedLeft⟩ := Place.runRead_correct.mp first
-  obtain ⟨_, readRight, observedRight⟩ := Place.runRead_correct.mp second
-  let access := place.target depth
-  have original := AccessTarget.read_current_byte ((access.read_correct _ _ _).mpr ⟨readLeft, observedLeft⟩)
-  have again := AccessTarget.read_current_byte ((access.read_correct _ _ _).mpr ⟨readRight, observedRight⟩)
-  rw [observedLeft] at again
-  exact Option.some.inj (original.symm.trans again)
-
 private theorem Comparison.guardResult_sound {comparison : Comparison} {place : Place}
     {operand : ByteOperand Place} {depth : Nat} {state middle after : State} {left right : UInt8} {known : Bool}
     (result : comparison.guardResult place operand = some known)
@@ -312,7 +334,7 @@ inductive Operations where
   | call (name : String) (body next : Operations)
   | sequence (body next : Operations)
   | reborrow (parent : Nat) (mode : AccessMode) (body next : Operations)
-  | forkStores (tasks : List StoreTask) (next : Operations)
+  | fork (tasks : List ByteTask) (next : Operations)
   deriving Repr, DecidableEq, ToJson, FromJson
 
 /-- The guard read follows the write so it precedes the next body or
@@ -324,9 +346,6 @@ def Operations.countdown (offset : Nat) (threshold amount : UInt8) (afterDecreas
   .repeatFrom (.field offset) (.countdown threshold amount) (countdownIteration offset amount afterDecrease) next
 
 abbrev Continuation := (ctx : List Ty) → Code ctx
-
-private def prepend (steps : Program) (rest : Code ctx) : Code ctx :=
-  steps.foldr .instruction rest
 
 private def repeatCode (body : Continuation → Continuation) :
     Nat → Continuation → Continuation
@@ -378,8 +397,8 @@ def Operations.toCode : Operations → Nat → Continuation → Continuation
   | .call _ body next, depth, rest | .sequence body next, depth, rest |
     .reborrow _ _ body next, depth, rest =>
     body.toCode depth (next.toCode depth rest)
-  | .forkStores tasks next, depth, rest => fun ctx =>
-    prepend (StoreTask.code tasks.flatten) (next.toCode depth rest ctx)
+  | .fork tasks next, depth, rest => fun ctx =>
+    Code.prepend (ByteTask.code tasks.flatten) (next.toCode depth rest ctx)
 
 private def checkStable (resources : ResourceState) (instruction : Instruction) : Bool :=
   decide (checkInstruction resources instruction = some resources)
@@ -439,8 +458,8 @@ def Operations.check : Operations → Nat → ResourceState → Bool
     body.check depth resources && next.check depth resources
   | .reborrow parent mode body next, depth, resources =>
     checkReborrow resources depth parent mode && (body.check depth resources && next.check depth resources)
-  | .forkStores tasks next, depth, resources =>
-    checkStoreTasks tasks resources && next.check depth resources
+  | .fork tasks next, depth, resources =>
+    checkTasks tasks resources && next.check depth resources
 
 theorem Operations.countdown_checked {offset depth : Nat} {threshold amount : UInt8} {afterDecrease next : Operations}
     {resources : ResourceState}
@@ -468,7 +487,7 @@ private def Checks (state : ResourceState) (rest : Continuation) : Prop :=
 private theorem prepend_check (entry : Program) (initial final : ResourceState)
     (checked : checkResources initial entry = some final)
     (rest : Continuation) (post : Checks final rest) :
-    Checks initial (fun ctx => prepend entry (rest ctx)) := by
+    Checks initial (fun ctx => Code.prepend entry (rest ctx)) := by
   induction entry generalizing initial with
   | nil =>
     cases checked
@@ -477,7 +496,7 @@ private theorem prepend_check (entry : Program) (initial final : ResourceState)
     simp only [checkResources, Option.bind_eq_some_iff] at checked
     obtain ⟨middle, first, remaining⟩ := checked
     intro ctx facts
-    simpa only [prepend, List.foldr_cons, Structured.checkWithFacts, first, Option.any_some] using
+    simpa only [Code.prepend, List.foldr_cons, Structured.checkWithFacts, first, Option.any_some] using
       ih middle remaining facts
 
 private theorem repeatCode_checked (body : Continuation → Continuation) (count : Nat)
@@ -591,9 +610,9 @@ private theorem Operations.check_code (ops : Operations) {depth : Nat} {state : 
     cases fixed : first.fixedRangeLength stop with
     | none =>
       have bodyOk : body.check depth state = true := by simpa [fixed] using loopOk
-      simp only [selectRange, fixed, checkWithFacts, List.all_eq_true]
-      intro count _
-      exact repeatCode_checked _ count.val _ (fun tail tailOk => inside bodyOk tail tailOk) _ nextChecked _
+      simp only [selectRange, fixed, check_selectByte]
+      intro count _ facts _
+      exact repeatCode_checked _ count.val _ (fun tail tailOk => inside bodyOk tail tailOk) _ nextChecked facts
     | some count =>
       simp only [selectRange, fixed]
       by_cases empty : count = 0
@@ -607,20 +626,20 @@ private theorem Operations.check_code (ops : Operations) {depth : Nat} {state : 
     intro ctx facts
     simp only [Operations.toCode]
     apply bound.bindCode_checked depth readOk
-    simp only [checkWithFacts, List.all_eq_true]
-    intro count _
+    apply check_selectByte.mpr
+    intro count _ facts _
     exact repeatCode_checked _ (iterations.ofByte count.val) _ (fun tail tailOk => inside bodyOk tail tailOk)
-      _ (after nextOk rest post) _
+      _ (after nextOk rest post) facts
   | call _ body next inside after | sequence body next inside after | reborrow _ _ body next inside after =>
     have paired : (body.check depth state && next.check depth state) = true := by
       first | exact ok | exact (Bool.and_eq_true_iff.mp ok).2
     have ⟨bodyOk, nextOk⟩ := Bool.and_eq_true_iff.mp paired
     intro ctx facts
     exact inside bodyOk _ (after nextOk rest post) facts
-  | forkStores tasks next after =>
+  | fork tasks next after =>
     have ⟨forkOk, nextOk⟩ := Bool.and_eq_true_iff.mp ok
     intro ctx facts
-    exact prepend_check _ _ _ ((StoreSchedule.serial tasks).checked forkOk) _
+    exact prepend_check _ _ _ ((TaskSchedule.serial tasks).checked forkOk) _
       (after nextOk rest post) facts
 
 def runRepeat (body : State → Option State) : Nat → State → Option State
@@ -674,8 +693,8 @@ def Operations.run : Operations → Nat → State → Option State
     .reborrow _ _ body next, depth, state => do
     let after ← body.run depth state
     next.run depth after
-  | .forkStores tasks next, depth, state => do
-    let after ← Core.run state (StoreTask.code tasks.flatten)
+  | .fork tasks next, depth, state => do
+    let after ← Core.run state (ByteTask.code tasks.flatten)
     next.run depth after
 
 theorem Operations.reborrow_erased (parent : Nat) (mode : AccessMode) (body next : Operations)
@@ -853,9 +872,9 @@ private theorem Operations.check_balanced (ops : Operations) {depth : Nat} {entr
       first | exact checked | exact (Bool.and_eq_true_iff.mp checked).2
     have ⟨bodyOk, nextOk⟩ := Bool.and_eq_true_iff.mp paired
     exact (inside bodyOk).thenRun (after nextOk)
-  | forkStores tasks next after =>
+  | fork tasks next after =>
     have ⟨forkOk, nextOk⟩ := Bool.and_eq_true_iff.mp checked
-    exact (runsWithResources_program ((StoreSchedule.serial tasks).checked forkOk)).thenRun
+    exact (runsWithResources_program ((TaskSchedule.serial tasks).checked forkOk)).thenRun
       (after nextOk)
 
 /-- A checked block can run with the caller's reservations live and returns
@@ -944,12 +963,12 @@ private theorem Place.writeCode_snd (target : Place) (depth : Nat) (env : Env ct
   exact runWrite_snd env state (target.target depth) value next
 
 private theorem prepend_snd (entry : Program) {ctx} (env : Env ctx) (state : State) (rest : Code ctx) :
-    (runCode env state (prepend entry rest)).map Prod.snd =
+    (runCode env state (Code.prepend entry rest)).map Prod.snd =
       (Core.run state entry).bind (fun mid => (runCode env mid rest).map Prod.snd) := by
   induction entry generalizing state with
   | nil => rfl
   | cons op entry ih =>
-    simp only [prepend, List.foldr_cons, runInstruction_snd, Core.run, Option.bind_assoc]
+    simp only [Code.prepend, List.foldr_cons, runInstruction_snd, Core.run, Option.bind_assoc]
     congr
     funext middle
     exact ih middle
@@ -1065,7 +1084,7 @@ private theorem Operations.run_agrees (ops : Operations) (depth : Nat) (rest : C
     intro ctx env state
     simpa only [Operations.toCode, Operations.run, bind, Option.bind_assoc] using
       inside depth _ _ (after depth rest tail post) env state
-  | forkStores tasks next after =>
+  | fork tasks next after =>
     intro ctx env state
     simp only [Operations.toCode, Operations.run, prepend_snd, bind, Option.bind_assoc]
     congr
@@ -1081,6 +1100,14 @@ theorem Operations.run_executes {ops : Operations} {depth : Nat} {state final : 
   obtain ⟨⟨steps, result⟩, executed, rfl⟩ := Option.map_eq_some_iff.mp agrees
   exact ⟨steps, runCode_sound executed⟩
 
+theorem Operations.executes_run {ops : Operations} {depth : Nat} {state final : State} {steps : Program}
+    (ran : Structured.Executes Env.empty state (ops.toCode depth (fun _ => .finish) []) steps final) :
+    ops.run depth state = some final := by
+  have done : Interprets (fun _ => .finish) some := fun _ _ => rfl
+  have agrees := ops.run_agrees depth _ some done Env.empty state
+  rw [ran.agrees] at agrees
+  simpa only [Option.map_some, Option.bind_fun_some] using agrees.symm
+
 /-- A checked block has a declarative execution that preserves the caller's
 resource state. The caller can retain live views while this block runs. -/
 theorem Operations.checked_trace {ops : Operations} {depth : Nat} {state : State}
@@ -1092,20 +1119,20 @@ theorem Operations.checked_trace {ops : Operations} {depth : Nat} {state : State
   obtain ⟨steps, executed⟩ := Operations.run_executes ran
   exact ⟨steps, final, executed, restored⟩
 
-theorem Operations.forkStores_agrees {tasks : List StoreTask} {schedule : StoreTask} {next : Operations}
-    {state : State} {depth : Nat} (checked : (Operations.forkStores tasks next).check depth state.resources = true)
-    (addresses : RecordAddresses state) (interleaved : StoreSchedule tasks schedule) :
+theorem Operations.fork_agrees {tasks : List ByteTask} {schedule : ByteTask} {next : Operations}
+    {state : State} {depth : Nat} (checked : (Operations.fork tasks next).check depth state.resources = true)
+    (addresses : RecordAddresses state) (interleaved : TaskSchedule tasks schedule) :
     ∃ serial alternate,
-      Runs state (StoreTask.code tasks.flatten) serial ∧ Runs state schedule.code alternate ∧
+      Runs state (ByteTask.code tasks.flatten) serial ∧ Runs state schedule.code alternate ∧
       serial.resources = state.resources ∧ alternate.resources = state.resources ∧
       (∀ location, serial.byte location = alternate.byte location) ∧
-      (Operations.forkStores tasks next).run depth state = next.run depth serial := by
+      (Operations.fork tasks next).run depth state = next.run depth serial := by
   have forkOk := (Bool.and_eq_true_iff.mp checked).1
-  let serialOrder := StoreSchedule.serial tasks
+  let serialOrder := TaskSchedule.serial tasks
   obtain ⟨serial, first, restoredFirst⟩ := serialOrder.executes forkOk
   obtain ⟨alternate, second, restoredSecond⟩ := interleaved.executes forkOk
   refine ⟨serial, alternate, first, second, restoredFirst, restoredSecond,
-    storeTasks_schedule_deterministic forkOk addresses serialOrder interleaved first second, ?_⟩
+    task_schedule_deterministic forkOk addresses serialOrder interleaved first second, ?_⟩
   simp [Operations.run, bind, Core.run_complete first]
 
 /-- A write footprint that includes every reachable store and called body.
@@ -1125,7 +1152,7 @@ def Operations.writes : Operations → List Nat
       | some false => no.writes
       | none => yes.writes ++ no.writes
     arms ++ next.writes
-  | .forkStores tasks next => tasks.flatten.map Prod.fst ++ next.writes
+  | .fork tasks next => ByteTask.writes tasks.flatten ++ next.writes
 
 private def Frames (writes : List Nat) (before after : State) : Prop :=
   after.handles = before.handles ∧
@@ -1286,12 +1313,12 @@ private theorem Operations.run_frame (ops : Operations) {depth : Nat} {state fin
     obtain ⟨middle, entered, continued⟩ := ran
     have called := inside roots entered
     exact called.thenFrame (after (called.addresses roots) continued)
-  | forkStores tasks next after =>
+  | fork tasks next after =>
     simp only [Operations.run, bind, Option.bind_eq_some_iff] at ran
     obtain ⟨joined, scheduled, continued⟩ := ran
     have executed := Core.run_sound scheduled
-    have frame : Frames (tasks.flatten.map Prod.fst) state joined :=
-      ⟨StoreTask.handles_preserved executed, fun _ outside => StoreTask.frames_byte roots executed outside⟩
+    have frame : Frames (ByteTask.writes tasks.flatten) state joined :=
+      ⟨ByteTask.handles_preserved executed, fun _ outside => ByteTask.frames_byte roots executed outside⟩
     exact frame.thenFrame (after (frame.addresses roots) continued)
 
 /-- Every successful body execution preserves bytes outside the derived write
@@ -1336,73 +1363,34 @@ structure SourceMIR where
   result : Nat
   deriving Repr, DecidableEq, ToJson, FromJson
 
-def currentSourceMIRVersion : Nat := 12
+def currentSourceMIRVersion : Nat := 15
 
 private def recordEntry (bytes : List UInt8) : Program :=
-  .alloc 0 bytes :: (List.range bytes.length).map (fun i => .alias i 0 i .exclusive)
+  Core.byteRegionEntry 0 bytes
 
 def SourceMIR.entry (mir : SourceMIR) : Program :=
   recordEntry (mir.fields.map Prod.snd)
 
-private theorem recordAliases_initialized (offsets : List Nat) {initial final : State}
-    (ran : Core.run initial (offsets.map (fun i => .alias i 0 i .exclusive)) = some final) :
-    final.allocations = initial.allocations ∧
-      ∀ offset, final.handle offset = if offset ∈ offsets then some ⟨⟨0, offset⟩, .exclusive⟩
-        else initial.handle offset := by
-  induction offsets generalizing initial with
-  | nil =>
-    cases ran
-    simp
-  | cons offset rest ih =>
-    simp only [List.map_cons, Core.run, Option.bind_eq_some_iff] at ran
-    obtain ⟨middle, added, continued⟩ := ran
-    obtain ⟨allocations, handles⟩ := ih continued
-    cases execute_sound added
-    refine ⟨allocations, fun field => ?_⟩
-    rw [handles]
-    by_cases later : field ∈ rest
-    · simp [later]
-    · by_cases same : offset = field
-      · subst field
-        simp [later, State.handle, State.addHandle]
-      · simp [later, State.handle, State.addHandle, beq_false_of_ne same, Ne.symm same]
+theorem SourceMIR.entry_views (mir : SourceMIR) {state : State} (ran : Core.run {} mir.entry = some state) :
+    state.views = [] :=
+  (Core.byteRegionEntry_exact 0 _ ran).2.1
 
 theorem SourceMIR.entry_initialized (mir : SourceMIR) {state : State} {offset : Nat}
     {name : String} {value : UInt8} (ran : Core.run {} mir.entry = some state)
     (field : mir.fields[offset]? = some (name, value)) :
     state.handle offset = some ⟨⟨0, offset⟩, .exclusive⟩ ∧ state.byte ⟨0, offset⟩ = some value := by
-  change (Core.execute {} (.alloc 0 (mir.fields.map Prod.snd))).bind
-    (fun initial => Core.run initial ((List.range (mir.fields.map Prod.snd).length).map
-      (fun i => .alias i 0 i .exclusive))) = some state at ran
-  obtain ⟨initial, allocated, continued⟩ := Option.bind_eq_some_iff.mp ran
-  obtain ⟨initialBytes, handles⟩ := recordAliases_initialized _ continued
+  obtain ⟨allocation, _, handles⟩ := Core.byteRegionEntry_exact 0 _ ran
   have within := (List.getElem?_eq_some_iff.mp field).choose
-  constructor
-  · simp [handles, within]
-  · cases execute_sound allocated
-    simp [State.byte, State.allocation, initialBytes, State.addAllocation, bind, field]
-
-private theorem recordAliases_addresses (offsets : List Nat) {state final : State}
-    (roots : RecordAddresses state)
-    (ran : Core.run state (offsets.map (fun i => .alias i 0 i .exclusive)) = some final) :
-    RecordAddresses final := by
-  obtain ⟨_, handles⟩ := recordAliases_initialized offsets ran
-  intro id handle found
-  by_cases added : id ∈ offsets
-  · have canonical : final.handle id = some ⟨⟨0, id⟩, .exclusive⟩ := by
-      simpa [added] using handles id
-    rw [← Option.some.inj (canonical.symm.trans found)]
-  · exact roots id handle (by simpa [handles, added] using found)
+  exact ⟨by simp [handles, within], by simp [State.byte, State.allocation, allocation, bind, field]⟩
 
 theorem SourceMIR.entry_addresses (bytes : List UInt8) {entered : State}
     (ran : Core.run {} (recordEntry bytes) = some entered) : RecordAddresses entered := by
-  change (Core.execute {} (.alloc 0 bytes)).bind
-    (fun middle => Core.run middle ((List.range bytes.length).map (fun i => .alias i 0 i .exclusive))) =
-      some entered at ran
-  obtain ⟨middle, allocated, rest⟩ := Option.bind_eq_some_iff.mp ran
-  apply recordAliases_addresses _ _ rest
-  cases execute_sound allocated
-  simp [RecordAddresses, State.handle, State.addAllocation]
+  intro id handle found
+  rw [(Core.byteRegionEntry_exact 0 bytes ran).2.2] at found
+  split at found
+  · cases found
+    rfl
+  · contradiction
 
 private def exitSteps (result : FunctionResult) : Program :=
   match result with
@@ -1410,8 +1398,11 @@ private def exitSteps (result : FunctionResult) : Program :=
   | .view mode offset => [.reserve 0 offset mode, .release 0, .destroy 0]
   | .unit => [.destroy 0]
 
+def SourceMIR.exit (mir : SourceMIR) : Program :=
+  exitSteps (.byte mir.result)
+
 private def programCode (bytes : List UInt8) (body : Operations) (result : FunctionResult) : Code [] :=
-  prepend (recordEntry bytes) (body.toCode 0 (fun _ => prepend (exitSteps result) .finish) [])
+  Code.prepend (recordEntry bytes) (body.toCode 0 (fun _ => Code.prepend (exitSteps result) .finish) [])
 
 def SourceMIR.code (mir : SourceMIR) : Code [] :=
   programCode (mir.fields.map Prod.snd) mir.body (.byte mir.result)
@@ -1441,7 +1432,7 @@ private theorem programRun_agrees (bytes : List UInt8) (body : Operations) (resu
   funext initial
   refine body.run_agrees 0 _ _ ?_ Env.empty initial
   intro ctx env state
-  change (runCode env state (prepend (exitSteps result) .finish)).map Prod.snd = Core.run state (exitSteps result)
+  change (runCode env state (Code.prepend (exitSteps result) .finish)).map Prod.snd = Core.run state (exitSteps result)
   rw [prepend_snd]
   simp [runCode]
 
@@ -1473,14 +1464,29 @@ theorem SourceMIR.entry_runs {mir : SourceMIR} (ok : mir.check = true) :
   obtain ⟨entered, executed, _⟩ := abstract
   exact ⟨entered, executed⟩
 
-theorem SourceMIR.body_checked {mir : SourceMIR} (ok : mir.check = true) {entry : State}
-    (entered : Core.run {} mir.entry = some entry) : mir.body.check 0 entry.resources = true := by
+private theorem SourceMIR.parts_checked {mir : SourceMIR} (ok : mir.check = true) {entry : State}
+    (entered : Core.run {} mir.entry = some entry) :
+    mir.body.check 0 entry.resources = true ∧
+      ∃ closing, checkResources entry.resources mir.exit = some closing ∧ closing.views = [] := by
   have accepted := (Bool.and_eq_true_iff.mp ok).2
-  simp only [checkProgram, Option.any_eq_true, Bool.and_eq_true] at accepted
-  obtain ⟨resources, checked, bodyOK, _⟩ := accepted
+  simp only [checkProgram, Option.any_eq_true, Bool.and_eq_true, List.isEmpty_iff] at accepted
+  obtain ⟨resources, checked, bodyOK, closing, exitOK, closed⟩ := accepted
   change checkResources ({} : State).resources mir.entry = some resources at checked
   rw [checkResources_correct, entered, Option.map_some] at checked
-  exact Option.some.inj checked ▸ bodyOK
+  obtain rfl := Option.some.inj checked
+  exact ⟨bodyOK, closing, exitOK, closed⟩
+
+theorem SourceMIR.body_checked {mir : SourceMIR} (ok : mir.check = true) {entry : State}
+    (entered : Core.run {} mir.entry = some entry) : mir.body.check 0 entry.resources = true :=
+  (SourceMIR.parts_checked ok entered).1
+
+theorem SourceMIR.exit_runs {mir : SourceMIR} (ok : mir.check = true) {entry state : State}
+    (entered : Core.run {} mir.entry = some entry) (restored : state.resources = entry.resources) :
+    ∃ final, Runs state mir.exit final ∧ final.views = [] := by
+  obtain ⟨closing, safe, closed⟩ := (SourceMIR.parts_checked ok entered).2
+  rw [← restored, checkResources_correct] at safe
+  obtain ⟨final, ran, exactResources⟩ := Option.map_eq_some_iff.mp safe
+  exact ⟨final, run_sound ran, (congrArg ResourceState.views exactResources).trans closed⟩
 
 private theorem checkProgram_sound {bytes : List UInt8} {body : Operations} {result : FunctionResult}
     (checked : checkProgram bytes body result = true) :
@@ -1501,7 +1507,7 @@ private theorem checkProgram_input_length (body : Operations) (result : Function
     (bytes reference : List UInt8)
     (same : bytes.length = reference.length) :
     checkProgram bytes body result = checkProgram reference body result := by
-  simp only [checkProgram, recordEntry, checkResources, Core.checkInstruction, same]
+  simp only [checkProgram, recordEntry, Core.byteRegionEntry, checkResources, Core.checkInstruction, same]
 
 theorem SourceMIR.helpers_execute {mir : SourceMIR} (ok : mir.check = true)
     (fnMir : FunctionMIR) (declared : fnMir ∈ mir.functions)
@@ -1527,13 +1533,10 @@ private theorem repeatCode_post (body : Continuation → Continuation) (count : 
 
 private theorem prepend_post {ctx} {env : Env ctx} (entry : Program) {rest : Code ctx}
     (P : State → Prop) (post : ∀ {state steps final}, Structured.Executes env state rest steps final → P final)
-    {state steps final} (ran : Structured.Executes env state (prepend entry rest) steps final) :
+    {state steps final} (ran : Structured.Executes env state (Code.prepend entry rest) steps final) :
     P final := by
-  induction entry generalizing state steps final with
-  | nil => exact post ran
-  | cons _ _ ih =>
-    cases ran with
-    | instruction _ continued => exact ih continued
+  obtain ⟨_, _, _, _, continued⟩ := ran.prepend_split entry
+  exact post continued
 
 private theorem Place.guarded_executes {target : Place} {depth : Nat} {env : Env ctx}
     {state final : State} {code : Code ctx} {steps : Program}
@@ -1629,13 +1632,32 @@ private theorem Operations.toCode_post (ops : Operations) (P : State → Prop)
         (next.toCode depth rest) (after rest depth post) ran
   | call _ _ _ inside after | sequence _ _ inside after | reborrow _ _ _ _ inside after =>
     exact inside _ depth (after rest depth post) run
-  | forkStores tasks next after =>
+  | fork tasks next after =>
     exact prepend_post _ P (fun continued => after rest depth post continued) run
 
 private theorem programCode_post {bytes body result steps final} (P : State → Prop)
-    (exitPost : HasPost P (fun _ => prepend (exitSteps result) .finish))
+    (exitPost : HasPost P (fun _ => Code.prepend (exitSteps result) .finish))
     (ran : Structured.Executes Env.empty {} (programCode bytes body result) steps final) : P final :=
   prepend_post _ P (fun bodyRun => Operations.toCode_post body P _ 0 exitPost bodyRun) ran
+
+private theorem exitSteps_result {offset : Nat} {state final : State}
+    (ran : Runs state (exitSteps (.byte offset)) final) :
+    ∃ after value, Step state (.read offset) after ∧
+      Step after (.destroy 0) final ∧ final.observations.head? = some value := by
+  cases ran with
+  | cons reads continued =>
+    cases continued with
+    | cons destroys finished =>
+      cases finished
+      obtain ⟨value, observed⟩ := AccessTarget.read_observes (target := .handle offset) reads
+      refine ⟨_, value, reads, destroys, ?_⟩
+      cases destroys
+      simp [observed, State.removeOwner, State.observe]
+
+theorem SourceMIR.exit_result (mir : SourceMIR) {state final : State} (ran : Runs state mir.exit final) :
+    ∃ after value, Step state (.read mir.result) after ∧
+      Step after (.destroy 0) final ∧ final.observations.head? = some value :=
+  exitSteps_result ran
 
 private theorem programCode_result {bytes : List UInt8} {body : Operations} {offset : Nat} {steps final}
     (ran : Structured.Executes Env.empty {} (programCode bytes body (.byte offset)) steps final) :
@@ -1647,15 +1669,10 @@ private theorem programCode_result {bytes : List UInt8} {body : Operations} {off
   change P final
   apply programCode_post P ?_ ran
   intro ctx env state steps final ran
-  cases ran with
-  | instruction reads continued =>
-    cases continued with
-    | instruction destroys finished =>
-      cases finished
-      obtain ⟨value, observed⟩ := AccessTarget.read_observes (target := .handle offset) reads
-      refine ⟨_, _, value, reads, destroys, ?_⟩
-      cases destroys
-      simp [observed, State.removeOwner, State.observe]
+  obtain ⟨_, _, _, exit, finished⟩ := ran.prepend_split (exitSteps (.byte offset))
+  cases finished
+  obtain ⟨_, _, reads, destroys, observed⟩ := exitSteps_result exit
+  exact ⟨_, _, _, reads, destroys, observed⟩
 
 theorem SourceMIR.main_result {mir : SourceMIR} {steps final}
     (ran : Structured.Executes Env.empty {} mir.code steps final) :

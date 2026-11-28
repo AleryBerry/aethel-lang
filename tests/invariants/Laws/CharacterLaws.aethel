@@ -1,0 +1,5 @@
+namespace Laws.CharacterLaws
+
+law x_and_y_same(c: Character) {
+  always c.x == c.y
+}

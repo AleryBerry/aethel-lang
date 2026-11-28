@@ -1,0 +1,29 @@
+fn permitted(value: Result(u8, bool)) -> bool {
+  case value {
+    Ok(code) -> true
+    Err(blocked) -> if blocked { false } else { true }
+  }
+}
+
+fn handles(value: Result(u8, bool)) -> bool {
+  if permitted(value) { true } else {
+    case value {
+      Ok(code) -> false
+      Err(blocked) -> blocked
+    }
+  }
+}
+
+fn impossible(value: ((), (bool, bool))) -> bool {
+  let flags = value.1;
+  if flags.0 { if flags.0 { false } else { flags.1 } } else { false }
+}
+
+fn admit_pair(value: (u8, u8)) -> bool { true }
+fn admit_triple(value: (u8, (u8, u8))) -> bool { true }
+fn admit_callback(value: fn(bool) -> bool) -> bool { value(true) }
+
+fn main() -> u8 {
+  let request = Err(true): Result(u8, bool);
+  if handles(request) { 89 } else { 12 }
+}

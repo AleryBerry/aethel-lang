@@ -265,10 +265,9 @@ pub fn inferIntegerType(range: IntRange) ?IntType {
 
 pub const ParsedIntLit = struct {
     value: u128,
-    suffix: ?IntType,
 };
 
-/// Parse integer literal lexeme (`123`, `0xff_u8`, `42i7`, `1_u65535`) into magnitude + optional suffix.
+/// Parse unsuffixed integer literal lexeme (`123`, `0xff`, `0b1010_0101`, `1_000_000`) into magnitude.
 pub fn parseIntLiteral(lexeme: []const u8) ?ParsedIntLit {
     if (lexeme.len == 0) return null;
     var radix: u8 = 10;
@@ -291,22 +290,9 @@ pub fn parseIntLiteral(lexeme: []const u8) ?ParsedIntLit {
         }
     }
 
-    // Locate optional `u...` or `i...` suffix at end.
-    var mantissa_end = lexeme.len;
-    var suffix: ?IntType = null;
-    for (lexeme[start..], start..) |ch, idx| {
-        if ((ch == 'u' or ch == 'i') and (radix != 16 or idx > start)) {
-            if (lexer.parseIntWidth(lexeme[idx..])) |iw| {
-                suffix = .{ .signed = iw.signed, .bits = iw.bits };
-                mantissa_end = idx;
-                break;
-            }
-        }
-    }
-
     var acc: u128 = 0;
     var saw_digit = false;
-    for (lexeme[start..mantissa_end]) |ch| {
+    for (lexeme[start..]) |ch| {
         if (ch == '_') continue;
         const d: u128 = switch (ch) {
             '0'...'9' => ch - '0',
@@ -323,7 +309,7 @@ pub fn parseIntLiteral(lexeme: []const u8) ?ParsedIntLit {
         saw_digit = true;
     }
     if (!saw_digit) return null;
-    return .{ .value = acc, .suffix = suffix };
+    return .{ .value = acc };
 }
 
 pub fn fitsNonNeg(val: u128, ty: IntType) bool {

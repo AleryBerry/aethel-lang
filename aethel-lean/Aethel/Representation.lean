@@ -1,12 +1,269 @@
-import Aethel.CoreAST
-import Aethel.CoreSemantics
+import Aethel.CoreNormalization
 import Aethel.Machine
 import Aethel.Functions
 import Aethel.ResourceFrame
+import Aethel.ADTLayout
 
 namespace Aethel.Representation
 
-open Functional Core Structured CoreAST
+open Functional Core Structured CoreAST ADTLayout
+
+/-- Core data with a finite, dense representation. Functions and resources
+have separate representation requirements and receive no dense descriptor. -/
+inductive DenseData : CoreType → Nat → Type where
+  | unit : DenseData .unit 1
+  | bool : DenseData .bool 2
+  | byte : DenseData .byte 256
+  | prod : DenseData left a → DenseData right b → DenseData (.prod left right) (a * b)
+  | sum : DenseData left a → DenseData right b → DenseData (.sum left right) (a + b)
+
+def DenseData.ofType : (type : CoreType) → Option (Sigma (DenseData type))
+  | .unit => some ⟨1, .unit⟩
+  | .bool => some ⟨2, .bool⟩
+  | .int false 8 => some ⟨256, .byte⟩
+  | .prod left right => do
+    let ⟨_, left⟩ ← ofType left
+    let ⟨_, right⟩ ← ofType right
+    return ⟨_, .prod left right⟩
+  | .sum left right => do
+    let ⟨_, left⟩ ← ofType left
+    let ⟨_, right⟩ ← ofType right
+    return ⟨_, .sum left right⟩
+  | _ => none
+
+theorem DenseData.ofType_exact {shape : DenseData type count} : DenseData.ofType type = some ⟨count, shape⟩ := by
+  induction shape <;> simp [ofType, *, bind, pure]
+
+private def densePair (first : Fin a) (second : Fin b) : Fin (a * b) :=
+  ⟨second.val + b * first.val, by
+    have below := second.isLt
+    have capacity := Nat.mul_le_mul_left b (Nat.succ_le_of_lt first.isLt)
+    rw [Nat.mul_succ, Nat.mul_comm b a] at capacity
+    omega⟩
+
+private def densePairParts (code : Fin (a * b)) : Fin a × Fin b :=
+  have positive : 0 < b := by
+    cases b with
+    | zero => exact False.elim (Nat.not_lt_zero _ code.isLt)
+    | succ => exact Nat.zero_lt_succ _
+  (⟨code.val / b, (Nat.div_lt_iff_lt_mul positive).mpr code.isLt⟩,
+    ⟨code.val % b, Nat.mod_lt _ positive⟩)
+
+@[simp] private theorem densePair_parts (code : Fin (a * b)) :
+    densePair (densePairParts code).1 (densePairParts code).2 = code :=
+  Fin.ext (Nat.mod_add_div _ _)
+
+@[simp] private theorem densePairParts_join (first : Fin a) (second : Fin b) :
+    densePairParts (densePair first second) = (first, second) := by
+  have within := second.isLt
+  have positive := Nat.zero_lt_of_lt within
+  apply Prod.ext <;> apply Fin.ext
+  · change (second.val + b * first.val) / b = first.val
+    rw [Nat.add_mul_div_left _ _ positive, Nat.div_eq_of_lt within, Nat.zero_add]
+  · change (second.val + b * first.val) % b = second.val
+    rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt within]
+
+private theorem literalByte_iff (value : Int) : LiteralFits false 8 value ↔ 0 ≤ value ∧ value < 256 := by
+  rfl
+
+def DenseData.decode : DenseData ty count → Fin count → CoreExpr
+  | .unit, _ => .unit
+  | .bool, code => .bool (code.val == 1)
+  | .byte, code => .int false 8 code.val
+  | .prod left right, code =>
+    let (a, b) := densePairParts code
+    .pair (left.decode a) (right.decode b)
+  | @sum leftTy _ rightTy _ left right, code =>
+    match denseVariant code with
+    | .inl index => .inject true (leftTy, rightTy) (left.decode index)
+    | .inr index => .inject false (leftTy, rightTy) (right.decode index)
+
+def DenseData.encode : DenseData ty count → CoreExpr → Option (Fin count)
+  | .unit, .unit => some 0
+  | .bool, .bool value => some (if value then 1 else 0)
+  | .byte, .int signed width value =>
+    if fits : signed = false ∧ width = 8 ∧ LiteralFits false 8 value then
+      some ⟨value.toNat, by have := (literalByte_iff value).mp fits.2.2; omega⟩
+    else none
+  | .prod left right, .pair a b => do
+    return densePair (← left.encode a) (← right.encode b)
+  | @sum leftTy _ rightTy _ left right, .inject side variants payload =>
+    if variants = (leftTy, rightTy) then
+      if side then (left.encode payload).map (denseIndex ∘ Sum.inl)
+      else (right.encode payload).map (denseIndex ∘ Sum.inr)
+    else none
+  | _, _ => none
+
+theorem DenseData.decoded_computable (shape : DenseData ty count) (code : Fin count) :
+    Computable ty (shape.decode code) := by
+  induction shape with
+  | unit => exact ⟨.unit, .unit [], trivial⟩
+  | bool => exact ⟨.bool _, .bool [] _, trivial⟩
+  | byte =>
+    refine ⟨.int .., .int [] false 8 _ ((literalByte_iff _).mpr ?_), trivial⟩
+    have := code.isLt
+    omega
+  | prod left right ihLeft ihRight =>
+    exact (ihLeft (densePairParts code).1).pair (ihRight (densePairParts code).2)
+  | sum left right ihLeft ihRight =>
+    rw [decode]
+    cases denseVariant code with
+    | inl index => exact Computable.inject (side := true) (ihLeft index)
+    | inr index => exact Computable.inject (side := false) (ihRight index)
+
+theorem DenseData.decoded_value (shape : DenseData ty count) (code : Fin count) :
+    Value (shape.decode code) ∧ WellTyped [] (shape.decode code) ty .empty :=
+  ⟨(shape.decoded_computable code).isValue, (shape.decoded_computable code).typed⟩
+
+theorem DenseData.encode_decode (shape : DenseData ty count) (code : Fin count) :
+    shape.encode (shape.decode code) = some code := by
+  induction shape with
+  | unit => exact congrArg some (Fin.ext (by have := code.isLt; omega))
+  | bool =>
+    have within := code.isLt
+    by_cases set : code.val = 1
+    · have same : code = 1 := Fin.ext set
+      cases same
+      rfl
+    · have same : code = 0 := Fin.ext (by omega)
+      cases same
+      rfl
+  | byte =>
+    have checked : false = false ∧ 8 = 8 ∧ LiteralFits false 8 ↑code.val :=
+      ⟨rfl, rfl, (literalByte_iff _).mpr (by have := code.isLt; omega)⟩
+    rw [decode, encode, dite_eq_left checked]
+    exact congrArg some (Fin.ext (Int.toNat_natCast _))
+  | prod left right ihLeft ihRight =>
+    simp [decode, encode, ihLeft, ihRight, bind, pure]
+  | sum left right ihLeft ihRight =>
+    rw [decode]
+    have coded := denseIndex_variant code
+    cases side : denseVariant code
+    · rw [side] at coded
+      simp [encode, ihLeft, Function.comp_def, coded]
+    · rw [side] at coded
+      simp [encode, ihRight, Function.comp_def, coded]
+
+private theorem DenseData.decode_encode (shape : DenseData ty count) {value : CoreExpr} {code : Fin count}
+    (encoded : shape.encode value = some code) : shape.decode code = value := by
+  induction shape generalizing value with
+  | unit => cases value <;> simp [encode] at encoded; rfl
+  | bool =>
+    cases value <;> simp [encode] at encoded
+    case bool flag =>
+      subst code
+      cases flag <;> rfl
+  | byte =>
+    cases value <;> simp only [encode, reduceCtorEq] at encoded
+    case int =>
+      split at encoded
+      · rename_i checked
+        obtain ⟨rfl, rfl, fit⟩ := checked
+        obtain rfl := Option.some.inj encoded
+        exact congrArg (CoreExpr.int false 8) (Int.toNat_of_nonneg ((literalByte_iff _).mp fit).1)
+      · contradiction
+  | prod left right ihLeft ihRight =>
+    cases value <;> simp [encode, bind, pure, Option.bind_eq_some_iff] at encoded
+    case pair =>
+      obtain ⟨a, leftCode, b, rightCode, rfl⟩ := encoded
+      simp [decode, ihLeft leftCode, ihRight rightCode]
+  | sum left right ihLeft ihRight =>
+    cases value <;> simp only [encode, Option.ite_none_right_eq_some, reduceCtorEq] at encoded
+    case inject side variants payload =>
+      obtain ⟨rfl, encoded⟩ := encoded
+      cases side
+      · obtain ⟨index, selected, rfl⟩ := Option.map_eq_some_iff.mp encoded
+        simp [decode, ihRight selected]
+      · obtain ⟨index, selected, rfl⟩ := Option.map_eq_some_iff.mp encoded
+        simp [decode, ihLeft selected]
+
+theorem DenseData.encode_correct (shape : DenseData ty count) {value : CoreExpr} {code : Fin count} :
+    shape.encode value = some code ↔ shape.decode code = value :=
+  ⟨shape.decode_encode, fun same => same ▸ shape.encode_decode code⟩
+
+theorem DenseData.encode_total (shape : DenseData ty count) {value : CoreExpr} {effect : Effect}
+    (ready : Value value) (typed : WellTyped [] value ty effect) :
+    ∃ code, shape.encode value = some code := by
+  induction ready generalizing ty count effect with
+  | unit => cases typed; cases shape; exact ⟨_, rfl⟩
+  | bool => cases typed; cases shape; exact ⟨_, rfl⟩
+  | nat => cases typed; cases shape
+  | lam => cases typed; cases shape
+  | adt => cases typed; cases shape
+  | int signed bits value =>
+    cases typed with
+    | int _ _ _ _ fits =>
+      cases shape
+      have within : value.toNat < 256 := by have := (literalByte_iff value).mp fits; omega
+      refine ⟨⟨value.toNat, within⟩, ?_⟩
+      rw [encode, dite_eq_left (show false = false ∧ 8 = 8 ∧ LiteralFits false 8 value from ⟨rfl, rfl, fits⟩)]
+  | pair readyLeft readyRight ihLeft ihRight =>
+    cases typed with
+    | pair leftTyped rightTyped =>
+      cases shape with
+      | prod left right =>
+        obtain ⟨a, foundLeft⟩ := ihLeft left leftTyped
+        obtain ⟨b, foundRight⟩ := ihRight right rightTyped
+        exact ⟨densePair a b, by simp [encode, foundLeft, foundRight, bind, pure]⟩
+  | inject side variants ready ih =>
+    cases variants with
+    | mk leftTy rightTy =>
+      cases typed with
+      | inject _ _ payloadTyped =>
+        cases shape with
+        | sum left right =>
+          cases side
+          · obtain ⟨index, encoded⟩ := ih right payloadTyped
+            exact ⟨denseIndex (.inr index), by simp [encode, encoded, Function.comp_def]⟩
+          · obtain ⟨index, encoded⟩ := ih left payloadTyped
+            exact ⟨denseIndex (.inl index), by simp [encode, encoded, Function.comp_def]⟩
+
+theorem DenseData.minimum_width (shape : DenseData ty count) (width : Nat) (encode : CoreExpr → BitVec width)
+    (distinct : ∀ {a b}, Value a → WellTyped [] a ty .empty → Value b → WellTyped [] b ty .empty →
+      encode a = encode b → a = b) : minTagBits count ≤ width := by
+  apply packDenseIndex_minimum (encode ∘ shape.decode)
+  intro a b same
+  obtain ⟨readyA, typedA⟩ := shape.decoded_value a
+  obtain ⟨readyB, typedB⟩ := shape.decoded_value b
+  have values := distinct readyA typedA readyB typedB same
+  exact Option.some.inj ((shape.encode_decode a).symm.trans (congrArg shape.encode values) |>.trans
+    (shape.encode_decode b))
+
+structure DenseDataField (size : Nat) (type : CoreType) where
+  count : Nat
+  shape : DenseData type count
+  slot : DenseIndexField size count
+
+def DenseDataField.load (field : DenseDataField size ty) (image : AutomaticLayout.Image size) : Option CoreExpr :=
+  (field.slot.load image).map field.shape.decode
+
+def DenseDataField.store (field : DenseDataField size ty) (image : AutomaticLayout.Image size)
+    (value : CoreExpr) : Option (AutomaticLayout.Image size) :=
+  (field.shape.encode value).map (field.slot.store image)
+
+def DenseDataField.Represents (field : DenseDataField size ty) (image : AutomaticLayout.Image size)
+    (value : CoreExpr) : Prop :=
+  ∃ code, field.shape.decode code = value ∧
+    image.readBits field.slot.offset (minTagBits field.count) = packDenseIndex code
+
+theorem DenseDataField.load_correct (field : DenseDataField size ty) (image : AutomaticLayout.Image size)
+    (value : CoreExpr) : field.load image = some value ↔ field.Represents image value := by
+  simp only [load, Represents, Option.map_eq_some_iff, DenseIndexField.load_correct]
+  exact exists_congr fun _ => and_comm
+
+theorem DenseDataField.store_roundtrip (field : DenseDataField size ty)
+    (image : AutomaticLayout.Image size) {value : CoreExpr} (ready : Value value)
+    (typed : WellTyped [] value ty effect) :
+    ∃ updated, field.store image value = some updated ∧ field.Represents updated value ∧
+      ∀ offset width, offset + width ≤ size * 8 →
+        field.slot.offset + minTagBits field.count ≤ offset ∨ offset + width ≤ field.slot.offset →
+        updated.readBits offset width = image.readBits offset width := by
+  obtain ⟨code, encoded⟩ := field.shape.encode_total ready typed
+  refine ⟨field.slot.store image code, by simp [store, encoded], ?_, ?_⟩
+  · apply (field.load_correct ..).mp
+    simp [load, DenseIndexField.load_store, field.shape.encode_correct.mp encoded]
+  · intro offset width fits outside
+    exact field.slot.store_frames_bits image code offset width fits outside
 
 /-- Logical-to-physical byte representation relation. -/
 inductive Represents : CoreExpr → CoreType → List UInt8 → Prop where

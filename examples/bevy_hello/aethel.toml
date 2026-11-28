@@ -1,0 +1,9 @@
+[package]
+name = "bevy_hello"
+version = "0.1.0"
+entry = "src/main.aethel"
+
+[dependencies]
+
+[rust-dependencies]
+bevy = { version = "0.17.3", default-features = false }

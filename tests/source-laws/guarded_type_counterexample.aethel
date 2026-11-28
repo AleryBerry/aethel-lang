@@ -1,0 +1,4 @@
+law never_byte_under_guard(triple: Triple) {
+  when triple.second >= 10
+  never stage(triple) <= 255
+}

@@ -1,0 +1,5 @@
+fn choose(read: fn(u8) -> u8, fallback: u8, available: bool) -> u8 {
+  if available { read(fallback) } else { fallback }
+}
+
+fn main() -> u8 { choose(fn(value: u8) { 87 }, 17, true) }

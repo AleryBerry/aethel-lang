@@ -30,7 +30,12 @@ import Aethel.AffineIndex
 import Aethel.StatefulCore
 import Aethel.CoBorrowPacking
 import Aethel.CacheLayout
+import Aethel.IndexedBorrow
+import Aethel.SourceCollection
 import Aethel.ADTLayout
+import Aethel.PackedMIR
+import Aethel.PackedMIRSchedule
+import Aethel.SourcePacked
 import Aethel.CategoricalLNL
 import Aethel.CategoricalFusion
 import Aethel.CategoricalCombinators
@@ -45,6 +50,8 @@ import Aethel.RustFFI
 import Aethel.RustBorrowedCall
 import Aethel.IntInference
 import Aethel.CategoricalTraits
+import Aethel.NumericHierarchy
+import Aethel.ComplexModel
 import Aethel.RustBorrowBridge
 import Aethel.RustTraitBridge
 import Aethel.RustComplexABI
@@ -55,7 +62,7 @@ import Aethel.SourceVerification
 import Aethel.SourceLoops
 import Aethel.SourceLaws
 import Aethel.SourceLayout
-import Aethel.SourcePure
-import Aethel.SourceRust
+import Aethel.SourcePureLaws
+import Aethel.SourceRustCall
 import Aethel.CargoInterop
 import Aethel.ProcMacroInterop

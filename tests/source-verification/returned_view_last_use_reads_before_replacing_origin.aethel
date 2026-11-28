@@ -1,0 +1,13 @@
+type Pair { left: u8, right: u8, }
+fn adjust(pair: Pair ~>.{left}) -> View(u8, Exclusive) {
+  pair.left = 87;
+  pair.left
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 42, right: 0, };
+  let held = adjust(pair);
+  pair.right = held;
+  pair.left = 9;
+  if pair.left != 9 { pair.right = 0; } else { };
+  pair.right
+}

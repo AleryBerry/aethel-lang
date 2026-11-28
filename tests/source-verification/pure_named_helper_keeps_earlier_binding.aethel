@@ -1,0 +1,10 @@
+fn choose(first: bool) -> u8 {
+  if first { 51 } else { 32 }
+}
+
+fn selected(source: (bool, u8)) -> u8 { choose(source.0) }
+
+fn main() -> u8 {
+  let choose = fn(flag: bool) { 7 };
+  selected((true, choose(false)))
+}

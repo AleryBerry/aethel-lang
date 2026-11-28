@@ -1,0 +1,8 @@
+fn main() -> u8 {
+  let result = Ok(67): Result(u8, bool);
+  let output = case result {
+    Ok(value) -> fn(take: bool) { if take { value } else { 0 } }
+    Err(flag) -> fn(take: bool) { if flag { 4 } else { 6 } }
+  };
+  output(true)
+}

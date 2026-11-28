@@ -1,0 +1,14 @@
+type Row { control: u8, left: u8, right: u8, result: u8, }
+fn main() -> u8 {
+  let mut row = Row { control: 61, left: 0, right: 0, result: 0, };
+  view exclusive saved = row.control {
+    fork {
+      { row.left = 30; }
+      {}
+      { row.right = 47; }
+      { row.result = 14; }
+    } join;
+    if saved == 61 { row.result = row.right; } else { row.result = row.left; };
+  };
+  row.result
+}

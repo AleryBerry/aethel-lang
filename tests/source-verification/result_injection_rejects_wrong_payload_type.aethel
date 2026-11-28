@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let authored = Err(109): Result(u8, bool);
+  case authored {
+    Ok(value) -> value
+    Err(flag) -> if flag { 8 } else { 11 }
+  }
+}

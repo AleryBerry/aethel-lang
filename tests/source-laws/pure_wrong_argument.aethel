@@ -1,0 +1,3 @@
+law no_capture(value: Result(u8, bool)) {
+  always handles(other)
+}

@@ -145,4 +145,77 @@ theorem verifyResources_correct (program : Program) :
   exact ⟨fun ⟨_, ⟨final, traced, rfl⟩, closed⟩ => ⟨final, traced, closed⟩,
     fun ⟨final, traced, closed⟩ => ⟨final.resources, ⟨final, traced, rfl⟩, closed⟩⟩
 
+def Instruction.isByteAccess : Instruction → Bool
+  | .read .. | .write .. | .readView .. | .writeView .. => true
+  | _ => false
+
+inductive ByteAccess where
+  | read (location : ByteLocation)
+  | write (location : ByteLocation) (value : UInt8)
+  deriving Repr, DecidableEq
+
+/-- Resolve the byte used by a handle or a view using only entry metadata.
+This lookup describes the physical operand and carries no permission claim. -/
+def Instruction.byteAccess (resources : ResourceState) : Instruction → Option ByteAccess
+  | .read id => (resources.authorityState.handle id).map fun handle => .read handle.location
+  | .write id value => (resources.authorityState.handle id).map fun handle => .write handle.location value
+  | .readView id => (resources.authorityState.view id).map fun view => .read view.location
+  | .writeView id value => (resources.authorityState.view id).map fun view => .write view.location value
+  | _ => none
+
+theorem Step.resources_of_byteAccess {state next : State} {op : Instruction}
+    (step : Step state op next) (access : op.isByteAccess = true) :
+    next.resources = state.resources := by
+  cases step <;> simp_all [Instruction.isByteAccess]
+
+theorem Runs.resources_of_byteAccesses {state final : State} {program : Program}
+    (ran : Runs state program final) (accesses : program.all Instruction.isByteAccess = true) :
+    final.resources = state.resources := by
+  induction ran with
+  | nil => rfl
+  | cons step _ ih =>
+    obtain ⟨head, tail⟩ := Bool.and_eq_true_iff.mp accesses
+    exact (ih tail).trans (step.resources_of_byteAccess head)
+
+private theorem Runs.byteAccesses_ready {state final : State} {program : Program}
+    (ran : Runs state program final) (accesses : program.all Instruction.isByteAccess = true) :
+    ∀ op ∈ program, checkInstruction state.resources op = some state.resources := by
+  induction ran with
+  | nil => simp
+  | cons first _ ih =>
+    obtain ⟨head, tail⟩ := Bool.and_eq_true_iff.mp accesses
+    have unchanged := first.resources_of_byteAccess head
+    intro op member
+    rcases List.mem_cons.mp member with rfl | later
+    · rw [checkInstruction_correct, execute_complete first, Option.map_some, unchanged]
+    · simpa only [unchanged] using ih tail op later
+
+private theorem checkResources_unchanged {state : ResourceState} {program : Program}
+    (ready : ∀ op ∈ program, checkInstruction state op = some state) :
+    checkResources state program = some state := by
+  induction program with
+  | nil => rfl
+  | cons op rest ih =>
+    simp [checkResources, ready op List.mem_cons_self, ih (fun instr mem =>
+      ready instr (List.mem_cons_of_mem _ mem))]
+
+/-- Once authorized under the same reservations, byte accesses can be
+replayed from the same state without consuming any authority. -/
+theorem Runs.replay_byteAccesses {state final : State} {program replay : Program}
+    (ran : Runs state program final) (accesses : program.all Instruction.isByteAccess = true)
+    (included : ∀ op ∈ replay, op ∈ program) :
+    ∃ result, Runs state replay result ∧ result.resources = state.resources := by
+  have checked := checkResources_unchanged (fun op mem => ran.byteAccesses_ready accesses op (included op mem))
+  rw [checkResources_correct, Option.map_eq_some_iff] at checked
+  obtain ⟨result, executed, preserved⟩ := checked
+  exact ⟨result, run_sound executed, preserved⟩
+
+/-- Resource eligibility is independent of the schedule. The caller
+supplies the task-local order needed for value semantics. -/
+theorem Runs.reorder_byteAccesses {state final : State} {program reordered : Program}
+    (ran : Runs state program final) (accesses : program.all Instruction.isByteAccess = true)
+    (perm : program.Perm reordered) :
+    ∃ result, Runs state reordered result ∧ result.resources = state.resources :=
+  ran.replay_byteAccesses accesses (fun _ member => perm.mem_iff.mpr member)
+
 end Aethel.Core

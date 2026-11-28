@@ -1,0 +1,12 @@
+fn keep(value: u8) -> fn(()) -> u8 {
+  fn(unused: ()) { value }
+}
+
+fn twice(make: fn(u8) -> fn(()) -> u8) -> u8 {
+  let saved = make(92);
+  let other = make(11);
+  let values = (other(()), saved(()));
+  values.1
+}
+
+fn main() -> u8 { twice(keep) }

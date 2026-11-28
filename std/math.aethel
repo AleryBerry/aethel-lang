@@ -1,8 +1,8 @@
 //// Total, overflow-safe, Lean-verified integer math utilities.
 
 pub fn abs_i32(x: i32) -> u32 {
-  if x < 0i32 {
-    (0i64 - (x as i64)) as u32
+  if x < 0 {
+    (0 - (x as i64)) as u32
   } else {
     x as u32
   }
@@ -35,7 +35,7 @@ pub fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 {
 pub fn gcd_u32(a_in: u32, b_in: u32) -> u32 {
   let mut a: u32 = a_in
   let mut b: u32 = b_in
-  while b > 0u32 {
+  while b > 0 {
     let rem = a % b
     a = b
     b = rem
@@ -44,10 +44,10 @@ pub fn gcd_u32(a_in: u32, b_in: u32) -> u32 {
 }
 
 pub fn pow_u32(base: u32, exp: u32) -> u32 decreases exp {
-  if exp == 0u32 {
-    1u32
+  if exp == 0 {
+    1
   } else {
-    base *% pow_u32(base, exp - 1u32)
+    base *% pow_u32(base, exp - 1)
   }
 }
 
@@ -56,5 +56,5 @@ law abs_diff_sym(a: u8, b: u8) {
 }
 
 law clamp_upper(v: u8, hi: u8) {
-  always clamp_u32(v as u32, 0u32, hi as u32) <= (hi as u32)
+  always clamp_u32(v as u32, 0, hi as u32) <= (hi as u32)
 }

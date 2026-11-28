@@ -1,0 +1,19 @@
+type Triple { first: u8, second: u8, third: u8, }
+fn paint(triple: Triple ~>.{first, second}) {
+  fork {
+    { triple.first = 75; }
+    { triple.second = 76; }
+  } join;
+}
+fn main() -> u8 {
+  let mut triple = Triple { first: 42, second: 11, third: 9, };
+  view exclusive keep = triple.third {
+    paint(triple);
+    if keep != 9 {
+      triple.second = 0;
+    } else {
+      let _ = triple.second;
+    };
+  };
+  triple.second
+}

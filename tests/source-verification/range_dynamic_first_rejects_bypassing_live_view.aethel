@@ -1,0 +1,9 @@
+type Meter { first: u8, total: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { first: 7, total: 51, };
+  view exclusive beginning = meter.first {
+    for _ in meter.first..3 { meter.total = 0; };
+    let _ = beginning;
+  };
+  meter.total
+}

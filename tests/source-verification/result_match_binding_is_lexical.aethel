@@ -1,0 +1,10 @@
+fn main() -> u8 {
+  let code = 105;
+  let result = Err(12): Result(bool, u8);
+  let picked = case result {
+    Ok(code) -> if code { 1 } else { 0 }
+    Err(code) -> code
+  };
+  let snapshot = (picked, code);
+  snapshot.1
+}

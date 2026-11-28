@@ -417,11 +417,6 @@ pub fn parsePrimitiveType(lexeme: []const u8) ?PrimitiveType {
     return null;
 }
 
-const float_suffixes = std.StaticStringMap(void).initComptime(.{
-    .{ "f32" },
-    .{ "f64" },
-});
-
 /// Zero-allocation, sentinel-terminated streaming lexer for Aethel source buffers.
 pub const Lexer = struct {
     source: [:0]const u8,
@@ -779,7 +774,7 @@ pub const Lexer = struct {
             if (exp_digits == 0) invalid = true;
         }
 
-        return self.finishNumberWithSuffix(start, i, is_float, prev_underscore, invalid);
+        return self.finishNumber(start, i, is_float, prev_underscore, invalid);
     }
 
     fn lexRadixNumber(self: *Lexer, start: usize, comptime radix: u8) Token {
@@ -803,10 +798,10 @@ pub const Lexer = struct {
         }
 
         if (!had_digit) invalid = true;
-        return self.finishNumberWithSuffix(start, i, false, prev_underscore, invalid);
+        return self.finishNumber(start, i, false, prev_underscore, invalid);
     }
 
-    fn finishNumberWithSuffix(
+    fn finishNumber(
         self: *Lexer,
         start: usize,
         mantissa_end: usize,
@@ -816,21 +811,12 @@ pub const Lexer = struct {
     ) Token {
         const len = self.source.len;
         var i = mantissa_end;
-        var invalid = mantissa_invalid;
+        var invalid = mantissa_invalid or trailing_underscore;
 
-        // If alphanumeric or underscore characters follow immediately, consume them as an
-        // attached suffix (allowing a single `_` separator strictly before a valid suffix,
-        // such as `0xff_u8` or `1_000_u32`).
+        // Glued alphanumeric/underscore suffixes (e.g. `32u8`, `1.5f32`, `123abc`) are rejected
+        // while still consuming the full run so error recovery stays aligned.
         if (i < len and isIdentContinue(self.source[i])) {
-            const suffix_start = i;
             while (i < len and isIdentContinue(self.source[i])) : (i += 1) {}
-            const suffix = self.source[suffix_start..i];
-            const ok = if (is_float)
-                float_suffixes.has(suffix)
-            else
-                parseIntWidth(suffix) != null;
-            if (!ok) invalid = true;
-        } else if (trailing_underscore) {
             invalid = true;
         }
 

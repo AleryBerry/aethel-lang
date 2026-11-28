@@ -1,0 +1,12 @@
+type Pair { left: u8, right: u8, }
+fn set_right(target: Pair ~>.{right}) {
+  target.right = 31;
+}
+fn bad(target: Pair ~>.{left}) {
+  set_right(target);
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 23, };
+  bad(pair);
+  pair.right
+}

@@ -1,0 +1,9 @@
+fn choose(on: bool, values: (u8, u8)) -> u8 {
+  if on { values.0 } else { values.1 }
+}
+
+fn invoke(select: fn((bool, (u8, u8))) -> u8, values: (u8, u8)) -> u8 {
+  select(false, values)
+}
+
+fn main() -> u8 { invoke(choose, (44, 96)) }

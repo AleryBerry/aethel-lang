@@ -1,0 +1,12 @@
+type Pair { left: u8, right: u8, }
+fn clear(pair: Pair ~>.{right}) {
+  pair.right = 0;
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 2, right: 20, };
+  pair.left = 0;
+  for _ in 0..pair.left {
+    clear(pair);
+  };
+  pair.right
+}

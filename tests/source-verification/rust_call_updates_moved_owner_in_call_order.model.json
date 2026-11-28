@@ -1,0 +1,13 @@
+[
+  {
+    "target": {"package": "batch", "symbol": "last"},
+    "accesses": [{"address": {"argument": 0, "byte": 0}, "write": 90}]
+  },
+  {
+    "target": {"package": "batch", "symbol": "first"},
+    "accesses": [
+      {"address": {"argument": 1, "byte": 0}, "write": null},
+      {"address": {"argument": 0, "byte": 0}, "write": 26}
+    ]
+  }
+]

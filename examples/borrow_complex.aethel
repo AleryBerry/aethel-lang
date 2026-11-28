@@ -59,7 +59,7 @@ fn inspect_then_boost(ship: Spaceship ~>.{x, vx, thruster_on}) -> i32 {
     // While `rx` holds a shared reservation on `ship.x`, mutating `ship.x` is forbidden.
     // Reading `ship.x` (and mutating disjoint sibling `ship.thruster_on`) is allowed:
     snapshot = ship.x
-    ship.thruster_on = 1u1
+    ship.thruster_on = 1
   }
   // Shared view `rx` has ended; exclusive authority over `ship.x` is restored:
   ship.x = snapshot +% (ship.vx as i32)
@@ -71,7 +71,7 @@ fn inspect_then_boost(ship: Spaceship ~>.{x, vx, thruster_on}) -> i32 {
 fn lock_both_subsystems(mut locks: ConcurrentLocks) -> u1 {
   view exclusive va = locks.nav_lock {
     view exclusive vb = locks.weapons_lock {
-      locks.weapons_lock = 1u1
+      locks.weapons_lock = 1
     }
   }
   locks.weapons_lock

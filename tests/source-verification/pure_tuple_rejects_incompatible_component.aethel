@@ -1,0 +1,4 @@
+fn main() -> u8 {
+  let inspect = fn(value: (u8, bool)) { if value.1 { value.0 } else { 0 } };
+  inspect((true, 11))
+}

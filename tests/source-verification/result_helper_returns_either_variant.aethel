@@ -1,0 +1,12 @@
+fn read_status(ok: bool) -> Result(u8, bool) {
+  if ok { Ok(32): Result(u8, bool) } else { Err(true): Result(u8, bool) }
+}
+fn recover(result: Result(u8, bool)) -> u8 {
+  case result {
+    Ok(value) -> value
+    Err(retry) -> if retry { 19 } else { 23 }
+  }
+}
+fn main() -> u8 {
+  recover(read_status(false))
+}

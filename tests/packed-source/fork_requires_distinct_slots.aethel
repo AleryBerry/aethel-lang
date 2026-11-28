@@ -1,0 +1,9 @@
+type Sample { wide: u35, flag: u5, }
+fn main() -> u5 {
+  let mut row = Sample { wide: 3, flag: 1, };
+  fork {
+    { row.wide = 32; }
+    { row.flag = 17; }
+  } join;
+  row.flag
+}

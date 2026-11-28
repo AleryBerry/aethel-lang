@@ -1,0 +1,14 @@
+@layout(aosoa(2))
+type Tile { fuel: u8, next: u8, }
+fn main() -> u8 {
+  let mut tiles: Collection(Tile) = [
+    Tile { fuel: 48, next: 2, },
+    Tile { fuel: 38, next: 0, },
+    Tile { fuel: 57, next: 1, },
+  ];
+  let target = tiles[0].next;
+  if target < 3 {
+    tiles[target].fuel = tiles[1].fuel;
+  } else { };
+  tiles[2].fuel
+}

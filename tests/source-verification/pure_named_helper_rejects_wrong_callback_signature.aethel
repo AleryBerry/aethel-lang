@@ -1,0 +1,5 @@
+fn apply(transform: fn(u8) -> u8) -> u8 { transform(74) }
+
+fn choose(flag: bool) -> u8 { if flag { 12 } else { 19 } }
+
+fn main() -> u8 { apply(choose) }

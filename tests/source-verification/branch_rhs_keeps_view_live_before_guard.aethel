@@ -1,0 +1,10 @@
+type Pair { left: u8, right: u8, out: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 53, right: 10, out: 4, };
+  view shared held = pair.right {
+    let _ = held;
+    pair.right = 18;
+    if pair.left > held { pair.out = 57; } else { };
+  };
+  pair.out
+}

@@ -15,16 +15,17 @@ def FieldAt (source : Source) (root : String) (paths : List String)
 private def ContractSlot (source : Source) (paths : List String) (offset : Nat) : Prop :=
   ∃ field value, source.fields[offset]? = some (field, value) ∧ field ∈ paths
 
-inductive StoresAt (source : Source) (root : String) (paths : List String) :
-    SourceStoreTask → StoreTask → Prop where
-  | done : StoresAt source root paths [] []
-  | next : FieldAt source root paths field offset → StoresAt source root paths tail resolved →
-      StoresAt source root paths ((field, value) :: tail) ((offset, value) :: resolved)
+inductive TaskAccessesAt (source : Source) (root : String) (paths : List String) :
+    SourceTask → ByteTask → Prop where
+  | done : TaskAccessesAt source root paths [] []
+  | next {access : TaskAccess FieldPath} :
+      FieldAt source root paths access.target offset → TaskAccessesAt source root paths tail resolved →
+      TaskAccessesAt source root paths (access :: tail) (access.map (fun _ => offset) :: resolved)
 
 inductive TasksAt (source : Source) (root : String) (paths : List String) :
-    List SourceStoreTask → List StoreTask → Prop where
+    List SourceTask → List ByteTask → Prop where
   | empty : TasksAt source root paths [] []
-  | next : StoresAt source root paths task resolved → TasksAt source root paths tail loweredTail →
+  | next : TaskAccessesAt source root paths task resolved → TasksAt source root paths tail loweredTail →
       TasksAt source root paths (task :: tail) (resolved :: loweredTail)
 
 abbrev Callees := List (String × FunctionMIR)
@@ -141,9 +142,9 @@ inductive Lowers (source : Source) (callees : Callees) (root : String) (paths : 
       Lowers source callees root paths scopes (inside.loanWindow binding).after tail →
       Lowers source callees root paths scopes (.bindView binding name argument inside)
         (.call name callee.body (.withView mode offset body tail))
-  | forkStores : TasksAt source root paths tasks resolved →
+  | fork : TasksAt source root paths tasks resolved →
       Lowers source callees root paths scopes next rest →
-      Lowers source callees root paths scopes (.forkStores tasks next) (.forkStores resolved rest)
+      Lowers source callees root paths scopes (.fork tasks next) (.fork resolved rest)
 
 private def fieldNames (source : Source) : List String := source.fields.map Prod.fst
 
@@ -189,9 +190,9 @@ private theorem FieldAt.unique {source : Source} {root : String} {paths : List S
   · simp [fieldNames, List.getElem?_map, leftField]
   · simp [fieldNames, List.getElem?_map, rightField]
 
-private theorem StoresAt.unique {source : Source} {root : String} {paths : List String}
-    {task : SourceStoreTask} {first second : StoreTask}
-    (left : StoresAt source root paths task first) (right : StoresAt source root paths task second)
+private theorem TaskAccessesAt.unique {source : Source} {root : String} {paths : List String}
+    {task : SourceTask} {first second : ByteTask}
+    (left : TaskAccessesAt source root paths task first) (right : TaskAccessesAt source root paths task second)
     (fields : (fieldNames source).Nodup) : first = second := by
   induction left generalizing second with
   | done => cases right; rfl
@@ -200,7 +201,7 @@ private theorem StoresAt.unique {source : Source} {root : String} {paths : List 
     | next field tail => rw [target.unique field fields, ih tail]
 
 private theorem TasksAt.unique {source : Source} {root : String} {paths : List String}
-    {tasks : List SourceStoreTask} {first second : List StoreTask}
+    {tasks : List SourceTask} {first second : List ByteTask}
     (left : TasksAt source root paths tasks first) (right : TasksAt source root paths tasks second)
     (fields : (fieldNames source).Nodup) : first = second := by
   induction left generalizing second with
@@ -333,9 +334,9 @@ theorem Lowers.unique {source : Source} {callees : Callees} {root : String}
       cases callee.unique invoked
       obtain ⟨rfl, rfl⟩ := FunctionResult.view.inj (result.symm.trans returned)
       rw [inner body (List.nodup_cons.mpr ⟨fresh, views⟩), suffix rest views]
-  | forkStores tasks _ after =>
+  | fork tasks _ after =>
     cases second with
-    | forkStores same rest => rw [tasks.unique same names, after rest views]
+    | fork same rest => rw [tasks.unique same names, after rest views]
 
 def Contract (source : Source) (paths : List String) : Prop :=
   paths.Nodup ∧ (∀ field ∈ paths, field ∈ fieldNames source)
@@ -494,26 +495,27 @@ private theorem WriteAt.contractSlot {source : Source} {root : String} {paths : 
   | field resolved => exact resolved.contractSlot
   | view _ contracted => exact contracted
 
-private theorem StoresAt.writeWithin {source : Source} {root : String} {paths : List String}
-    {statements : SourceStoreTask} {task : StoreTask} (lowered : StoresAt source root paths statements task)
-    {offset : Nat} (written : offset ∈ task.map Prod.fst) :
-    ∃ field initial, source.fields[offset]? = some (field, initial) ∧ field ∈ paths := by
+private theorem TaskAccessesAt.writeWithin {source : Source} {root : String} {paths : List String}
+    {statements : SourceTask} {task : ByteTask} (lowered : TaskAccessesAt source root paths statements task)
+    {offset : Nat} (written : offset ∈ task.writes) : ContractSlot source paths offset := by
   induction lowered with
   | done => cases written
   | next target _ ih =>
-    rcases List.mem_cons.mp written with rfl | remaining
-    · exact target.contractSlot
-    · exact ih remaining
+    cases ‹TaskAccess FieldPath› with
+    | read field => exact ih written
+    | write field value =>
+      rcases List.mem_cons.mp written with rfl | remaining
+      · exact target.contractSlot
+      · exact ih remaining
 
 private theorem TasksAt.writeWithin {source : Source} {root : String} {paths : List String}
-    {statements : List SourceStoreTask} {tasks : List StoreTask}
+    {statements : List SourceTask} {tasks : List ByteTask}
     (lowered : TasksAt source root paths statements tasks)
-    {offset : Nat} (written : offset ∈ tasks.flatten.map Prod.fst) :
-    ∃ field initial, source.fields[offset]? = some (field, initial) ∧ field ∈ paths := by
+    {offset : Nat} (written : offset ∈ ByteTask.writes tasks.flatten) : ContractSlot source paths offset := by
   induction lowered with
   | empty => cases written
   | next task _ ih =>
-    simp only [List.flatten_cons, List.map_append, List.mem_append] at written
+    simp only [List.flatten_cons, ByteTask.writes, List.filterMap_append, List.mem_append] at written
     exact written.elim task.writeWithin ih
 
 private def Callees.WriteContracts (source : Source) (callees : Callees) : Prop :=
@@ -581,7 +583,7 @@ theorem Lowers.writesWithin {source : Source} {callees : Callees} {root : String
     rcases List.mem_append.mp written with called | remaining
     · exact ((known _ _ callee.found).weaken callee.covered) offset called
     · exact (List.mem_append.mp remaining).elim inside after
-  | forkStores tasks _ after =>
+  | fork tasks _ after =>
     exact (List.mem_append.mp written).elim tasks.writeWithin after
 
 theorem Declares.writesWithin {source : Source} {callees : Callees} {helpers : List Helper}
@@ -701,19 +703,19 @@ private def lowerReturn (source : Source) (root : String) (paths : List String) 
     let offset ← resolveField source root paths field
     return ⟨.view mode offset.val, .view offset.property⟩
 
-private def lowerStores (source : Source) (root : String) (paths : List String) :
-    (task : SourceStoreTask) → Except Error (Subtype (StoresAt source root paths task))
+private def lowerTask (source : Source) (root : String) (paths : List String) :
+    (task : SourceTask) → Except Error (Subtype (TaskAccessesAt source root paths task))
   | [] => .ok ⟨[], .done⟩
-  | (field, value) :: tail => do
-    let target ← resolveField source root paths field
-    let rest ← lowerStores source root paths tail
-    return ⟨(target.val, value) :: rest.val, .next target.property rest.property⟩
+  | access :: tail => do
+    let target ← resolveField source root paths access.target
+    let rest ← lowerTask source root paths tail
+    return ⟨access.map (fun _ => target.val) :: rest.val, .next target.property rest.property⟩
 
 private def lowerTasks (source : Source) (root : String) (paths : List String) :
-    (tasks : List SourceStoreTask) → Except Error (Subtype (TasksAt source root paths tasks))
+    (tasks : List SourceTask) → Except Error (Subtype (TasksAt source root paths tasks))
   | [] => .ok ⟨[], .empty⟩
   | next :: tail => do
-    let task ← lowerStores source root paths next
+    let task ← lowerTask source root paths next
     let rest ← lowerTasks source root paths tail
     return ⟨task.val :: rest.val, .next task.property rest.property⟩
 
@@ -815,10 +817,10 @@ private def lowerBody (source : Source) (callees : Callees) (root : String) (pat
       return ⟨.call name callee.val.body (.withView mode offset loan.val.1 loan.val.2),
         .bindView callee.property returns fresh.down.1 fresh.down.2 loan.property.1 loan.property.2⟩
     | _ => throw (.invalidCallResult name)
-  | .forkStores tasks next => do
+  | .fork tasks next => do
     let lowered ← lowerTasks source root paths tasks
     let rest ← lowerBody source callees root paths scopes next
-    return ⟨.forkStores lowered.val rest.val, .forkStores lowered.property rest.property⟩
+    return ⟨.fork lowered.val rest.val, .fork lowered.property rest.property⟩
 termination_by body => sizeOf body
 decreasing_by
   all_goals simp_wf <;> omega
@@ -854,21 +856,27 @@ private def lower (source : Source) : Except Error (Subtype (SourceTrace source)
       fields.1, fields.2, rfl, rfl, rfl, moves.down, rfl, functions.property, body.property, result.property⟩
   else throw (.syntax "at least one distinct record field")
 
-structure Verified (input : String) where
+structure CheckedRecord where
   source : Source
   mir : SourceMIR
-  spelled : tokens input = source.tokens
   lowers : SourceTrace source mir
   checked : mir.check = true
+
+def checkRecord (source : Source) : Except Error { record : CheckedRecord // record.source = source } := do
+  let lowered ← lower source
+  if safe : lowered.val.check = true then
+    return ⟨⟨source, lowered.val, lowered.property, safe⟩, rfl⟩
+  else throw .resourceConflict
+
+structure Verified (input : String) extends CheckedRecord where
+  spelled : tokens input = source.tokens
 
 /-- Check the actual source and build its operations in the reference MIR. -/
 def verify (input : String) : Except Error (Verified input) := do
   let source ← parseSource (tokens input)
   if spelled : tokens input = source.tokens then
-    let lowered ← lower source
-    if safe : lowered.val.check = true then
-      return ⟨source, lowered.val, spelled, lowered.property, safe⟩
-    else throw .resourceConflict
+    let ⟨accepted, same⟩ ← checkRecord source
+    return ⟨accepted, same ▸ spelled⟩
   else throw (.syntax "canonical record fragment")
 
 theorem Verified.executes {input : String} (accepted : Verified input) :
@@ -882,12 +890,7 @@ theorem Verified.prefix_safe {input : String} (accepted : Verified input) {first
       middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible := by
   obtain ⟨_, checkedFinal, checkedRun, closed⟩ := accepted.executes
   have same : final = checkedFinal := congrArg Prod.snd (Option.some.inj (ran.agrees.symm.trans checkedRun.agrees))
-  have finalClosed : final.views = [] := same ▸ closed
-  obtain ⟨middle, _, initial, _, _, owners, live, views⟩ :=
-    Core.verified_prefix_safe ((verifyResources_correct _).mpr ⟨final, ran.trace, finalClosed⟩)
-  have traced := run_complete ran.trace
-  rw [run_append, run_complete initial] at traced
-  exact ⟨middle, initial, Core.run_sound traced, finalClosed, owners, live, views⟩
+  exact ran.prefix_safe (same ▸ closed)
 
 def execute {input : String} (accepted : Verified input) : Option UInt8 :=
   accepted.mir.run.bind fun state => state.observations.head?

@@ -27,6 +27,8 @@ structure MIRRecordDecl where
   name : String
   fields : List Schema
   conflicts : List (Nat × Nat) := []
+  addressable : List Nat := []
+  isFlat : Bool := false
   claimedSize : Option Nat := none
   deriving Repr
 
@@ -104,11 +106,33 @@ structure MIRCertificate where
   lawCount : Nat := 0
   deriving Repr, DecidableEq
 
+def planMIRRecord (r : MIRRecordDecl) : Option Layout :=
+  let g : CoBorrowGraph := ⟨r.fields.length, r.conflicts⟩
+  let schema := applyPolicies g r.fields r.addressable
+  if r.isFlat then AutomaticLayout.planWithFlat .natural schema [[]]
+  else autoPlan .natural g r.fields r.addressable
+
+theorem planMIRRecord_sound {r : MIRRecordDecl} {lay : Layout}
+    (hPlan : planMIRRecord r = some lay) :
+    let g : CoBorrowGraph := ⟨r.fields.length, r.conflicts⟩
+    Conforms .natural (applyPolicies g r.fields r.addressable) lay ∧
+      (r.isFlat = true → lay.RespectsFlat [[]]) := by
+  dsimp [planMIRRecord] at hPlan
+  split at hPlan
+  · next hFlat =>
+    obtain ⟨hConf, hResp⟩ := AutomaticLayout.planWithFlat_sound hPlan
+    exact ⟨hConf, fun _ => hResp⟩
+  · next hNotFlat =>
+    refine ⟨autoPlan_conforms hPlan, fun hFlat => ?_⟩
+    rw [hFlat] at hNotFlat
+    contradiction
+
 /-- Independent mathematical specification of a valid MIR module. -/
 def MIRRecordDecl.Valid (r : MIRRecordDecl) : Prop :=
   let g : CoBorrowGraph := ⟨r.fields.length, r.conflicts⟩
-  ∃ lay, autoPlan .natural g r.fields = some lay ∧
-    Conforms .natural (applyPolicies g r.fields) lay ∧
+  ∃ lay, planMIRRecord r = some lay ∧
+    Conforms .natural (applyPolicies g r.fields r.addressable) lay ∧
+    (r.isFlat = true → lay.RespectsFlat [[]]) ∧
     (∀ size alignment placed, lay = .record size alignment placed → PackingConflictFree g placed) ∧
     (∀ sz, r.claimedSize = some sz → lay.size = sz)
 
@@ -161,8 +185,7 @@ def MIRModule.Valid (m : MIRModule) : Prop :=
   (∀ l ∈ m.laws, l.Valid)
 
 def validateRecord (r : MIRRecordDecl) : Except MIRError (String × Nat) :=
-  let g : CoBorrowGraph := ⟨r.fields.length, r.conflicts⟩
-  match autoPlan .natural g r.fields with
+  match planMIRRecord r with
   | none => .error (.invalidRecordLayout r.name)
   | some lay =>
     match r.claimedSize with
@@ -233,17 +256,17 @@ theorem validateRecord_sound {r : MIRRecordDecl} {pair : String × Nat}
     (hOk : validateRecord r = .ok pair) :
     r.Valid := by
   dsimp [validateRecord] at hOk
-  let g : CoBorrowGraph := ⟨r.fields.length, r.conflicts⟩
-  cases hPlan : autoPlan .natural g r.fields with
+  cases hPlan : planMIRRecord r with
   | none =>
     rw [hPlan] at hOk
     cases hOk
   | some lay =>
     rw [hPlan] at hOk
-    refine ⟨lay, hPlan, autoPlan_conforms hPlan, ?_, ?_⟩
+    obtain ⟨hConf, hFlat⟩ := planMIRRecord_sound hPlan
+    refine ⟨lay, hPlan, hConf, hFlat, ?_, ?_⟩
     · intro size alignment placed hEq
       subst hEq
-      exact autoPlan_conflict_free hPlan
+      exact conforms_conflict_free hConf
     · intro sz hClaim
       rw [hClaim] at hOk
       dsimp only at hOk
@@ -692,10 +715,10 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
       | .ok c => return { st with mod := { st.mod with collections := st.mod.collections ++ [c] } }
       | .error e => .error s!"invalid dynamic vector '{name}': {reprStr e}"
     | ["record", name] =>
-      return { st with block := .inRecord ⟨name, [], [], none⟩ }
+      return { st with block := .inRecord { name := name, fields := [] } }
     | ["record", name, szTok] =>
       let sz ← parseNatTok szTok
-      return { st with block := .inRecord ⟨name, [], [], some sz⟩ }
+      return { st with block := .inRecord { name := name, fields := [], claimedSize := some sz } }
     | ["fn", name] =>
       return { st with block := .inFn { name := name, effects := .empty, preserves := [], body := [] } }
     | ["law_always", name] =>
@@ -714,6 +737,11 @@ private def stepParseLine (st : ParseState) (line : String) : Except String Pars
       let i ← parseNatTok iTok
       let j ← parseNatTok jTok
       return { st with block := .inRecord { r with conflicts := r.conflicts ++ [(i, j)] } }
+    | ["addressable", iTok] =>
+      let i ← parseNatTok iTok
+      return { st with block := .inRecord { r with addressable := r.addressable ++ [i] } }
+    | ["flat"] =>
+      return { st with block := .inRecord { r with isFlat := true } }
     | ["end_record"] =>
       return { st with
         mod := { st.mod with records := st.mod.records ++ [r] }
@@ -903,7 +931,7 @@ theorem validateMIR_accepts_valid_module :
   exact ⟨hOk, validateMIR_sound hOk⟩
 
 theorem validateMIR_rejects_forged_size (r : MIRRecordDecl) {lay : Layout} {sz : Nat}
-    (hPlan : autoPlan .natural ⟨r.fields.length, r.conflicts⟩ r.fields = some lay)
+    (hPlan : planMIRRecord r = some lay)
     (hClaim : r.claimedSize = some sz) (hNe : lay.size ≠ sz) :
     ∃ err, validateMIR { version := currentMIRVersion, records := [r] } = .error err := by
   refine ⟨.staleLayoutSize r.name sz lay.size, ?_⟩

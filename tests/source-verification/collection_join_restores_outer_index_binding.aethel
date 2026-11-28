@@ -1,0 +1,19 @@
+@layout(soa)
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut rows: Collection(Pair) = [
+    Pair { left: 73, right: 0, },
+    Pair { left: 92, right: 1, },
+  ];
+  let index = rows[0].right;
+  if index < 2 {
+    let index = rows[1].right;
+    if index < 2 {
+      rows[index].left = 21;
+    } else { };
+  } else { };
+  if index < 2 {
+    rows[index].right = rows[index].left;
+  } else { };
+  rows[0].right
+}

@@ -47,6 +47,10 @@ pub const modules = [_]StdModule{
         \\  fn eq(x: i8, y: i8) -> bool { x == y }
         \\}
         \\
+        \\pub default instance eq_u64: Eq(u64) {
+        \\  fn eq(x: u64, y: u64) -> bool { x == y }
+        \\}
+        \\
         \\pub default instance eq_bool: Eq(bool) {
         \\  fn eq(x: bool, y: bool) -> bool { (x && y) || (!x && !y) }
         \\}
@@ -129,12 +133,12 @@ pub const modules = [_]StdModule{
         \\}
         \\
         \\pub default instance sum_u32: Monoid(u32) {
-        \\  fn empty() -> u32 { 0u32 }
+        \\  fn empty() -> u32 { 0 }
         \\  fn combine(x: u32, y: u32) -> u32 { x +| y }
         \\}
         \\
         \\pub instance max_u32: Monoid(u32) {
-        \\  fn empty() -> u32 { 0u32 }
+        \\  fn empty() -> u32 { 0 }
         \\  fn combine(x: u32, y: u32) -> u32 { max(x, y) }
         \\}
         \\
@@ -181,6 +185,92 @@ pub const modules = [_]StdModule{
         \\    acc = combine(acc, x)
         \\  }
         \\  acc
+        \\}
+        \\
+        \\pub trait FromInt(a) {
+        \\  fn from_int(n: i32) -> a
+        \\}
+        \\
+        \\pub trait Semiring(a) <= FromInt(a) {
+        \\  fn zero() -> a
+        \\  fn one() -> a
+        \\  fn add(x: a, y: a) -> a
+        \\  fn mul(x: a, y: a) -> a
+        \\}
+        \\
+        \\pub trait Ring(a) <= Semiring(a) {
+        \\  fn neg(x: a) -> a
+        \\  fn sub(x: a, y: a) -> a
+        \\}
+        \\
+        \\pub trait Field(a) <= Ring(a) {
+        \\  fn div(x: a, y: a) -> a
+        \\}
+        \\
+        \\pub default instance semiring_u32: Semiring(u32) {
+        \\  fn from_int(n: i32) -> u32 { if n < 0 { 0 } else { n as u32 } }
+        \\  fn zero() -> u32 { 0 }
+        \\  fn one() -> u32 { 1 }
+        \\  fn add(x: u32, y: u32) -> u32 { x +% y }
+        \\  fn mul(x: u32, y: u32) -> u32 { x *% y }
+        \\}
+        \\
+        \\pub default instance semiring_u64: Semiring(u64) {
+        \\  fn from_int(n: i32) -> u64 { if n < 0 { 0 } else { n as u64 } }
+        \\  fn zero() -> u64 { 0 }
+        \\  fn one() -> u64 { 1 }
+        \\  fn add(x: u64, y: u64) -> u64 { x +% y }
+        \\  fn mul(x: u64, y: u64) -> u64 { x *% y }
+        \\}
+        \\
+        \\pub default instance ring_i32: Ring(i32) {
+        \\  fn from_int(n: i32) -> i32 { n }
+        \\  fn zero() -> i32 { 0 }
+        \\  fn one() -> i32 { 1 }
+        \\  fn add(x: i32, y: i32) -> i32 { x +% y }
+        \\  fn mul(x: i32, y: i32) -> i32 { x *% y }
+        \\  fn neg(x: i32) -> i32 { 0 -% x }
+        \\  fn sub(x: i32, y: i32) -> i32 { x -% y }
+        \\}
+        \\
+        \\pub default instance ring_i64: Ring(i64) {
+        \\  fn from_int(n: i32) -> i64 { n }
+        \\  fn zero() -> i64 { 0 }
+        \\  fn one() -> i64 { 1 }
+        \\  fn add(x: i64, y: i64) -> i64 { x +% y }
+        \\  fn mul(x: i64, y: i64) -> i64 { x *% y }
+        \\  fn neg(x: i64) -> i64 { 0 -% x }
+        \\  fn sub(x: i64, y: i64) -> i64 { x -% y }
+        \\}
+        \\
+        \\pub default instance field_f32: Field(f32) {
+        \\  fn from_int(n: i32) -> f32 { n as f32 }
+        \\  fn zero() -> f32 { 0.0 }
+        \\  fn one() -> f32 { 1.0 }
+        \\  fn add(x: f32, y: f32) -> f32 { x + y }
+        \\  fn mul(x: f32, y: f32) -> f32 { x * y }
+        \\  fn neg(x: f32) -> f32 { -x }
+        \\  fn sub(x: f32, y: f32) -> f32 { x - y }
+        \\  fn div(x: f32, y: f32) -> f32 { x / y }
+        \\}
+        \\
+        \\pub default instance field_f64: Field(f64) {
+        \\  fn from_int(n: i32) -> f64 { n }
+        \\  fn zero() -> f64 { 0.0 }
+        \\  fn one() -> f64 { 1.0 }
+        \\  fn add(x: f64, y: f64) -> f64 { x + y }
+        \\  fn mul(x: f64, y: f64) -> f64 { x * y }
+        \\  fn neg(x: f64) -> f64 { -x }
+        \\  fn sub(x: f64, y: f64) -> f64 { x - y }
+        \\  fn div(x: f64, y: f64) -> f64 { x / y }
+        \\}
+        \\
+        \\law ring_i8_add_comm(x: i8, y: i8) {
+        \\  always (x +% y) == (y +% x)
+        \\}
+        \\
+        \\law ring_i8_sub_neg(x: i8, y: i8) {
+        \\  always (x -% y) == (x +% (0 -% y))
         \\}
         \\
         ,
@@ -331,8 +421,8 @@ pub const modules = [_]StdModule{
         \\//// Total, overflow-safe, Lean-verified integer math utilities.
         \\
         \\pub fn abs_i32(x: i32) -> u32 {
-        \\  if x < 0i32 {
-        \\    (0i64 - (x as i64)) as u32
+        \\  if x < 0 {
+        \\    (0 - (x as i64)) as u32
         \\  } else {
         \\    x as u32
         \\  }
@@ -365,7 +455,7 @@ pub const modules = [_]StdModule{
         \\pub fn gcd_u32(a_in: u32, b_in: u32) -> u32 {
         \\  let mut a: u32 = a_in
         \\  let mut b: u32 = b_in
-        \\  while b > 0u32 {
+        \\  while b > 0 {
         \\    let rem = a % b
         \\    a = b
         \\    b = rem
@@ -374,10 +464,10 @@ pub const modules = [_]StdModule{
         \\}
         \\
         \\pub fn pow_u32(base: u32, exp: u32) -> u32 decreases exp {
-        \\  if exp == 0u32 {
-        \\    1u32
+        \\  if exp == 0 {
+        \\    1
         \\  } else {
-        \\    base *% pow_u32(base, exp - 1u32)
+        \\    base *% pow_u32(base, exp - 1)
         \\  }
         \\}
         \\
@@ -386,7 +476,7 @@ pub const modules = [_]StdModule{
         \\}
         \\
         \\law clamp_upper(v: u8, hi: u8) {
-        \\  always clamp_u32(v as u32, 0u32, hi as u32) <= (hi as u32)
+        \\  always clamp_u32(v as u32, 0, hi as u32) <= (hi as u32)
         \\}
         \\
         ,
@@ -433,7 +523,7 @@ pub const modules = [_]StdModule{
         \\////   vec.clear(v) / vec.as_slice(v) / vec.as_mut_slice(v) / vec.as_collection(v)
         \\
         \\pub fn initial_capacity() -> u64 {
-        \\  8u64
+        \\  8
         \\}
         \\
         ,
@@ -453,11 +543,11 @@ pub const modules = [_]StdModule{
         \\////   map.contains(m, k) / map.remove(m, k) / map.clear(m)
         \\
         \\pub fn load_factor_numerator() -> u32 {
-        \\  7u32
+        \\  7
         \\}
         \\
         \\pub fn load_factor_denominator() -> u32 {
-        \\  8u32
+        \\  8
         \\}
         \\
         ,
@@ -475,7 +565,7 @@ pub const modules = [_]StdModule{
         \\////   set.insert(s, x) / set.contains(s, x) / set.remove(s, x) / set.clear(s)
         \\
         \\pub fn empty_count() -> u64 {
-        \\  0u64
+        \\  0
         \\}
         \\
         ,
@@ -494,7 +584,106 @@ pub const modules = [_]StdModule{
         \\////   deque.pop_front(d) / deque.pop_back(d) / deque.get(d, i) / deque.clear(d)
         \\
         \\pub fn empty_count() -> u64 {
-        \\  0u64
+        \\  0
+        \\}
+        \\
+        ,
+    },
+    .{
+        .key = "std/complex",
+        .source =
+        \\//// Complex numbers over commutative Semiring/Ring/Field types,
+        \\//// verified in `Aethel.ComplexModel`.
+        \\
+        \\import std/cmp.{Eq, eq}
+        \\import std/traits.{FromInt, Semiring, Ring, Field, from_int, zero, one, add, mul, neg, sub, div}
+        \\
+        \\pub type Complex(a) {
+        \\  pub re: a,
+        \\  pub im: a,
+        \\}
+        \\
+        \\pub fn complex(re: a, im: a) -> Complex(a) {
+        \\  Complex { re: re, im: im }
+        \\}
+        \\
+        \\pub fn i_unit() -> Complex(a) with Semiring(a) {
+        \\  Complex { re: zero(), im: one() }
+        \\}
+        \\
+        \\pub fn conj(z: Complex(a)) -> Complex(a) with Ring(a) {
+        \\  Complex { re: z.re, im: -z.im }
+        \\}
+        \\
+        \\pub fn norm_sq(z: Complex(a)) -> a with Ring(a) {
+        \\  z.re * z.re + z.im * z.im
+        \\}
+        \\
+        \\pub default instance complex_eq: Eq(Complex(a)) with Eq(a) {
+        \\  fn eq(x: Complex(a), y: Complex(a)) -> bool {
+        \\    eq(x.re, y.re) && eq(x.im, y.im)
+        \\  }
+        \\}
+        \\
+        \\pub default instance complex_ring: Ring(Complex(a)) with Ring(a) {
+        \\  fn from_int(n: i32) -> Complex(a) {
+        \\    Complex { re: from_int(n), im: zero() }
+        \\  }
+        \\  fn zero() -> Complex(a) {
+        \\    Complex { re: zero(), im: zero() }
+        \\  }
+        \\  fn one() -> Complex(a) {
+        \\    Complex { re: one(), im: zero() }
+        \\  }
+        \\  fn add(x: Complex(a), y: Complex(a)) -> Complex(a) {
+        \\    Complex { re: x.re + y.re, im: x.im + y.im }
+        \\  }
+        \\  fn mul(x: Complex(a), y: Complex(a)) -> Complex(a) {
+        \\    Complex {
+        \\      re: x.re * y.re - x.im * y.im,
+        \\      im: x.re * y.im + x.im * y.re,
+        \\    }
+        \\  }
+        \\  fn neg(x: Complex(a)) -> Complex(a) {
+        \\    Complex { re: -x.re, im: -x.im }
+        \\  }
+        \\  fn sub(x: Complex(a), y: Complex(a)) -> Complex(a) {
+        \\    Complex { re: x.re - y.re, im: x.im - y.im }
+        \\  }
+        \\}
+        \\
+        \\pub default instance complex_field: Field(Complex(a)) with Field(a) {
+        \\  fn from_int(n: i32) -> Complex(a) {
+        \\    Complex { re: from_int(n), im: zero() }
+        \\  }
+        \\  fn zero() -> Complex(a) {
+        \\    Complex { re: zero(), im: zero() }
+        \\  }
+        \\  fn one() -> Complex(a) {
+        \\    Complex { re: one(), im: zero() }
+        \\  }
+        \\  fn add(x: Complex(a), y: Complex(a)) -> Complex(a) {
+        \\    Complex { re: x.re + y.re, im: x.im + y.im }
+        \\  }
+        \\  fn mul(x: Complex(a), y: Complex(a)) -> Complex(a) {
+        \\    Complex {
+        \\      re: x.re * y.re - x.im * y.im,
+        \\      im: x.re * y.im + x.im * y.re,
+        \\    }
+        \\  }
+        \\  fn neg(x: Complex(a)) -> Complex(a) {
+        \\    Complex { re: -x.re, im: -x.im }
+        \\  }
+        \\  fn sub(x: Complex(a), y: Complex(a)) -> Complex(a) {
+        \\    Complex { re: x.re - y.re, im: x.im - y.im }
+        \\  }
+        \\  fn div(z: Complex(a), w: Complex(a)) -> Complex(a) {
+        \\    let d: a = w.re * w.re + w.im * w.im
+        \\    Complex {
+        \\      re: (z.re * w.re + z.im * w.im) / d,
+        \\      im: (z.im * w.re - z.re * w.im) / d,
+        \\    }
+        \\  }
         \\}
         \\
         ,

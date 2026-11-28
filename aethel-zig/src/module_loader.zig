@@ -135,6 +135,7 @@ const Loader = struct {
             }
             return null;
         }
+        if (comptime @import("builtin").os.tag == .freestanding) return null;
         const io = self.io orelse return null;
         return Io.Dir.cwd().readFileAllocOptions(
             io,

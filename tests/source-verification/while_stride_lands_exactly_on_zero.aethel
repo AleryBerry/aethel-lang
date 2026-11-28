@@ -1,0 +1,9 @@
+type Meter { count: u8, copy: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { count: 96, copy: 11, };
+  while meter.count > 0 decreases meter.count {
+    meter.count = meter.count -| 24;
+  };
+  meter.copy = meter.count;
+  meter.copy
+}

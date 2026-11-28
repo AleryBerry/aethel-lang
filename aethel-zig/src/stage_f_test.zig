@@ -72,11 +72,11 @@ test "1. Stage F: Semigroup + Monoid default vs named instance using, plus trait
         \\  law right_id(x: a) { always combine(x, empty()) == x }
         \\}
         \\pub default instance sum_u32: Monoid(u32) {
-        \\  fn empty() -> u32 { 0u32 }
+        \\  fn empty() -> u32 { 0 }
         \\  fn combine(x: u32, y: u32) -> u32 { x +| y }
         \\}
         \\pub instance max_u32: Monoid(u32) {
-        \\  fn empty() -> u32 { 0u32 }
+        \\  fn empty() -> u32 { 0 }
         \\  fn combine(x: u32, y: u32) -> u32 { max(x, y) }
         \\}
         \\pub fn fold_slice(xs: [a]) -> a with Monoid(a) {
@@ -87,7 +87,7 @@ test "1. Stage F: Semigroup + Monoid default vs named instance using, plus trait
         \\  acc
         \\}
         \\pub fn main() -> u32 {
-        \\  let scores = [3u32, 9u32, 4u32]
+        \\  let scores: [u32] = [3, 9, 4]
         \\  let total = fold_slice(scores)
         \\  let peak = fold_slice(scores) using max_u32
         \\  total +| peak
@@ -104,7 +104,7 @@ test "1. Stage F: Semigroup + Monoid default vs named instance using, plus trait
 
     try std.testing.expectEqual(@as(usize, 2), res.checked.traits.len);
     try std.testing.expectEqual(@as(usize, 2), res.checked.instances.len);
-    try std.testing.expect(std.mem.indexOf(u8, res.mir_txt, "trait_law sum_u32.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res.mir_txt, "trait_law sum_u32.") == null);
     try std.testing.expect(std.mem.indexOf(u8, res.mir_txt, "trait_law max_u32.") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.zig_txt, "__Inst_sum_u32") != null);
     try std.testing.expect(std.mem.indexOf(u8, res.zig_txt, "__Inst_max_u32") != null);
@@ -134,11 +134,11 @@ test "2. Stage F: Monad(Option) <= Applicative(Option) <= Functor(Option) with a
         \\  }
         \\}
         \\pub fn inc_opt(x: f(u32)) -> f(u32) with Functor(f) {
-        \\  fmap(x, fn(n: u32) -> u32 { n +% 1u32 })
+        \\  fmap(x, fn(n: u32) -> u32 { n +% 1 })
         \\}
         \\pub fn main() -> u32 {
-        \\  let mapped = inc_opt(Some(41u32))
-        \\  mapped |> unwrap_or(0u32)
+        \\  let mapped = inc_opt(Some(41 as u32))
+        \\  mapped |> unwrap_or(0)
         \\}
     ;
     var res = try checkAndEmitAll(src);
@@ -164,7 +164,7 @@ test "3. Stage F: unlawful Monoid and ambiguous default instances rejected at co
         \\  fn empty() -> a
         \\}
         \\pub default instance bad_sub: Monoid(u32) {
-        \\  fn empty() -> u32 { 0u32 }
+        \\  fn empty() -> u32 { 0 }
         \\  fn combine(x: u32, y: u32) -> u32 { x -| y }
         \\}
     , .law_violation);
@@ -195,7 +195,7 @@ test "4. Stage F: nested polynomial structural `using` without newtype & branded
         \\  fn score(x: Foo) -> u32 { x.v }
         \\}
         \\pub instance bonus_foo: Score(Foo) {
-        \\  fn score(x: Foo) -> u32 { x.v +| 100u32 }
+        \\  fn score(x: Foo) -> u32 { x.v +| 100 }
         \\}
         \\pub default instance score_qux: Score(Qux(a)) with Score(a) {
         \\  fn score(x: Qux(a)) -> u32 { score(x.q) }
@@ -236,8 +236,8 @@ test "4. Stage F: nested polynomial structural `using` without newtype & branded
         \\  BrandedAcc { val: x }
         \\}
         \\fn bad_mix() -> BrandedAcc(u32) {
-        \\  let mut b = make_acc(10u32)
-        \\  let m = make_acc(20u32) using max_u32
+        \\  let mut b = make_acc(10)
+        \\  let m = make_acc(20) using max_u32
         \\  b = m
         \\  b
         \\}
@@ -277,15 +277,15 @@ test "5. Stage F: @external(rust), @layout(flat), packed-FFI rejection, physical
         \\pub fn step_aosoa_bodies(t: View(Collection(TileBody), Exclusive), dt: f32)
         \\pub fn main() -> f32 {
         \\  let mut ents: Collection(Entity) = [
-        \\    Entity { px: 0.0f32, py: 0.0f32, vx: 2.0f32, vy: 0.0f32 },
-        \\    Entity { px: 1.0f32, py: 0.0f32, vx: 3.0f32, vy: 0.0f32 },
+        \\    Entity { px: 0.0, py: 0.0, vx: 2.0, vy: 0.0 },
+        \\    Entity { px: 1.0, py: 0.0, vx: 3.0, vy: 0.0 },
         \\  ]
         \\  let mut tiles: Collection(TileBody) = [
-        \\    TileBody { x: 0.0f32, vx: 4.0f32 },
-        \\    TileBody { x: 1.0f32, vx: 5.0f32 },
+        \\    TileBody { x: 0.0, vx: 4.0 },
+        \\    TileBody { x: 1.0, vx: 5.0 },
         \\  ]
-        \\  step_soa_physics(ents, StepConfig { dt: 0.5f32, gravity: 9.8f32 })
-        \\  step_aosoa_bodies(tiles, 0.5f32)
+        \\  step_soa_physics(ents, StepConfig { dt: 0.5, gravity: 9.8 })
+        \\  step_aosoa_bodies(tiles, 0.5)
         \\  ents[0].px + tiles[0].x
         \\}
     ;

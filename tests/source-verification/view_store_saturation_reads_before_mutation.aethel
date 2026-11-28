@@ -1,0 +1,11 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 13, right: 24, };
+  view exclusive item = pair.left {
+    item = item -| 18;
+    pair.right = item;
+    pair.left = 4;
+  };
+  if pair.left != 4 { pair.right = 255; } else { };
+  pair.right
+}

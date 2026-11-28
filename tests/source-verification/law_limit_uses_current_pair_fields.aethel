@@ -1,0 +1,14 @@
+type Limits { requested: u8, maximum: u8, }
+
+fn clamp(limits: Limits ~>.{requested, maximum}) -> u8 {
+  if limits.requested > limits.maximum {
+    limits.requested = limits.maximum;
+  } else { };
+  limits.requested
+}
+
+fn main() -> u8 {
+  let mut limits = Limits { requested: 177, maximum: 64, };
+  limits.requested = clamp(limits);
+  limits.requested
+}

@@ -2,7 +2,38 @@ import Aethel.Representation
 
 namespace Aethel.Representation.Tests
 
-open Functional Core Structured CoreAST Representation
+open Functional Core Structured CoreAST Representation ADTLayout
+
+private def runDenseDataTests : IO Unit := do
+  let three := CoreType.sum .bool .unit
+  let variant : DenseData three 3 := .sum .bool .unit
+  let payload := CoreType.prod (.prod three three) (.prod three (.prod three three))
+  let some schema := DenseData.ofType (.sum payload .unit) |
+    throw (IO.userError "finite nested sum has no layout")
+  let field : DenseDataField 1 (.sum payload .unit) :=
+    ⟨244, .sum (.prod (.prod variant variant) (.prod variant (.prod variant variant))) .unit, ⟨0, by decide⟩⟩
+  let absent := CoreExpr.inject false (payload, .unit) .unit
+  let initial : AutomaticLayout.Image 1 := fun _ => 255
+  let some encoded := field.store initial absent | throw (IO.userError "cannot encode vacant variant")
+  if schema.1 != 244 || minTagBits schema.1 != 8 || (encoded 0).toNat != 243 || field.load encoded != some absent then
+    throw (IO.userError "nested sum must fit into the spare codes of a single byte")
+  if (field.load initial).isSome then
+    throw (IO.userError "unused nested sum code decoded as a typed value")
+  let mixed : DenseDataField 2 (.sum (.prod .byte .bool) .byte) :=
+    ⟨768, .sum (.prod .byte .bool) .byte, ⟨3, by decide⟩⟩
+  let image : AutomaticLayout.Image 2 := fun _ => 255
+  let error := CoreExpr.inject false (.prod .byte .bool, .byte) (.int false 8 255)
+  let ok := CoreExpr.inject true (.prod .byte .bool, .byte) (.pair (.int false 8 255) (.bool true))
+  let some failed := mixed.store image error | throw (IO.userError "cannot encode the error payload")
+  let some recovered := mixed.store failed ok | throw (IO.userError "cannot encode the recovered payload")
+  if (failed.readBits 3 10).toNat != 767 || (recovered.readBits 3 10).toNat != 511 ||
+      mixed.load recovered != some ok || (recovered.readBits 0 3).toNat != 7 ||
+      (recovered.readBits 13 3).toNat != 7 then
+    throw (IO.userError "changing a typed variant across bytes disturbed its payload or neighbors")
+  let wrong := CoreExpr.inject true (.prod .byte .bool, .unit) (.pair (.int false 8 255) (.bool true))
+  if (mixed.store image wrong).isSome ||
+      (DenseData.ofType (.sum (.arrow .byte .byte .empty) .unit)).isSome then
+    throw (IO.userError "dense layout accepted the wrong variant signature or a closure")
 
 def runRepresentationTests : IO Unit := do
   -- Test 1: Primitives representation
@@ -89,6 +120,7 @@ def runRepresentationTests : IO Unit := do
   if stateDestroyed2.byte ⟨1, 0⟩ != some 77 then
     throw (IO.userError "destroying owner 2 altered owner 1")
 
-  IO.println "13 logical-to-physical representation refinement regressions passed"
+  runDenseDataTests
+  IO.println "17 logical-to-physical representation refinement regressions passed"
 
 end Aethel.Representation.Tests

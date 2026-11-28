@@ -1,0 +1,5 @@
+fn main() -> u8 {
+  let apply = fn(args: (fn(u8) -> u8, u8)) { args.0(args.1) };
+  let identity = fn(value: u8) { value };
+  apply((identity, 84))
+}

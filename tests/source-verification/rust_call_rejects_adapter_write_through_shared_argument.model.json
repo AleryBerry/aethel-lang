@@ -1,0 +1,6 @@
+[
+  {
+    "target": {"package": "batch", "symbol": "inspect"},
+    "accesses": [{"address": {"argument": 0, "byte": 0}, "write": 86}]
+  }
+]

@@ -68,23 +68,23 @@ fn main() {
   let s3 = Idle
 
   let mut swarm: Collection(Particle) = [
-    Particle { id: 1u32, cooldown: 0.0f32, x: 0.0f32, vx: 2.0f32 },
-    Particle { id: 2u32, cooldown: 0.0f32, x: 1.0f32, vx: 3.0f32 },
-    Particle { id: 3u32, cooldown: 0.0f32, x: 2.0f32, vx: 4.0f32 },
-    Particle { id: 4u32, cooldown: 0.0f32, x: 3.0f32, vx: 5.0f32 },
-    Particle { id: 5u32, cooldown: 0.0f32, x: 4.0f32, vx: 6.0f32 },
-    Particle { id: 6u32, cooldown: 0.0f32, x: 5.0f32, vx: 7.0f32 },
-    Particle { id: 7u32, cooldown: 0.0f32, x: 6.0f32, vx: 8.0f32 },
-    Particle { id: 8u32, cooldown: 0.0f32, x: 7.0f32, vx: 9.0f32 },
-    Particle { id: 9u32, cooldown: 0.0f32, x: 8.0f32, vx: 10.0f32 },
-    Particle { id: 10u32, cooldown: 0.0f32, x: 9.0f32, vx: 11.0f32 },
+    Particle { id: 1, cooldown: 0.0, x: 0.0, vx: 2.0 },
+    Particle { id: 2, cooldown: 0.0, x: 1.0, vx: 3.0 },
+    Particle { id: 3, cooldown: 0.0, x: 2.0, vx: 4.0 },
+    Particle { id: 4, cooldown: 0.0, x: 3.0, vx: 5.0 },
+    Particle { id: 5, cooldown: 0.0, x: 4.0, vx: 6.0 },
+    Particle { id: 6, cooldown: 0.0, x: 5.0, vx: 7.0 },
+    Particle { id: 7, cooldown: 0.0, x: 6.0, vx: 8.0 },
+    Particle { id: 8, cooldown: 0.0, x: 7.0, vx: 9.0 },
+    Particle { id: 9, cooldown: 0.0, x: 8.0, vx: 10.0 },
+    Particle { id: 10, cooldown: 0.0, x: 9.0, vx: 11.0 },
   ]
 
-  integrate_particles(swarm, 0.5f32)
+  integrate_particles(swarm, 0.5)
 
   let mut locks = ConcurrentLocks { lane_a: false, lane_b: false }
-  let mut sum_low: f32 = 0.0f32
-  let mut sum_high: f32 = 0.0f32
+  let mut sum_low: f32 = 0.0
+  let mut sum_high: f32 = 0.0
   let mut score_sum: u16 = 0
 
   @parallel fork {

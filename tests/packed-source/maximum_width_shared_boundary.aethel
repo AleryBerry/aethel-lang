@@ -1,0 +1,6 @@
+type Sample { wide: u65535, next: u33, tail: u2, }
+fn main() -> u33 {
+  let mut row = Sample { wide: 0, next: 4294967296, tail: 3, };
+  row.wide = 5;
+  row.next
+}

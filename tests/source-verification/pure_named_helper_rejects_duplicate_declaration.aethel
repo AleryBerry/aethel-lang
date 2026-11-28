@@ -1,0 +1,5 @@
+fn choose(first: bool) -> u8 { 33 }
+
+fn choose(first: bool) -> u8 { 46 }
+
+fn main() -> u8 { choose(true) }

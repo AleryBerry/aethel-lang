@@ -1,0 +1,10 @@
+type Row { count: u8, output: u8, }
+fn main() -> u8 {
+  let mut row = Row { count: 2, output: 47, };
+  view shared bound = row.count {
+    for _ in 0..bound { row.output = row.output -| 5; };
+    row.count = 0;
+  };
+  if row.count != 0 { row.output = 0; } else { };
+  row.output
+}

@@ -1,0 +1,10 @@
+@external(rust, "batch", "inspect")
+pub fn inspect(input: [u8]) -> ()
+
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut seed = Pair { left: 14, right: 62, };
+  let mut row = move seed;
+  inspect(seed.left);
+  row.left
+}

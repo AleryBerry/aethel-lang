@@ -72,6 +72,31 @@ def runRecordRuntime : IO Unit := do
     ((destroyed.handle 2).isNone && (record.read destroyed [1, 1] [.handle 2]).isNone)
   IO.println "14 initialized record runtime regressions passed"
 
+def runCrossBoundaryPermissions : IO Unit := do
+  let wide : IntegerType := .unsigned ⟨35, by decide, by decide⟩
+  let small : IntegerType := .unsigned .w5
+  let schema := Schema.record [(.mayShareByte, .integer wide), (.mayShareByte, .integer small)]
+  let some (record, initial) := allocateRecord .natural schema {} 3
+      (fun path => if path == [0] then some ⟨wide, 0⟩ else some ⟨small, 21⟩)
+    | throw (IO.userError "wide packed record allocation failed")
+  ensureRuntime "initialized 35-bit field and 5-bit sibling share byte four"
+    ((initial.allocation 3).map Allocation.bytes == some [0, 0, 0, 0, 168])
+  let some handles := Core.run initial ((List.range 5).map fun i => .alias i 3 i .exclusive)
+    | throw (IO.userError "wide packed byte handle setup failed")
+  let targets := (List.range 5).map Structured.AccessTarget.handle
+  let ensureWideWrite := record.write handles [0] targets ⟨wide, 2^35 - 1⟩
+  ensureRuntime "wide store rejects a footprint that omits the shared boundary byte"
+    (record.write handles [0] (targets.take 4) ⟨wide, 1⟩).isNone
+  let some reserved := Core.execute handles (.reserve 10 4 .shared)
+    | throw (IO.userError "wide packed shared reservation failed")
+  ensureRuntime "a read reservation on the sibling byte blocks a wide write"
+    (record.write reserved [0] targets ⟨wide, 1⟩).isNone
+  let some changed := ensureWideWrite
+    | throw (IO.userError "authorized wide store was rejected")
+  ensureRuntime "wide store preserves the sibling bits in the last byte"
+    ((changed.allocation 3).map Allocation.bytes == some [255, 255, 255, 255, 175])
+  IO.println "Cross-boundary integer permission regressions passed"
+
 open Aethel.Structured.Records
 
 private def rejects (outcome : Except RecordError (List IntegerBits × State))

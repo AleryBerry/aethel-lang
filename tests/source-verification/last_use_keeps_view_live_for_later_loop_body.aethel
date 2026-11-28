@@ -1,0 +1,10 @@
+type Pair { input: u8, output: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { input: 47, output: 0, };
+  view shared sample = pair.input {
+    pair.output = sample;
+    pair.input = 39;
+    for _ in 0..2 { pair.output = sample; };
+  };
+  pair.output
+}

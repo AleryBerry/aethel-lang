@@ -1,0 +1,7 @@
+type Reading { Idle, Sample(f32), Fault(u13), }
+type Packet { flag: u3, reading: Reading, count: u35, }
+fn main() -> u3 {
+  let mut packet = Packet { flag: 7, reading: Sample(-0.0), count: 34359738367, };
+  packet.reading = Idle;
+  packet.flag
+}

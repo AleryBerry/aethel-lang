@@ -1,0 +1,15 @@
+type Meter { count: u8, signal: u8, }
+fn drain(meter: Meter ~>.{count}) -> u8 {
+  while meter.count > 0 decreases meter.count {
+    meter.count = meter.count -| 19;
+  };
+  meter.count
+}
+fn main() -> u8 {
+  let mut meter = Meter { count: 84, signal: 20, };
+  view shared signal = meter.signal {
+    meter.count = drain(meter);
+    let _ = signal;
+  };
+  meter.count
+}

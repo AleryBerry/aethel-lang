@@ -1,0 +1,15 @@
+law accepted_cases(value: Result(u8, bool)) {
+  always handles(value)
+}
+
+law no_blocked_request(value: Result(u8, bool)) {
+  always permitted(value)
+}
+
+law unexpected_type(value: bool) {
+  always permitted(value)
+}
+
+law unknown_predicate(value: bool) {
+  always absent(value)
+}

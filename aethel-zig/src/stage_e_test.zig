@@ -306,7 +306,7 @@ test "5. Stage E: Rust FFI slice aliasing, RustOwn single-drop, and C-ABI bridge
         \\  fn rust_buf_drop(b: RustBuf)
         \\}
         \\fn run_ok(mut arr: [mut f32], mid: u32) -> f32 {
-        \\  scale_two(arr[0..mid], arr[mid..arr.len], 2.0f32)
+        \\  scale_two(arr[0..mid], arr[mid..arr.len], 2.0)
         \\  let b = rust_buf_new()
         \\  let _ = rust_buf_sum(b)
         \\  rust_buf_drop(b)
@@ -319,7 +319,7 @@ test "5. Stage E: Rust FFI slice aliasing, RustOwn single-drop, and C-ABI bridge
     try expectSemaError(
         \\extern "rust" fn scale_two(lhs: [mut f32], rhs: [mut f32], k: f32)
         \\fn bad_alias(mut arr: [mut f32]) {
-        \\  scale_two(arr[0..3], arr[2..4], 2.0f32)
+        \\  scale_two(arr[0..3], arr[2..4], 2.0)
         \\}
     , .borrow_conflict);
 

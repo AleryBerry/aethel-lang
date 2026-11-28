@@ -1,0 +1,8 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 78, right: 0, };
+  view exclusive sample = pair.left {
+    if sample < sample { pair.right = pair.left; } else { pair.right = sample; };
+  };
+  pair.right
+}

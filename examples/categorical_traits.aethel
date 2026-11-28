@@ -24,12 +24,12 @@ pub trait Monoid(a) <= Semigroup(a) {
 }
 
 pub default instance sum_u32: Monoid(u32) {
-  fn empty() -> u32 { 0u32 }
+  fn empty() -> u32 { 0 }
   fn combine(x: u32, y: u32) -> u32 { x +| y }
 }
 
 pub instance max_u32: Monoid(u32) {
-  fn empty() -> u32 { 0u32 }
+  fn empty() -> u32 { 0 }
   fn combine(x: u32, y: u32) -> u32 { max(x, y) }
 }
 
@@ -71,7 +71,7 @@ pub default instance opt_monad: Monad(Option) {
 }
 
 pub fn bump_wrapped(x: f(u32)) -> f(u32) with Functor(f) {
-  fmap(x, fn(n: u32) -> u32 { n +% 10u32 })
+  fmap(x, fn(n: u32) -> u32 { n +% 10 })
 }
 
 // Nested polynomial structural `using` without `newtype` wrappers
@@ -88,7 +88,7 @@ pub default instance w_payload: Weight(Payload) {
 }
 
 pub instance double_payload: Weight(Payload) {
-  fn weight(x: Payload) -> u32 { x.base *| 2u32 }
+  fn weight(x: Payload) -> u32 { x.base *| 2 }
 }
 
 pub default instance w_slot: Weight(Slot(a)) with Weight(a) {
@@ -107,13 +107,13 @@ pub fn wrap_acc(x: a) -> AccBox(a) with Monoid(a) {
 }
 
 pub fn main() {
-  let scores = [3u32, 9u32, 4u32]
+  let scores = [3, 9, 4]
   let total = fold_slice(scores)
   let peak = fold_slice(scores) using max_u32
 
-  let bumped = bump_wrapped(Some(32u32)) |> unwrap_or(0u32)
+  let bumped = bump_wrapped(Some(32)) |> unwrap_or(0)
 
-  let c = Crate { slot: Slot { item: Payload { base: 7u32 } } }
+  let c = Crate { slot: Slot { item: Payload { base: 7 } } }
   let w_std = weight(c)
   let w_dbl = weight(c) using double_payload
 

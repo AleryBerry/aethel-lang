@@ -1,0 +1,10 @@
+type Pair { left: u8, right: u8, }
+fn select(pair: Pair ~>.{left}) -> View(u8, Exclusive) { pair.left }
+fn load(pair: Pair ~>.{right}) -> u8 { pair.right }
+fn main() -> u8 {
+  let mut pair = Pair { left: 19, right: 81, };
+  let item = select(pair);
+  item = load(pair);
+  pair.right = pair.left;
+  pair.right
+}

@@ -1,0 +1,16 @@
+@layout(soa)
+type Cell { value: u8, next: u8, }
+fn main() -> u8 {
+  let mut cells: Collection(Cell) = [
+    Cell { value: 48, next: 0, },
+    Cell { value: 54, next: 1, },
+  ];
+  let i = cells[0].next;
+  if i < 2 {
+    view exclusive held = cells[i].value {
+      cells[i].next = cells[i].value;
+      held = 89;
+    };
+  } else { };
+  cells[0].next
+}

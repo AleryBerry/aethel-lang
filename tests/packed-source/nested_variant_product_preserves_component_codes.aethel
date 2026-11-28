@@ -1,0 +1,13 @@
+type Payload { empty: Unit, narrow: u3, wide: u35, }
+type Tagged { Empty, Full(Unit, Payload, u13), }
+type Row { tagged: Tagged, guard: u5, }
+
+fn main() -> u5 {
+  let mut row = Row {
+    tagged: Full((), Payload { empty: (), narrow: 5, wide: 34359738367, }, 8191),
+    guard: 29,
+  };
+  row.tagged = Empty;
+  row.tagged = Full((), Payload { empty: (), narrow: 7, wide: 1, }, 42);
+  row.guard
+}

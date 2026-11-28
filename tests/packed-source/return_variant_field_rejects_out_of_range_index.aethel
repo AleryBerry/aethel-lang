@@ -1,0 +1,9 @@
+@layout(flat)
+type Payload { flag: u1, word: u35, }
+type Tagged { Full(Payload), }
+type Row { tagged: Tagged, }
+
+fn main() -> u35 {
+  let mut row = Row { tagged: Full(Payload { flag: 1, word: 66, }), };
+  row.tagged as Full[1].word
+}

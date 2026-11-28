@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let result = Ok(51): Result(u8, u8);
+  case result {
+    Ok(value) -> value
+    Err(code) -> value
+  }
+}

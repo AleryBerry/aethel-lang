@@ -19,12 +19,12 @@ pub trait Monoid(a) <= Semigroup(a) {
 }
 
 pub default instance sum_u32: Monoid(u32) {
-  fn empty() -> u32 { 0u32 }
+  fn empty() -> u32 { 0 }
   fn combine(x: u32, y: u32) -> u32 { x +| y }
 }
 
 pub instance max_u32: Monoid(u32) {
-  fn empty() -> u32 { 0u32 }
+  fn empty() -> u32 { 0 }
   fn combine(x: u32, y: u32) -> u32 { max(x, y) }
 }
 
@@ -71,4 +71,90 @@ pub fn fold_slice(xs: [a]) -> a with Monoid(a) {
     acc = combine(acc, x)
   }
   acc
+}
+
+pub trait FromInt(a) {
+  fn from_int(n: i32) -> a
+}
+
+pub trait Semiring(a) <= FromInt(a) {
+  fn zero() -> a
+  fn one() -> a
+  fn add(x: a, y: a) -> a
+  fn mul(x: a, y: a) -> a
+}
+
+pub trait Ring(a) <= Semiring(a) {
+  fn neg(x: a) -> a
+  fn sub(x: a, y: a) -> a
+}
+
+pub trait Field(a) <= Ring(a) {
+  fn div(x: a, y: a) -> a
+}
+
+pub default instance semiring_u32: Semiring(u32) {
+  fn from_int(n: i32) -> u32 { if n < 0 { 0 } else { n as u32 } }
+  fn zero() -> u32 { 0 }
+  fn one() -> u32 { 1 }
+  fn add(x: u32, y: u32) -> u32 { x +% y }
+  fn mul(x: u32, y: u32) -> u32 { x *% y }
+}
+
+pub default instance semiring_u64: Semiring(u64) {
+  fn from_int(n: i32) -> u64 { if n < 0 { 0 } else { n as u64 } }
+  fn zero() -> u64 { 0 }
+  fn one() -> u64 { 1 }
+  fn add(x: u64, y: u64) -> u64 { x +% y }
+  fn mul(x: u64, y: u64) -> u64 { x *% y }
+}
+
+pub default instance ring_i32: Ring(i32) {
+  fn from_int(n: i32) -> i32 { n }
+  fn zero() -> i32 { 0 }
+  fn one() -> i32 { 1 }
+  fn add(x: i32, y: i32) -> i32 { x +% y }
+  fn mul(x: i32, y: i32) -> i32 { x *% y }
+  fn neg(x: i32) -> i32 { 0 -% x }
+  fn sub(x: i32, y: i32) -> i32 { x -% y }
+}
+
+pub default instance ring_i64: Ring(i64) {
+  fn from_int(n: i32) -> i64 { n }
+  fn zero() -> i64 { 0 }
+  fn one() -> i64 { 1 }
+  fn add(x: i64, y: i64) -> i64 { x +% y }
+  fn mul(x: i64, y: i64) -> i64 { x *% y }
+  fn neg(x: i64) -> i64 { 0 -% x }
+  fn sub(x: i64, y: i64) -> i64 { x -% y }
+}
+
+pub default instance field_f32: Field(f32) {
+  fn from_int(n: i32) -> f32 { n as f32 }
+  fn zero() -> f32 { 0.0 }
+  fn one() -> f32 { 1.0 }
+  fn add(x: f32, y: f32) -> f32 { x + y }
+  fn mul(x: f32, y: f32) -> f32 { x * y }
+  fn neg(x: f32) -> f32 { -x }
+  fn sub(x: f32, y: f32) -> f32 { x - y }
+  fn div(x: f32, y: f32) -> f32 { x / y }
+}
+
+pub default instance field_f64: Field(f64) {
+  fn from_int(n: i32) -> f64 { n }
+  fn zero() -> f64 { 0.0 }
+  fn one() -> f64 { 1.0 }
+  fn add(x: f64, y: f64) -> f64 { x + y }
+  fn mul(x: f64, y: f64) -> f64 { x * y }
+  fn neg(x: f64) -> f64 { -x }
+  fn sub(x: f64, y: f64) -> f64 { x - y }
+  fn div(x: f64, y: f64) -> f64 { x / y }
+}
+
+law ring_i8_add_comm(x: i8, y: i8) {
+  always (x +% y) == (y +% x)
+}
+
+law ring_i8_sub_neg(x: i8, y: i8) {
+  always (x -% y) == (x +% (0 -% y))
 }

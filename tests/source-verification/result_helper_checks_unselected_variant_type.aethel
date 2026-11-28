@@ -1,0 +1,9 @@
+fn extract(input: Result(u8, bool)) -> u8 {
+  case input {
+    Ok(value) -> value
+    Err(flag) -> if flag { 1 } else { 0 }
+  }
+}
+fn main() -> u8 {
+  extract(Ok(42): Result(u8, ()))
+}

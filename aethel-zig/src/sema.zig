@@ -492,10 +492,32 @@ pub const LawVerdict = enum {
     violated,
 };
 
+pub const CheckedLawClause = struct {
+    kind: std.meta.Tag(ast.LawClause),
+    span: ast.Span,
+    verdict: ?LawVerdict,
+    detail: []const u8,
+    certificate: ?[]const u8 = null,
+    counterexample: ?[]const u8 = null,
+
+    fn init(cl: ast.LawClause) CheckedLawClause {
+        const span = switch (cl) {
+            inline else => |c| c.span,
+        };
+        return .{
+            .kind = std.meta.activeTag(cl),
+            .span = span,
+            .verdict = if (cl == .when) null else .unverified_symbolic,
+            .detail = if (cl == .when) "guard for subsequent clauses" else "no proof for this clause",
+        };
+    }
+};
+
 pub const CheckedLaw = struct {
     name: []const u8,
     span: ast.Span,
     verdict: LawVerdict,
+    clauses: []const CheckedLawClause = &.{},
     tier_detail: []const u8 = "",
     counterexample: ?[]const u8 = null,
     symbolic_certs: []const law_verifier.SymbolicLawCert = &.{},
@@ -587,6 +609,8 @@ pub const CheckedModule = struct {
     foreign_contracts: []const ForeignContract = &.{},
     type_decl_params: std.AutoHashMapUnmanaged(usize, []const []const u8) = .empty,
     call_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Expr, CallTraitResolution) = .empty,
+    numeral_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Expr, ResolvedWitness) = .empty,
+    assign_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Stmt, CallTraitResolution) = .empty,
     std_intrinsic_calls: std.AutoHashMapUnmanaged(*const ast.Expr, StdIntrinsicCall) = .empty,
 
     pub fn deinit(self: *CheckedModule) void {
@@ -833,6 +857,7 @@ const Analyzer = struct {
     resolved_records: std.AutoHashMapUnmanaged(*const ast.Expr, usize) = .empty,
 
     scopes: std.ArrayList(Binding),
+    field_ranges: std.ArrayListUnmanaged(FieldRangeEntry) = .empty,
     scope_marks: std.ArrayList(usize),
     active_views: std.ArrayList(ActiveView),
     view_marks: std.ArrayList(usize),
@@ -862,6 +887,8 @@ const Analyzer = struct {
     foreign_contracts: std.ArrayList(ForeignContract) = .empty,
     type_decl_params: std.AutoHashMapUnmanaged(usize, []const []const u8) = .empty,
     call_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Expr, CallTraitResolution) = .empty,
+    numeral_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Expr, ResolvedWitness) = .empty,
+    assign_trait_resolutions: std.AutoHashMapUnmanaged(*const ast.Stmt, CallTraitResolution) = .empty,
     active_hkt_params: std.ArrayList([]const u8) = .empty,
     active_constraints: []const ResolvedConstraint = &.{},
     active_using_stack: std.ArrayList([]const usize) = .empty,
@@ -876,6 +903,12 @@ const Analyzer = struct {
     current_fn_decreases: ?*const ast.Expr = null,
     current_sym_guards: std.ArrayList(*const ast.Expr) = .empty,
 
+    const FieldRangeEntry = struct {
+        root: []const u8,
+        field: []const u8,
+        range: IntRange,
+    };
+
     const RecordDef = struct {
         name: []const u8,
         local_name: []const u8,
@@ -889,6 +922,7 @@ const Analyzer = struct {
         auto_layout_requested: bool = false,
         simd_loop_seen: bool = false,
         hot_fields: []bool = &.{},
+        address_taken_fields: []bool = &.{},
         observed_collection_len: ?usize = null,
         is_flat_c: bool = false,
         is_packed_attr: bool = false,
@@ -1290,6 +1324,8 @@ const Analyzer = struct {
                             const fslice = try self.alloc.alloc(CheckedField, fields.len);
                             const hslice = try self.alloc.alloc(bool, fields.len);
                             @memset(hslice, false);
+                            const aslice = try self.alloc.alloc(bool, fields.len);
+                            @memset(aslice, false);
                             try self.record_defs.append(self.alloc, .{
                                 .name = cname,
                                 .local_name = local_name,
@@ -1302,6 +1338,7 @@ const Analyzer = struct {
                                 .decl_ast = decl.kind,
                                 .auto_layout_requested = auto_req,
                                 .hot_fields = hslice,
+                                .address_taken_fields = aslice,
                                 .is_flat_c = is_flat,
                                 .is_packed_attr = is_packed,
                                 .rust_derives = rec_rust.derives,
@@ -2219,13 +2256,47 @@ const Analyzer = struct {
                 matches.append(self.alloc, .{ .idx = idx, .subst = subst }) catch {};
             }
         }
+        if (matches.items.len > 1) {
+            var filtered: std.ArrayList(MatchItem) = .empty;
+            for (matches.items) |m| {
+                var subst_copy = m.subst.clone(self.alloc) catch continue;
+                if (self.instantiateConstraintWitness(m.idx, &subst_copy, span, false) != null) {
+                    filtered.append(self.alloc, m) catch {};
+                }
+            }
+            if (filtered.items.len > 0) matches = filtered;
+        }
         if (matches.items.len == 0) {
             for (self.instance_defs.items, 0..) |inst, idx| {
                 if (!inst.is_default or inst.trait_idx == trait_idx) continue;
                 var subst: std.StringHashMapUnmanaged(*const Ty) = .empty;
                 if (self.instanceMatchesRequirement(idx, trait_idx, target_tys, target_hkts, &subst)) {
-                    matches.append(self.alloc, .{ .idx = idx, .subst = subst }) catch {};
+                    var subst_copy = subst.clone(self.alloc) catch continue;
+                    if (self.instantiateConstraintWitness(idx, &subst_copy, span, false) != null) {
+                        matches.append(self.alloc, .{ .idx = idx, .subst = subst }) catch {};
+                    }
                 }
+            }
+            // Prefer the most general supertrait when multiple subtraits implement the same target
+            // (e.g. Ring(Complex(a)) over Field(Complex(a)) when resolving Semiring(Complex(f64))).
+            if (matches.items.len > 1) {
+                var best: std.ArrayList(MatchItem) = .empty;
+                for (matches.items, 0..) |mi, i| {
+                    const ti = self.instance_defs.items[mi.idx].trait_idx;
+                    var has_super_candidate = false;
+                    for (matches.items, 0..) |mj, j| {
+                        if (i == j) continue;
+                        const tj = self.instance_defs.items[mj.idx].trait_idx;
+                        if (ti != tj and self.traitHasSuper(ti, tj)) {
+                            has_super_candidate = true;
+                            break;
+                        }
+                    }
+                    if (!has_super_candidate) {
+                        best.append(self.alloc, mi) catch {};
+                    }
+                }
+                if (best.items.len > 0) matches = best;
             }
         }
         if (matches.items.len == 1) {
@@ -3194,11 +3265,11 @@ const Analyzer = struct {
         switch (ty.*) {
             .int => |it| {
                 const slot = layout.naturalSlot(it.bits);
-                return .{ .bits = it.bits, .signed = it.signed, .size = slot.size, .alignment = slot.alignment, .packable = it.bits < 8 };
+                return .{ .bits = it.bits, .signed = it.signed, .size = slot.size, .alignment = slot.alignment, .packable = it.bits > 0 and it.bits % 8 != 0 };
             },
             .int_range => |ir| {
                 const slot = layout.naturalSlot(ir.synthesized.bits);
-                return .{ .bits = ir.synthesized.bits, .signed = ir.synthesized.signed, .size = slot.size, .alignment = slot.alignment, .packable = ir.synthesized.bits < 8 };
+                return .{ .bits = ir.synthesized.bits, .signed = ir.synthesized.signed, .size = slot.size, .alignment = slot.alignment, .packable = ir.synthesized.bits > 0 and ir.synthesized.bits % 8 != 0 };
             },
             .bool => {
                 const slot = layout.naturalSlot(1);
@@ -3214,7 +3285,7 @@ const Analyzer = struct {
                     .signed = false,
                     .size = adt_lay.total_bytes,
                     .alignment = layout.naturalAlignment(adt_lay.total_bytes),
-                    .packable = adt_lay.can_share_byte,
+                    .packable = false,
                 };
             },
             .opaque_ty => return .{ .bits = 64, .signed = false, .size = 8, .alignment = 8, .packable = false },
@@ -3546,7 +3617,7 @@ const Analyzer = struct {
                         return -@as(i128, @intCast(parsed.value));
                     }
                     const inner = evalConstInt(source, u.operand) orelse return null;
-                    return -inner;
+                    return std.math.negate(inner) catch null;
                 }
                 return null;
             },
@@ -3735,7 +3806,9 @@ const Analyzer = struct {
         self.current_fn_ret = fsig.ret;
         self.inferred_return_origin = fsig.returned_origin;
         self.inferred_return_field = .pending;
+        self.field_ranges.clearRetainingCapacity();
         defer {
+            self.field_ranges.clearRetainingCapacity();
             self.current_accesses = prev_acc;
             self.current_perm_trace = prev_pt;
             self.current_disjoint_certs = prev_dc;
@@ -3752,7 +3825,8 @@ const Analyzer = struct {
         const body_res = try self.checkBlock(&f.body, fsig.ret, f.ret != null);
         if (f.ret != null and !fsig.ret.eql(.unit)) {
             if (f.body.tail != null or f.body.stmts.len == 0) {
-                try self.checkAssignmentValue(f.body.span, fsig.ret, body_res);
+                const tail_op: ?ast.BinaryOp = if (f.body.tail != null and f.body.tail.?.* == .binary) f.body.tail.?.binary.op else null;
+                try self.checkAssignmentValueWithOp(f.body.span, fsig.ret, body_res, tail_op);
                 if (fsig.ret.* == .view) {
                     if (f.body.tail) |tail_expr| {
                         try self.verifyReturnedViewOrigin(tail_expr.getSpan(), tail_expr, fsig.ret.view.mode);
@@ -3900,7 +3974,8 @@ const Analyzer = struct {
                 const val_res = try self.checkExpr(ls.value, expected);
                 const final_ty = expected orelse try self.finalizeInferredType(ls.value.getSpan(), val_res);
                 if (expected) |exp| {
-                    try self.checkAssignmentValue(ls.span, exp, val_res);
+                    const init_op: ?ast.BinaryOp = if (ls.value.* == .binary) ls.value.binary.op else null;
+                    try self.checkAssignmentValueWithOp(ls.span, exp, val_res, init_op);
                 }
                 if (!final_ty.isCopyable() and ls.value.* == .ident) {
                     const src_name = ls.value.ident.slice(self.source);
@@ -3951,7 +4026,14 @@ const Analyzer = struct {
                 }
             },
             .assign_stmt => |asg| {
-                const hinted_ty = self.peekWriteTargetType(asg.target);
+                const hinted_raw = self.peekWriteTargetType(asg.target);
+                const hinted_ty: ?*const Ty = if (hinted_raw) |ht|
+                    if (ht.* == .view and ht.view.mode == .exclusive and ht.view.target.* != .slice and ht.view.target.* != .collection)
+                        ht.view.target
+                    else
+                        ht
+                else
+                    null;
                 const rhs = try self.checkExpr(asg.value, hinted_ty);
                 const rhs_res = if (asg.op == .assign and hinted_ty != null and hinted_ty.?.isInteger() != null)
                     try self.readIntegerOperand(asg.value, rhs)
@@ -3959,10 +4041,28 @@ const Analyzer = struct {
                     rhs;
                 const target_info = try self.checkWriteTarget(asg.target, asg.span);
                 try self.expr_types.put(self.alloc, asg.target, target_info.ty);
+                const is_view_rebind = blk: {
+                    if (asg.op == .assign and asg.target.* == .ident and target_info.ty.* == .view and rhs_res.ty.* == .view) {
+                        if (self.lookupVar(asg.target.ident.slice(self.source))) |vb| {
+                            break :blk vb.mutable and vb.view_id == null and target_info.ty.eql(rhs_res.ty.*);
+                        }
+                    }
+                    break :blk false;
+                };
+                const write_val_ty: *const Ty = if (!is_view_rebind and target_info.ty.* == .view and
+                    target_info.ty.view.mode == .exclusive and
+                    target_info.ty.view.target.* != .slice and
+                    target_info.ty.view.target.* != .collection)
+                    target_info.ty.view.target
+                else
+                    target_info.ty;
+                const write_val_range: ?IntRange = if (write_val_ty != target_info.ty) write_val_ty.rangeOf() else target_info.range;
+                var post_range: ?IntRange = null;
                 if (asg.op == .assign) {
-                    try self.checkAssignmentValue(asg.span, target_info.ty, rhs_res);
+                    try self.checkAssignmentValueWithOp(asg.span, write_val_ty, rhs_res, null);
+                    post_range = rhs_res.range orelse write_val_ty.rangeOf();
                 } else {
-                    const lhs_res = ExprResult{ .ty = target_info.ty, .range = target_info.range };
+                    const lhs_res = ExprResult{ .ty = write_val_ty, .range = write_val_range };
                     const op_bin: ast.BinaryOp = switch (asg.op) {
                         .add_assign => .add,
                         .sub_assign => .sub,
@@ -3971,8 +4071,33 @@ const Analyzer = struct {
                         .rem_assign => .rem,
                         .assign => .add,
                     };
-                    const combined = try self.combineBinary(asg.span, op_bin, lhs_res, rhs_res, target_info.ty);
-                    try self.checkAssignmentValue(asg.span, target_info.ty, combined);
+                    if (isTraitDispatchableScalarTarget(write_val_ty)) {
+                        if (try self.resolveNumericOpTrait(null, asg.span, op_bin, write_val_ty)) |ctr| {
+                            if (!write_val_ty.eql(rhs_res.ty.*)) {
+                                self.addError(.type_mismatch, asg.span, "compound assignment operand type mismatch");
+                            }
+                            try self.assign_trait_resolutions.put(self.alloc, stmt, ctr);
+                        }
+                    } else {
+                        const combined = try self.combineBinary(asg.span, op_bin, lhs_res, rhs_res, write_val_ty);
+                        try self.checkAssignmentValueWithOp(asg.span, write_val_ty, combined, op_bin);
+                        post_range = combined.range orelse write_val_ty.rangeOf();
+                    }
+                }
+                if (asg.target.* == .ident) {
+                    const rname = asg.target.ident.slice(self.source);
+                    self.invalidateRootFieldRanges(rname);
+                    if (self.lookupVar(rname)) |vb| {
+                        if (vb.view_root) |vr| {
+                            self.invalidateRootFieldRanges(vr);
+                        }
+                    }
+                } else if (self.extractPureFieldPath(asg.target)) |fp| {
+                    if (post_range) |pr| {
+                        try self.setFieldRange(fp.root, fp.field, pr);
+                    } else {
+                        self.removeFieldRange(fp.root, fp.field);
+                    }
                 }
             },
             .return_stmt => |rs| {
@@ -3980,7 +4105,8 @@ const Analyzer = struct {
                     const rv = try self.checkExpr(v, self.current_fn_ret);
                     if (self.current_fn_ret) |ret_ty| {
                         if (!ret_ty.eql(.unit)) {
-                            try self.checkAssignmentValue(rs.span, ret_ty, rv);
+                            const ret_op: ?ast.BinaryOp = if (v.* == .binary) v.binary.op else null;
+                            try self.checkAssignmentValueWithOp(rs.span, ret_ty, rv, ret_op);
                             if (ret_ty.* == .view) {
                                 try self.verifyReturnedViewOrigin(rs.span, v, ret_ty.view.mode);
                             }
@@ -3996,10 +4122,13 @@ const Analyzer = struct {
                 }
                 const saved_ranges = try self.alloc.alloc(?IntRange, self.scopes.items.len);
                 for (self.scopes.items, 0..) |sb, si| saved_ranges[si] = sb.range;
+                const saved_field_ranges = try self.alloc.dupe(FieldRangeEntry, self.field_ranges.items);
                 defer {
                     for (0..saved_ranges.len) |si| {
                         if (si < self.scopes.items.len) self.scopes.items[si].range = saved_ranges[si];
                     }
+                    self.field_ranges.clearRetainingCapacity();
+                    self.field_ranges.appendSlice(self.alloc, saved_field_ranges) catch {};
                 }
                 {
                     try self.pushScope();
@@ -4258,10 +4387,22 @@ const Analyzer = struct {
                 if (vb.moved) {
                     self.addError(.use_after_move, sp, "cannot assign to moved value");
                 }
-                if (!vb.mutable) {
+                const is_excl_view_target = vb.ty.* == .view and vb.ty.view.mode == .exclusive and
+                    vb.ty.view.target.* != .slice and vb.ty.view.target.* != .collection;
+                if (!vb.mutable and !is_excl_view_target) {
                     self.addError(.mutability_error, sp, "cannot assign to immutable binding; mark with 'mut'");
                 }
-                if (self.active_fork_start) |fstart| {
+                if (is_excl_view_target and (vb.view_id != null or vb.view_root != null)) {
+                    try self.recordAccess(
+                        vb.view_root orelse name,
+                        vb.view_record_idx orelse recordOfType(vb.ty.view.target),
+                        vb.view_field_idx,
+                        true,
+                        stmt_span,
+                        vb.view_index_key,
+                        vb.view_id,
+                    );
+                } else if (self.active_fork_start) |fstart| {
                     if (!self.in_projection_base and vb.decl_span.start < fstart and vb.ty.* != .fn_ty) {
                         try self.recordAccess(name, recordOfType(vb.ty), null, true, stmt_span, null, vb.view_id);
                     }
@@ -4322,7 +4463,11 @@ const Analyzer = struct {
                     try self.recordAccess(rn, ridx, fidx, true, stmt_span, idx_key, resolved.through_view_id);
                 }
                 const cf = self.record_defs.items[ridx].fields[fidx];
-                return .{ .ty = cf.ty, .range = cf.ty.rangeOf() };
+                const narrowed_rng = if (fld.target.* == .ident)
+                    self.lookupFieldRange(fld.target.ident.slice(self.source), fname)
+                else
+                    null;
+                return .{ .ty = cf.ty, .range = narrowed_rng orelse cf.ty.rangeOf() };
             },
             .index => |ix| {
                 const prev_proj = self.in_projection_base;
@@ -4573,13 +4718,147 @@ const Analyzer = struct {
         return res.ty;
     }
 
+    const f32_exact_int_limit: i128 = 16_777_216;
+    const f64_exact_int_limit: i128 = 9_007_199_254_740_992;
+
+    fn intRangeFitsFloat(rng: IntRange, is_f64: bool) bool {
+        return switch (rng) {
+            .bounded => |b| blk: {
+                const lim = if (is_f64) f64_exact_int_limit else f32_exact_int_limit;
+                break :blk b.lo >= -lim and b.hi <= lim;
+            },
+            .wide => |w| w.bits <= (if (is_f64) @as(u16, 53) else @as(u16, 24)),
+        };
+    }
+
+    fn canWidenNumericLossless(src_ty: *const Ty, src_range: ?IntRange, dst_ty: *const Ty) bool {
+        switch (dst_ty.*) {
+            .int => |it| {
+                const eff = src_range orelse src_ty.rangeOf() orelse return false;
+                return eff.fitsType(it);
+            },
+            .int_range => |ir| {
+                const eff = src_range orelse src_ty.rangeOf() orelse return false;
+                return ir.range.containsRange(eff);
+            },
+            .f32 => {
+                if (src_ty.* == .f32) return true;
+                const eff = src_range orelse src_ty.rangeOf() orelse return false;
+                return intRangeFitsFloat(eff, false);
+            },
+            .f64 => {
+                if (src_ty.* == .f32 or src_ty.* == .f64) return true;
+                const eff = src_range orelse src_ty.rangeOf() orelse return false;
+                return intRangeFitsFloat(eff, true);
+            },
+            else => return false,
+        }
+    }
+
+    fn joinLosslessScalarTy(self: *Analyzer, a: *const Ty, b: *const Ty) std.mem.Allocator.Error!?*const Ty {
+        if (a.eql(b.*)) return a;
+        if (a.isInteger() != null and b.isInteger() != null) {
+            const r1 = a.rangeOf() orelse return null;
+            const r2 = b.rangeOf() orelse return null;
+            const jr = r1.join(r2);
+            const it = int_range.inferIntegerType(jr) orelse return null;
+            return try self.allocTy(.{ .int = it });
+        }
+        if ((a.* == .f64 and b.* == .f32) or (a.* == .f32 and b.* == .f64)) {
+            return try self.allocTy(.f64);
+        }
+        if (a.* == .f32 or a.* == .f64) {
+            if (b.isInteger() != null) {
+                const r = b.rangeOf() orelse return null;
+                if (a.* == .f32 and intRangeFitsFloat(r, false)) return a;
+                if (intRangeFitsFloat(r, true)) return try self.allocTy(.f64);
+            }
+            return null;
+        }
+        if (b.* == .f32 or b.* == .f64) {
+            if (a.isInteger() != null) {
+                const r = a.rangeOf() orelse return null;
+                if (b.* == .f32 and intRangeFitsFloat(r, false)) return b;
+                if (intRangeFitsFloat(r, true)) return try self.allocTy(.f64);
+            }
+            return null;
+        }
+        return null;
+    }
+
+    fn formatRangeDesc(self: *Analyzer, ty: *const Ty, rng_opt: ?IntRange) []const u8 {
+        if (rng_opt) |rng| {
+            switch (rng) {
+                .bounded => |b| {
+                    if (int_range.inferIntegerType(rng)) |synth| {
+                        return std.fmt.allocPrint(self.alloc, "{d}..={d} ({c}{d})", .{
+                            b.lo,
+                            b.hi,
+                            if (synth.signed) @as(u8, 'i') else @as(u8, 'u'),
+                            synth.bits,
+                        }) catch "integer range";
+                    }
+                    return std.fmt.allocPrint(self.alloc, "{d}..={d}", .{ b.lo, b.hi }) catch "integer range";
+                },
+                .wide => |w| {
+                    return std.fmt.allocPrint(self.alloc, "{c}{d}", .{
+                        if (w.signed) @as(u8, 'i') else @as(u8, 'u'),
+                        w.bits,
+                    }) catch "wide integer";
+                },
+            }
+        }
+        if (ty.isInteger()) |it| {
+            return std.fmt.allocPrint(self.alloc, "{c}{d}", .{
+                if (it.signed) @as(u8, 'i') else @as(u8, 'u'),
+                it.bits,
+            }) catch "integer";
+        }
+        return "target type";
+    }
+
+    fn reportOverflowDiagnostic(
+        self: *Analyzer,
+        span: ast.Span,
+        op_hint: ?ast.BinaryOp,
+        src_ty: *const Ty,
+        src_range: ?IntRange,
+        dst_ty: *const Ty,
+    ) void {
+        const src_desc = self.formatRangeDesc(src_ty, src_range orelse src_ty.rangeOf());
+        const dst_desc = self.formatRangeDesc(dst_ty, dst_ty.rangeOf());
+        const op_advice: []const u8 = if (op_hint) |op| switch (op) {
+            .add => "use '+|' (saturating) or '+%' (wrapping)",
+            .sub => "use '-|' (saturating) or '-%' (wrapping)",
+            .mul => "use '*|' (saturating) or '*%' (wrapping)",
+            else => "use saturating '+|'/'-|'/'*|' or wrapping '+%'/'-%'/'*%'",
+        } else "use saturating '+|'/'-|'/'*|' or wrapping '+%'/'-%'/'*%'";
+        const msg = std.fmt.allocPrint(
+            self.alloc,
+            "potential integer overflow: expression range {s} exceeds target {s}; help: {s}, widen target type, or add a range guard",
+            .{ src_desc, dst_desc, op_advice },
+        ) catch "potential integer overflow: expression range exceeds target integer type";
+        self.addError(.potential_overflow, span, msg);
+    }
+
     fn checkAssignmentValue(self: *Analyzer, span: ast.Span, target: *const Ty, val: ExprResult) std.mem.Allocator.Error!void {
+        try self.checkAssignmentValueWithOp(span, target, val, null);
+    }
+
+    fn checkAssignmentValueWithOp(
+        self: *Analyzer,
+        span: ast.Span,
+        target: *const Ty,
+        val: ExprResult,
+        op_hint: ?ast.BinaryOp,
+    ) std.mem.Allocator.Error!void {
         if (target.* == .err) return;
         if (val.ty.* == .err and val.unsized_literal == null and val.range == null) return;
 
-        // Check unsized integer literal fit directly against target integer / IntRange type.
+        // Check unsized integer literal fit directly against target integer / IntRange / float / scalar View type.
         if (val.unsized_literal) |lit| {
-            switch (target.*) {
+            const lit_target: *const Ty = if (target.* == .view) target.view.target else target;
+            switch (lit_target.*) {
                 .int => |it| {
                     const ok = if (lit.negative) int_range.fitsSignedNegated(lit.mag, it) else int_range.fitsNonNeg(lit.mag, it);
                     if (!ok) {
@@ -4595,6 +4874,14 @@ const Analyzer = struct {
                     }
                     return;
                 },
+                .f32, .f64 => {
+                    if (val.range) |lr| {
+                        if (!intRangeFitsFloat(lr, lit_target.* == .f64)) {
+                            self.addError(.literal_out_of_range, span, "integer literal exceeds exact float precision; use explicit 'as'");
+                        }
+                    }
+                    return;
+                },
                 else => {
                     self.addError(.type_mismatch, span, "integer literal assigned to non-integer target type");
                     return;
@@ -4602,37 +4889,20 @@ const Analyzer = struct {
             }
         }
 
-        // Check range / integer overflow safety!
+        // Check lossless numeric widening & integer overflow safety!
         switch (target.*) {
-            .int => |it| {
-                if (val.ty.* == .int_range) {
-                    const rng = val.range orelse val.ty.int_range.range;
-                    if (!rng.fitsType(it)) {
-                        self.addError(.potential_overflow, span, "potential integer overflow: expression range exceeds target integer type");
-                    }
-                    return;
-                }
-                if (val.ty.* == .int) {
-                    const src_it = val.ty.int;
-                    if (src_it.signed != it.signed or src_it.bits != it.bits) {
-                        if (val.range) |rng| {
-                            if (rng.fitsType(it)) return;
-                        }
-                        self.addError(.potential_overflow, span, "integer type mismatch or potential overflow into target width");
+            .int, .int_range => {
+                if (val.ty.isInteger() != null or val.ty.* == .int_range) {
+                    if (!canWidenNumericLossless(val.ty, val.range, target)) {
+                        self.reportOverflowDiagnostic(span, op_hint, val.ty, val.range, target);
                     }
                     return;
                 }
             },
-            .int_range => |ir| {
-                if (val.range) |rng| {
-                    if (!ir.range.containsRange(rng)) {
-                        self.addError(.potential_overflow, span, "potential integer overflow: expression interval may exceed Int(lo..hi) bounds");
-                    }
-                    return;
-                }
-                if (val.ty.isInteger()) |src_it| {
-                    if (!IntRange.ofType(src_it).fitsType(ir.synthesized) or !ir.range.containsRange(IntRange.ofType(src_it))) {
-                        self.addError(.potential_overflow, span, "integer expression may exceed Int(lo..hi) bounds");
+            .f32, .f64 => {
+                if (val.ty.* == .f32 or val.ty.* == .f64 or val.ty.isInteger() != null or val.ty.* == .int_range) {
+                    if (!canWidenNumericLossless(val.ty, val.range, target)) {
+                        self.addError(.type_mismatch, span, "cannot implicitly widen float or wide integer without precision loss; use explicit 'as'");
                     }
                     return;
                 }
@@ -4763,19 +5033,25 @@ const Analyzer = struct {
                     self.addError(.literal_out_of_range, sp, "integer literal exceeds 128-bit constant parser range");
                     return .{ .ty = try self.allocTy(.err), .range = null };
                 };
-                if (parsed.suffix) |suf| {
-                    if (!int_range.fitsNonNeg(parsed.value, suf)) {
-                        self.addError(.literal_out_of_range, sp, "suffixed integer literal out of range for its bit width");
-                    }
-                    return .{
-                        .ty = try self.allocTy(.{ .int = suf }),
-                        .range = if (parsed.value <= @as(u128, @intCast(std.math.maxInt(i128)))) IntRange.singleton(@intCast(parsed.value)) else null,
-                    };
-                }
                 const rng: ?IntRange = if (parsed.value <= @as(u128, @intCast(std.math.maxInt(i128))))
                     IntRange.singleton(@intCast(parsed.value))
                 else
                     null;
+                if (expected != null and (expected.?.* == .f32 or expected.?.* == .f64)) {
+                    if (rng == null or !intRangeFitsFloat(rng.?, expected.?.* == .f64)) {
+                        self.addError(.literal_out_of_range, sp, "integer literal exceeds exact float precision; use explicit 'as'");
+                    }
+                    return .{
+                        .ty = expected.?,
+                        .range = rng,
+                        .unsized_literal = .{ .negative = false, .mag = parsed.value },
+                    };
+                }
+                if (expected != null and isTraitDispatchableScalarTarget(expected.?)) {
+                    if (try self.resolveNumeralFromInt(expr, sp, parsed.value, false, expected.?)) |res_ty| {
+                        return .{ .ty = res_ty, .range = null };
+                    }
+                }
                 const inf_ty = if (expected != null and expected.?.isInteger() != null)
                     expected.?
                 else if (rng) |r| blk: {
@@ -4887,24 +5163,27 @@ const Analyzer = struct {
                         self.addError(.literal_out_of_range, u.span, "negated integer literal out of range");
                         return .{ .ty = try self.allocTy(.err), .range = null };
                     };
-                    if (parsed.suffix) |suf| {
-                        if (!int_range.fitsSignedNegated(parsed.value, suf)) {
-                            self.addError(.literal_out_of_range, u.span, "negated literal does not fit in its signed bit width");
-                        }
-                        const neg_rng: ?IntRange = if (parsed.value == @as(u128, 1) << 127)
-                            IntRange.singleton(std.math.minInt(i128))
-                        else if (parsed.value <= @as(u128, @intCast(std.math.maxInt(i128))))
-                            IntRange.singleton(-@as(i128, @intCast(parsed.value)))
-                        else
-                            null;
-                        return .{ .ty = try self.allocTy(.{ .int = suf }), .range = neg_rng };
-                    }
                     const neg_rng: ?IntRange = if (parsed.value == @as(u128, 1) << 127)
                         IntRange.singleton(std.math.minInt(i128))
                     else if (parsed.value <= @as(u128, @intCast(std.math.maxInt(i128))))
                         IntRange.singleton(-@as(i128, @intCast(parsed.value)))
                     else
                         null;
+                    if (expected != null and (expected.?.* == .f32 or expected.?.* == .f64)) {
+                        if (neg_rng == null or !intRangeFitsFloat(neg_rng.?, expected.?.* == .f64)) {
+                            self.addError(.literal_out_of_range, u.span, "negated integer literal exceeds exact float precision; use explicit 'as'");
+                        }
+                        return .{
+                            .ty = expected.?,
+                            .range = neg_rng,
+                            .unsized_literal = .{ .negative = true, .mag = parsed.value },
+                        };
+                    }
+                    if (expected != null and isTraitDispatchableScalarTarget(expected.?)) {
+                        if (try self.resolveNumeralFromInt(expr, u.span, parsed.value, true, expected.?)) |res_ty| {
+                            return .{ .ty = res_ty, .range = null };
+                        }
+                    }
                     const ty = if (expected != null and expected.?.isInteger() != null)
                         expected.?
                     else if (neg_rng) |nr| blk: {
@@ -4931,6 +5210,11 @@ const Analyzer = struct {
                 }
                 const op_res = try self.checkExpr(u.operand, expected);
                 if (u.op == .neg) {
+                    if (isTraitDispatchableScalarTarget(op_res.ty)) {
+                        if (try self.resolveNumericTraitByName(expr, u.span, "Ring", "neg", op_res.ty)) |_| {
+                            return .{ .ty = op_res.ty, .range = null };
+                        }
+                    }
                     const rng = if (op_res.range) |r| r.neg() else null;
                     if (op_res.range != null and rng == null) {
                         self.addError(.width_exceeded, u.span, "negation exceeds supported integer bit width");
@@ -4950,8 +5234,23 @@ const Analyzer = struct {
                 if (b.op == .pipe) {
                     return try self.checkPipeline(expr, b.left, b.right, expected);
                 }
-                const lr = try self.checkExpr(b.left, null);
-                const rr = try self.checkExpr(b.right, null);
+                const l_lit = isNumericLiteralExpr(b.left);
+                const r_lit = isNumericLiteralExpr(b.right);
+                var lr: ExprResult = undefined;
+                var rr: ExprResult = undefined;
+                if (l_lit and !r_lit) {
+                    rr = try self.checkExpr(b.right, null);
+                    const l_hint: ?*const Ty = if (rr.ty.* != .int_range and rr.ty.* != .err) rr.ty else expected;
+                    lr = try self.checkExpr(b.left, l_hint);
+                } else {
+                    const l_exp: ?*const Ty = switch (b.op) {
+                        .add_sat, .sub_sat, .mul_sat, .add_wrap, .sub_wrap, .mul_wrap => expected,
+                        else => null,
+                    };
+                    lr = try self.checkExpr(b.left, l_exp);
+                    const r_hint: ?*const Ty = if (r_lit and lr.ty.* != .int_range and lr.ty.* != .err) lr.ty else null;
+                    rr = try self.checkExpr(b.right, r_hint);
+                }
                 switch (b.op) {
                     .eq, .ne, .lt, .le, .gt, .ge, .range, .range_eq, .sub_sat => {
                         const left = try self.readIntegerOperand(b.left, lr);
@@ -4960,13 +5259,45 @@ const Analyzer = struct {
                     },
                     else => {},
                 }
+                if ((b.op == .add or b.op == .sub or b.op == .mul or b.op == .div) and isTraitDispatchableScalarTarget(lr.ty)) {
+                    if (!lr.ty.eql(rr.ty.*)) {
+                        self.addError(.type_mismatch, b.span, "binary operator operand types do not match");
+                    }
+                    if (try self.resolveNumericOpTrait(expr, b.span, b.op, lr.ty)) |_| {
+                        return .{ .ty = lr.ty, .range = null };
+                    }
+                }
+                if ((b.op == .eq or b.op == .ne) and isTraitDispatchableScalarTarget(lr.ty)) {
+                    if (!lr.ty.eql(rr.ty.*)) {
+                        self.addError(.type_mismatch, b.span, "equality operand types do not match");
+                    }
+                    if (self.resolveVisibleTraitIndex("Eq", b.span)) |eq_tidx| {
+                        if (self.resolveTraitWitness(eq_tidx, &.{lr.ty}, &.{null}, b.span, false)) |w| {
+                            try self.call_trait_resolutions.put(self.alloc, expr, .{
+                                .kind = .{ .trait_method = .{ .method_name = "eq", .witness = w } },
+                                .witnesses = &.{},
+                                .type_args = &.{},
+                            });
+                        }
+                    }
+                    return .{ .ty = try self.allocTy(.bool), .range = null };
+                }
                 return try self.combineBinary(b.span, b.op, lr, rr, expected);
             },
             .cast => |c| {
                 const target_ty = try self.resolveType(c.ty);
                 const inner = try self.checkExpr(c.expr, target_ty);
-                try self.checkAssignmentValue(c.span, target_ty, inner);
-                return .{ .ty = target_ty, .range = inner.range orelse target_ty.rangeOf() };
+                const is_explicit_float_conv =
+                    ((target_ty.* == .f32 or target_ty.* == .f64) and
+                        (inner.ty.isInteger() != null or inner.ty.* == .f32 or inner.ty.* == .f64)) or
+                    (target_ty.isInteger() != null and (inner.ty.* == .f32 or inner.ty.* == .f64));
+                if (!is_explicit_float_conv) {
+                    try self.checkAssignmentValue(c.span, target_ty, inner);
+                }
+                return .{
+                    .ty = target_ty,
+                    .range = if (target_ty.isInteger() != null) (inner.range orelse target_ty.rangeOf()) else null,
+                };
             },
             .call => |call_expr| {
                 return try self.checkCall(expr, call_expr.span, call_expr.callee, call_expr.args, null, null, expected);
@@ -5087,6 +5418,20 @@ const Analyzer = struct {
                         return .{ .ty = field_ty, .range = field_ty.rangeOf() };
                     }
                     self.addError(.unknown_ident, fld.name, "unknown field on record");
+                }
+                const tup_elems: ?[]const *const Ty = switch (base.ty.*) {
+                    .tuple => |ts| ts,
+                    .view => |v| if (v.target.* == .tuple) v.target.tuple else null,
+                    else => null,
+                };
+                if (tup_elems) |ts| {
+                    if (std.fmt.parseInt(usize, fname, 10) catch null) |tidx| {
+                        if (tidx < ts.len) {
+                            return .{ .ty = ts[tidx], .range = ts[tidx].rangeOf() };
+                        }
+                        self.addError(.unknown_ident, fld.name, "tuple index out of bounds");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
                 }
                 return .{ .ty = try self.allocTy(.err), .range = null };
             },
@@ -5259,9 +5604,20 @@ const Analyzer = struct {
             },
             .tuple => |tp| {
                 if (tp.elems.len == 0) return .{ .ty = try self.allocTy(.unit), .range = null };
+                const exp_tup: ?[]const *const Ty = if (expected) |exp|
+                    if (exp.* == .tuple and exp.tuple.len == tp.elems.len) exp.tuple else null
+                else
+                    null;
                 const es = try self.alloc.alloc(*const Ty, tp.elems.len);
                 for (tp.elems, 0..) |el, i| {
-                    es[i] = (try self.checkExpr(el, null)).ty;
+                    const el_exp: ?*const Ty = if (exp_tup) |et| et[i] else null;
+                    const er = try self.checkExpr(el, el_exp);
+                    if (el_exp) |ee| {
+                        try self.checkAssignmentValue(el.getSpan(), ee, er);
+                        es[i] = ee;
+                    } else {
+                        es[i] = try self.finalizeInferredType(el.getSpan(), er);
+                    }
                 }
                 return .{ .ty = try self.allocTy(.{ .tuple = es }), .range = null };
             },
@@ -5307,10 +5663,13 @@ const Analyzer = struct {
                 for (self.active_views.items, 0..) |av, vi| saved_perms[vi] = av.perm;
                 const saved_ranges = try self.alloc.alloc(?IntRange, self.scopes.items.len);
                 for (self.scopes.items, 0..) |sb, si| saved_ranges[si] = sb.range;
+                const saved_field_ranges = try self.alloc.dupe(FieldRangeEntry, self.field_ranges.items);
                 defer {
                     for (0..saved_ranges.len) |si| {
                         if (si < self.scopes.items.len) self.scopes.items[si].range = saved_ranges[si];
                     }
+                    self.field_ranges.clearRetainingCapacity();
+                    self.field_ranges.appendSlice(self.alloc, saved_field_ranges) catch {};
                 }
                 self.branch_depth += 1;
                 defer self.branch_depth -= 1;
@@ -5333,6 +5692,8 @@ const Analyzer = struct {
                 for (0..saved_ranges.len) |si| {
                     if (si < self.scopes.items.len) self.scopes.items[si].range = saved_ranges[si];
                 }
+                self.field_ranges.clearRetainingCapacity();
+                try self.field_ranges.appendSlice(self.alloc, saved_field_ranges);
                 if (ie.else_branch) |eb| {
                     const then_perms = try self.alloc.alloc(BorrowPerm, saved_perms.len);
                     for (0..saved_perms.len) |vi| {
@@ -5343,7 +5704,8 @@ const Analyzer = struct {
                     defer self.popScope();
                     try self.applyBranchGuard(ie.cond, false);
                     try self.current_sym_guards.append(self.alloc, try self.invertCondExpr(ie.cond));
-                    const else_res = try self.checkExpr(eb, expected);
+                    const else_exp = expected orelse if (then_res.ty.* == .fn_ty) then_res.ty else null;
+                    const else_res = try self.checkExpr(eb, else_exp);
                     for (0..saved_perms.len) |vi| {
                         if (then_perms[vi] == .active_exclusive) {
                             self.active_views.items[vi].perm = .active_exclusive;
@@ -5361,8 +5723,9 @@ const Analyzer = struct {
                             };
                         }
                     }
+                    const joined_ty = (try self.joinLosslessScalarTy(then_res.ty, else_res.ty)) orelse then_res.ty;
                     return .{
-                        .ty = then_res.ty,
+                        .ty = joined_ty,
                         .range = joined_range,
                     };
                 }
@@ -5533,6 +5896,9 @@ const Analyzer = struct {
                 else
                     self.resolveAccessRoot(vw.target);
                 const root_name = target_resolved.root_name orelse "";
+                if (mode == .exclusive and root_name.len > 0) {
+                    self.invalidateRootFieldRanges(root_name);
+                }
 
                 var field_idx: ?usize = null;
                 var idx_key: ?AccessIndex = target_resolved.view_index_key;
@@ -5549,6 +5915,11 @@ const Analyzer = struct {
                             if (self.expr_types.get(vw.target.field.target)) |ft| {
                                 if (recordOfType(ft)) |ri| {
                                     field_idx = self.findRecordField(ri, vw.target.field.name.slice(self.source));
+                                    if (field_idx) |fi| {
+                                        if (fi < self.record_defs.items[ri].address_taken_fields.len) {
+                                            self.record_defs.items[ri].address_taken_fields[fi] = true;
+                                        }
+                                    }
                                     if (vw.target.field.target.* == .index and idx_key == null) {
                                         idx_key = self.extractAccessIndex(vw.target.field.target.index.idx);
                                     }
@@ -7437,6 +7808,7 @@ const Analyzer = struct {
                 const param_idx = ai + recv_offset;
                 const expected_p = if (param_idx < fsig.params.len) fsig.params[param_idx] else null;
                 if (is_poly_fn and expected_p != null) {
+                    if (isNumericLiteralExpr(arg.value)) continue;
                     const ep_sub = try self.substituteType(expected_p.?, &subst);
                     const has_free = containsUnresolvedTypeVar(ep_sub, &subst);
                     const ar = try self.checkExpr(arg.value, if (has_free) null else ep_sub);
@@ -7444,11 +7816,33 @@ const Analyzer = struct {
                         try self.finalizeInferredType(arg.value.getSpan(), ar)
                     else
                         ar.ty;
+                    if (ep_sub.* == .view and arg.value.* == .field) {
+                        if (self.expr_types.get(arg.value.field.target)) |ft| {
+                            if (recordOfType(ft)) |ri| {
+                                if (self.findRecordField(ri, arg.value.field.name.slice(self.source))) |fi| {
+                                    if (fi < self.record_defs.items[ri].address_taken_fields.len) {
+                                        self.record_defs.items[ri].address_taken_fields[fi] = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (!ep_sub.isCopyable() and arg.value.* == .ident) {
                         const vname = arg.value.ident.slice(self.source);
                         if (self.lookupVar(vname)) |vb| {
                             if (ep_sub.* != .view and ep_sub.* != .slice and ep_sub.* != .path_borrow) {
                                 vb.moved = true;
+                            }
+                        }
+                    }
+                    if (expected_p.?.* == .type_var) {
+                        const tv = expected_p.?.type_var;
+                        if (subst.get(tv)) |bound| {
+                            if (bound.* != .err and !bound.eql(final_ar_ty.*)) {
+                                if (try self.joinLosslessScalarTy(bound, final_ar_ty)) |joined| {
+                                    try subst.put(self.alloc, tv, joined);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -7458,6 +7852,17 @@ const Analyzer = struct {
                 } else {
                     const ar = try self.checkExpr(arg.value, expected_p);
                     if (expected_p) |ep| {
+                        if (ep.* == .view and arg.value.* == .field) {
+                            if (self.expr_types.get(arg.value.field.target)) |ft| {
+                                if (recordOfType(ft)) |ri| {
+                                    if (self.findRecordField(ri, arg.value.field.name.slice(self.source))) |fi| {
+                                        if (fi < self.record_defs.items[ri].address_taken_fields.len) {
+                                            self.record_defs.items[ri].address_taken_fields[fi] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if (!ep.isCopyable() and arg.value.* == .ident) {
                             const vname = arg.value.ident.slice(self.source);
                             if (self.lookupVar(vname)) |vb| {
@@ -7469,6 +7874,44 @@ const Analyzer = struct {
                         try self.checkAssignmentValue(arg.span, ep, ar);
                     }
                 }
+            }
+            if (is_poly_fn) {
+                for (args, 0..) |arg, ai| {
+                    const param_idx = ai + recv_offset;
+                    const expected_p = if (param_idx < fsig.params.len) fsig.params[param_idx] else null;
+                    if (expected_p == null) continue;
+                    const ep_sub = try self.substituteType(expected_p.?, &subst);
+                    if (isNumericLiteralExpr(arg.value)) {
+                        const has_free = containsUnresolvedTypeVar(ep_sub, &subst);
+                        const ar = try self.checkExpr(arg.value, if (has_free) null else ep_sub);
+                        const final_ar_ty = if (has_free)
+                            try self.finalizeInferredType(arg.value.getSpan(), ar)
+                        else
+                            ar.ty;
+                        if (expected_p.?.* == .type_var) {
+                            const tv = expected_p.?.type_var;
+                            if (subst.get(tv)) |bound| {
+                                if (bound.* != .err and !bound.eql(final_ar_ty.*)) {
+                                    if (try self.joinLosslessScalarTy(bound, final_ar_ty)) |joined| {
+                                        try subst.put(self.alloc, tv, joined);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        if (!try self.unifyType(expected_p.?, final_ar_ty, &subst)) {
+                            self.addError(.type_mismatch, arg.span, "argument does not match generic function type parameter");
+                        }
+                    } else {
+                        const ar_ty = self.expr_types.get(arg.value) orelse continue;
+                        if (ep_sub.* != .type_var and !ep_sub.eql(ar_ty.*)) {
+                            try self.checkAssignmentValue(arg.span, ep_sub, .{ .ty = ar_ty, .range = ar_ty.rangeOf() });
+                        }
+                    }
+                }
+            }
+            if (is_poly_fn and expected != null and expected.?.* != .err) {
+                _ = self.unifyType(fsig.ret, expected.?, &subst) catch false;
             }
             if (fsig.type_params.len > 0) {
                 const concrete = try self.alloc.alloc(*const Ty, fsig.type_params.len);
@@ -7771,8 +8214,13 @@ const Analyzer = struct {
                 return .{ .ty = target_ty, .range = target_ty.rangeOf() };
             },
             .add, .sub, .mul, .div, .rem, .bit_or, .bit_xor, .bit_and, .shl, .shr => {
-                if (lr.ty.* == .f32 or lr.ty.* == .f64) {
-                    return .{ .ty = lr.ty, .range = null };
+                if (lr.ty.* == .f32 or lr.ty.* == .f64 or rr.ty.* == .f32 or rr.ty.* == .f64) {
+                    const joined = try self.joinLosslessScalarTy(lr.ty, rr.ty);
+                    if (joined == null) {
+                        self.addError(.type_mismatch, span, "cannot implicitly mix float with integer exceeding exact float precision; use explicit 'as f32' or 'as f64'");
+                        return .{ .ty = try self.allocTy(.err), .range = null };
+                    }
+                    return .{ .ty = joined.?, .range = null };
                 }
                 const r1 = lr.range orelse lr.ty.rangeOf();
                 const r2 = rr.range orelse rr.ty.rangeOf();
@@ -7800,6 +8248,140 @@ const Analyzer = struct {
             },
             .pipe => unreachable,
         }
+    }
+
+    fn isTraitDispatchableScalarTarget(ty: *const Ty) bool {
+        return switch (ty.*) {
+            .type_var, .record, .adt, .applied => true,
+            else => false,
+        };
+    }
+
+    fn resolveNumeralFromInt(
+        self: *Analyzer,
+        expr: *const ast.Expr,
+        span: ast.Span,
+        mag: u128,
+        negative: bool,
+        target_ty: *const Ty,
+    ) std.mem.Allocator.Error!?*const Ty {
+        const tidx = self.resolveVisibleTraitIndex("FromInt", span) orelse return null;
+        const i32_ty = int_range.IntType{ .signed = true, .bits = 32 };
+        const fits = if (negative) int_range.fitsSignedNegated(mag, i32_ty) else int_range.fitsNonNeg(mag, i32_ty);
+        if (!fits) {
+            self.addError(.literal_out_of_range, span, "integer literal exceeds FromInt(i32) range");
+            return target_ty;
+        }
+        if (self.resolveTraitWitness(tidx, &.{target_ty}, &.{null}, span, true)) |w| {
+            try self.numeral_trait_resolutions.put(self.alloc, expr, w);
+        }
+        return target_ty;
+    }
+
+    fn resolveNumericTraitByName(
+        self: *Analyzer,
+        expr: ?*const ast.Expr,
+        span: ast.Span,
+        trait_name: []const u8,
+        method_name: []const u8,
+        target_ty: *const Ty,
+    ) std.mem.Allocator.Error!?CallTraitResolution {
+        const tidx = self.resolveVisibleTraitIndex(trait_name, span) orelse return null;
+        const w = self.resolveTraitWitness(tidx, &.{target_ty}, &.{null}, span, true) orelse return null;
+        const ctr = CallTraitResolution{
+            .kind = .{ .trait_method = .{ .method_name = method_name, .witness = w } },
+            .witnesses = &.{},
+            .type_args = &.{},
+        };
+        if (expr) |e| {
+            try self.call_trait_resolutions.put(self.alloc, e, ctr);
+        }
+        return ctr;
+    }
+
+    fn resolveNumericOpTrait(
+        self: *Analyzer,
+        expr: ?*const ast.Expr,
+        span: ast.Span,
+        op: ast.BinaryOp,
+        target_ty: *const Ty,
+    ) std.mem.Allocator.Error!?CallTraitResolution {
+        return switch (op) {
+            .add => try self.resolveNumericTraitByName(expr, span, "Semiring", "add", target_ty),
+            .mul => try self.resolveNumericTraitByName(expr, span, "Semiring", "mul", target_ty),
+            .sub => try self.resolveNumericTraitByName(expr, span, "Ring", "sub", target_ty),
+            .div => try self.resolveNumericTraitByName(expr, span, "Field", "div", target_ty),
+            else => null,
+        };
+    }
+
+    fn isNumericLiteralExpr(expr: *const ast.Expr) bool {
+        return switch (expr.*) {
+            .int_lit, .float_lit => true,
+            .unary => |u| u.op == .neg and (u.operand.* == .int_lit or u.operand.* == .float_lit),
+            else => false,
+        };
+    }
+
+    fn extractPureFieldPath(self: *const Analyzer, expr: *const ast.Expr) ?struct { root: []const u8, field: []const u8 } {
+        if (expr.* != .field) return null;
+        const fld = expr.field;
+        if (fld.target.* != .ident) return null;
+        return .{
+            .root = fld.target.ident.slice(self.source),
+            .field = fld.name.slice(self.source),
+        };
+    }
+
+    fn lookupFieldRange(self: *const Analyzer, root: []const u8, field: []const u8) ?IntRange {
+        var i = self.field_ranges.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.field_ranges.items[i];
+            if (std.mem.eql(u8, entry.root, root) and std.mem.eql(u8, entry.field, field)) {
+                return entry.range;
+            }
+        }
+        return null;
+    }
+
+    fn setFieldRange(self: *Analyzer, root: []const u8, field: []const u8, rng: IntRange) std.mem.Allocator.Error!void {
+        for (self.field_ranges.items) |*entry| {
+            if (std.mem.eql(u8, entry.root, root) and std.mem.eql(u8, entry.field, field)) {
+                entry.range = rng;
+                return;
+            }
+        }
+        try self.field_ranges.append(self.alloc, .{ .root = root, .field = field, .range = rng });
+    }
+
+    fn removeFieldRange(self: *Analyzer, root: []const u8, field: []const u8) void {
+        var i = self.field_ranges.items.len;
+        while (i > 0) {
+            i -= 1;
+            const entry = self.field_ranges.items[i];
+            if (std.mem.eql(u8, entry.root, root) and std.mem.eql(u8, entry.field, field)) {
+                _ = self.field_ranges.swapRemove(i);
+            }
+        }
+    }
+
+    fn invalidateRootFieldRanges(self: *Analyzer, root: []const u8) void {
+        var i = self.field_ranges.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.field_ranges.items[i].root, root)) {
+                _ = self.field_ranges.swapRemove(i);
+            }
+        }
+    }
+
+    fn resolveFieldBaseRange(self: *Analyzer, root: []const u8, field: []const u8) ?IntRange {
+        if (self.lookupFieldRange(root, field)) |fr| return fr;
+        const vb = self.lookupVar(root) orelse return null;
+        const ridx = recordOfType(vb.ty) orelse return null;
+        const fidx = self.findRecordField(ridx, field) orelse return null;
+        return self.record_defs.items[ridx].fields[fidx].ty.rangeOf();
     }
 
     fn applyBranchGuard(self: *Analyzer, cond: *const ast.Expr, truthy: bool) std.mem.Allocator.Error!void {
@@ -7839,6 +8421,28 @@ const Analyzer = struct {
                                 if (flipCmpOp(b.op)) |flipped| {
                                     if (if (truthy) flipped else invertCmpOp(flipped)) |effective_op| {
                                         vb.range = narrowByCmp(cur, effective_op, bound) orelse cur;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (self.extractPureFieldPath(b.left)) |fp| {
+                    if (evalConstInt(self.source, b.right)) |bound| {
+                        if (self.resolveFieldBaseRange(fp.root, fp.field)) |cur| {
+                            if (if (truthy) b.op else invertCmpOp(b.op)) |effective_op| {
+                                if (narrowByCmp(cur, effective_op, bound)) |nr| {
+                                    try self.setFieldRange(fp.root, fp.field, nr);
+                                }
+                            }
+                        }
+                    }
+                } else if (self.extractPureFieldPath(b.right)) |fp| {
+                    if (evalConstInt(self.source, b.left)) |bound| {
+                        if (self.resolveFieldBaseRange(fp.root, fp.field)) |cur| {
+                            if (flipCmpOp(b.op)) |flipped| {
+                                if (if (truthy) flipped else invertCmpOp(flipped)) |effective_op| {
+                                    if (narrowByCmp(cur, effective_op, bound)) |nr| {
+                                        try self.setFieldRange(fp.root, fp.field, nr);
                                     }
                                 }
                             }
@@ -8452,6 +9056,7 @@ const Analyzer = struct {
         }
         const resolved = self.resolveAccessRoot(arg_expr);
         if (resolved.root_name) |rn| {
+            if (is_write) self.invalidateRootFieldRanges(rn);
             const idx_key: ?AccessIndex = resolved.view_index_key orelse if (arg_expr.* == .index)
                 self.extractAccessIndex(arg_expr.index.idx)
             else
@@ -9038,137 +9643,171 @@ const Analyzer = struct {
         return has_field_write;
     }
 
-    fn synthesizeAllLayouts(self: *Analyzer) std.mem.Allocator.Error![]CheckedRecord {
-        const out = try self.alloc.alloc(CheckedRecord, self.record_defs.items.len);
-        for (self.record_defs.items, 0..) |*rdef, ridx| {
-            const schemas = try self.alloc.alloc(layout.FieldSchema, rdef.fields.len);
-            for (rdef.fields, 0..) |f, fi| {
-                const info = self.typeBitInfo(f.ty);
-                schemas[fi] = .{
-                    .name = f.name,
-                    .bits = @max(@as(u16, 1), info.bits),
-                    .signed = info.signed,
-                    .addressable_size = info.size,
-                    .addressable_align = info.alignment,
-                    .is_subbyte_packable = info.packable,
-                };
-            }
-            const base_naive = if (rdef.is_flat_c)
-                try layout.planFlatCLayout(self.alloc, schemas)
-            else
-                try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
-            var unpacked_any = false;
-            if (rdef.auto_layout_requested and !rdef.is_flat_c) {
-                for (schemas, 0..) |*sc, fi| {
-                    if (sc.is_subbyte_packable and fi < rdef.hot_fields.len and
-                        layout.shouldUnpackHotSubByteInL1(rdef.hot_fields[fi], rdef.observed_collection_len, base_naive.size))
-                    {
-                        sc.is_subbyte_packable = false;
-                        unpacked_any = true;
+    fn synthesizeRecordLayout(
+        self: *Analyzer,
+        ridx: usize,
+        computed: []bool,
+        in_progress: []bool,
+        out: []CheckedRecord,
+    ) std.mem.Allocator.Error!void {
+        if (computed[ridx]) return;
+        if (in_progress[ridx]) return;
+        in_progress[ridx] = true;
+        const rdef = &self.record_defs.items[ridx];
+        const schemas = try self.alloc.alloc(layout.FieldSchema, rdef.fields.len);
+        for (rdef.fields, 0..) |f, fi| {
+            var info = self.typeBitInfo(f.ty);
+            if (f.ty.* == .record) {
+                const inner_ri = f.ty.record;
+                if (inner_ri < self.record_defs.items.len and !in_progress[inner_ri]) {
+                    try self.synthesizeRecordLayout(inner_ri, computed, in_progress, out);
+                    if (computed[inner_ri]) {
+                        const inner_rl = out[inner_ri].record_layout;
+                        info.size = inner_rl.size;
+                        info.alignment = inner_rl.alignment;
+                        info.bits = @min(@as(u16, 65535), @as(u16, @intCast(inner_rl.size * 8)));
+                        info.packable = false;
                     }
                 }
             }
-            const base_planned = if (rdef.is_flat_c or !unpacked_any)
-                base_naive
-            else
-                try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
-
-            var hot_count: usize = 0;
-            var hot_bytes: usize = 0;
-            if (!rdef.is_flat_c) {
-                for (rdef.hot_fields, 0..) |is_h, fi| {
-                    if (is_h) {
-                        hot_count += 1;
-                        hot_bytes += @max(@as(usize, 1), schemas[fi].addressable_size);
-                    }
-                }
-            }
-
-            var auto_decision: ?layout.AutoLayoutDecision = null;
-            if (rdef.auto_layout_requested) {
-                const decision = layout.selectAutoCollectionLayout(.{
-                    .total_record_bytes = @max(@as(usize, 1), base_planned.size),
-                    .hot_record_bytes = hot_bytes,
-                    .hot_field_count = hot_count,
-                    .total_field_count = rdef.fields.len,
-                    .has_simd_loop = rdef.simd_loop_seen,
-                    .observed_len = rdef.observed_collection_len,
-                });
-                auto_decision = decision;
-                rdef.collection_layout = decision.selected;
-            }
-
-            var final_planned = base_planned;
-            if (!rdef.is_flat_c and hot_count > 0 and hot_count < rdef.fields.len and rdef.fields.len > 1) {
-                const orig_indices = try self.alloc.alloc(usize, rdef.fields.len);
-                for (orig_indices, 0..) |*idx_slot, fi| idx_slot.* = fi;
-                const reordered_idx = try layout.reorderHotFieldsFirst(usize, self.alloc, orig_indices, rdef.hot_fields);
-                const pos_of = try self.alloc.alloc(usize, rdef.fields.len);
-                const reordered_schemas = try self.alloc.alloc(layout.FieldSchema, rdef.fields.len);
-                for (reordered_idx, 0..) |orig_fi, new_pos| {
-                    pos_of[orig_fi] = new_pos;
-                    reordered_schemas[new_pos] = schemas[orig_fi];
-                }
-                const remapped_conflicts = try self.alloc.alloc(layout.ConflictPair, rdef.conflicts.items.len);
-                for (rdef.conflicts.items, 0..) |cp, ci| {
-                    remapped_conflicts[ci] = .{ .a = pos_of[cp.a], .b = pos_of[cp.b] };
-                }
-                const reordered_planned = try layout.planRecordLayout(self.alloc, reordered_schemas, remapped_conflicts);
-                const restored_fields = try self.alloc.alloc(layout.FieldPlacement, rdef.fields.len);
-                for (reordered_idx, 0..) |orig_fi, new_pos| {
-                    restored_fields[orig_fi] = reordered_planned.fields[new_pos];
-                }
-                final_planned = .{
-                    .size = reordered_planned.size,
-                    .alignment = reordered_planned.alignment,
-                    .fields = restored_fields,
-                };
-            }
-
-            if (rdef.has_pod_derive) {
-                var sum_sizes: usize = 0;
-                var all_pod_safe = rdef.fields.len > 0;
-                for (rdef.fields, 0..) |f, fi| {
-                    sum_sizes += schemas[fi].addressable_size;
-                    if (!self.isPodBitPatternSafeTy(f.ty, 0)) {
-                        all_pod_safe = false;
-                    }
-                }
-                if (!all_pod_safe or sum_sizes != final_planned.size) {
-                    self.addError(.invalid_ffi_type, rdef.span, "@derive(rust, \"bytemuck::Pod\") requires non-empty @layout(flat) record with zero implicit padding and no bool/@opaque fields");
-                }
-            }
-
-            out[ridx] = .{
-                .name = rdef.name,
-                .span = rdef.span,
-                .fields = rdef.fields,
-                .conflicts = try rdef.conflicts.toOwnedSlice(self.alloc),
-                .record_layout = final_planned,
-                .collection_layout = rdef.collection_layout,
-                .hot_fields = rdef.hot_fields,
-                .auto_layout_decision = auto_decision,
-                .is_flat_c = rdef.is_flat_c,
-                .rust_derives = rdef.rust_derives,
-                .rust_attrs = rdef.rust_attrs,
-                .has_pod_derive = rdef.has_pod_derive,
+            const addr_taken = fi < rdef.address_taken_fields.len and rdef.address_taken_fields[fi];
+            schemas[fi] = .{
+                .name = f.name,
+                .bits = @max(@as(u16, 1), info.bits),
+                .signed = info.signed,
+                .addressable_size = info.size,
+                .addressable_align = info.alignment,
+                .is_packable = info.packable and !addr_taken and rdef.type_params.len == 0,
             };
-            if (rdef.collection_layout) |cl| {
-                if (!self.hasCollectionNamed(rdef.name)) {
-                    try self.checked_collections.append(self.alloc, .{
-                        .name = rdef.name,
-                        .layout = cl,
-                        .field_count = @max(@as(usize, 1), rdef.fields.len),
-                    });
+        }
+        const base_naive = if (rdef.is_flat_c)
+            try layout.planFlatCLayout(self.alloc, schemas)
+        else
+            try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
+        var unpacked_any = false;
+        if (rdef.auto_layout_requested and !rdef.is_flat_c) {
+            for (schemas, 0..) |*sc, fi| {
+                if (sc.is_packable and fi < rdef.hot_fields.len and
+                    layout.shouldUnpackHotInL1(rdef.hot_fields[fi], rdef.observed_collection_len, base_naive.size))
+                {
+                    sc.is_packable = false;
+                    unpacked_any = true;
                 }
             }
-            if (rdef.used_in_dyn_vec) {
-                try self.checked_dyn_vecs.append(self.alloc, .{
+        }
+        const base_planned = if (rdef.is_flat_c or !unpacked_any)
+            base_naive
+        else
+            try layout.planRecordLayout(self.alloc, schemas, rdef.conflicts.items);
+
+        var hot_count: usize = 0;
+        var hot_bytes: usize = 0;
+        if (!rdef.is_flat_c) {
+            for (rdef.hot_fields, 0..) |is_h, fi| {
+                if (is_h) {
+                    hot_count += 1;
+                    hot_bytes += @max(@as(usize, 1), schemas[fi].addressable_size);
+                }
+            }
+        }
+
+        var auto_decision: ?layout.AutoLayoutDecision = null;
+        if (rdef.auto_layout_requested) {
+            const decision = layout.selectAutoCollectionLayout(.{
+                .total_record_bytes = @max(@as(usize, 1), base_planned.size),
+                .hot_record_bytes = hot_bytes,
+                .hot_field_count = hot_count,
+                .total_field_count = rdef.fields.len,
+                .has_simd_loop = rdef.simd_loop_seen,
+                .observed_len = rdef.observed_collection_len,
+            });
+            auto_decision = decision;
+            rdef.collection_layout = decision.selected;
+        }
+
+        var final_planned = base_planned;
+        if (!rdef.is_flat_c and hot_count > 0 and hot_count < rdef.fields.len and rdef.fields.len > 1) {
+            const orig_indices = try self.alloc.alloc(usize, rdef.fields.len);
+            for (orig_indices, 0..) |*idx_slot, fi| idx_slot.* = fi;
+            const reordered_idx = try layout.reorderHotFieldsFirst(usize, self.alloc, orig_indices, rdef.hot_fields);
+            const pos_of = try self.alloc.alloc(usize, rdef.fields.len);
+            const reordered_schemas = try self.alloc.alloc(layout.FieldSchema, rdef.fields.len);
+            for (reordered_idx, 0..) |orig_fi, new_pos| {
+                pos_of[orig_fi] = new_pos;
+                reordered_schemas[new_pos] = schemas[orig_fi];
+            }
+            const remapped_conflicts = try self.alloc.alloc(layout.ConflictPair, rdef.conflicts.items.len);
+            for (rdef.conflicts.items, 0..) |cp, ci| {
+                remapped_conflicts[ci] = .{ .a = pos_of[cp.a], .b = pos_of[cp.b] };
+            }
+            const reordered_planned = try layout.planRecordLayout(self.alloc, reordered_schemas, remapped_conflicts);
+            const restored_fields = try self.alloc.alloc(layout.FieldPlacement, rdef.fields.len);
+            for (reordered_idx, 0..) |orig_fi, new_pos| {
+                restored_fields[orig_fi] = reordered_planned.fields[new_pos];
+            }
+            final_planned = .{
+                .size = reordered_planned.size,
+                .alignment = reordered_planned.alignment,
+                .fields = restored_fields,
+            };
+        }
+
+        if (rdef.has_pod_derive) {
+            var sum_sizes: usize = 0;
+            var all_pod_safe = rdef.fields.len > 0;
+            for (rdef.fields, 0..) |f, fi| {
+                sum_sizes += schemas[fi].addressable_size;
+                if (!self.isPodBitPatternSafeTy(f.ty, 0)) {
+                    all_pod_safe = false;
+                }
+            }
+            if (!all_pod_safe or sum_sizes != final_planned.size) {
+                self.addError(.invalid_ffi_type, rdef.span, "@derive(rust, \"bytemuck::Pod\") requires non-empty @layout(flat) record with zero implicit padding and no bool/@opaque fields");
+            }
+        }
+
+        out[ridx] = .{
+            .name = rdef.name,
+            .span = rdef.span,
+            .fields = rdef.fields,
+            .conflicts = try rdef.conflicts.toOwnedSlice(self.alloc),
+            .record_layout = final_planned,
+            .collection_layout = rdef.collection_layout,
+            .hot_fields = rdef.hot_fields,
+            .auto_layout_decision = auto_decision,
+            .is_flat_c = rdef.is_flat_c,
+            .rust_derives = rdef.rust_derives,
+            .rust_attrs = rdef.rust_attrs,
+            .has_pod_derive = rdef.has_pod_derive,
+        };
+        if (rdef.collection_layout) |cl| {
+            if (!self.hasCollectionNamed(rdef.name)) {
+                try self.checked_collections.append(self.alloc, .{
                     .name = rdef.name,
-                    .layout = rdef.collection_layout orelse .aos,
+                    .layout = cl,
                     .field_count = @max(@as(usize, 1), rdef.fields.len),
                 });
             }
+        }
+        if (rdef.used_in_dyn_vec) {
+            try self.checked_dyn_vecs.append(self.alloc, .{
+                .name = rdef.name,
+                .layout = rdef.collection_layout orelse .aos,
+                .field_count = @max(@as(usize, 1), rdef.fields.len),
+            });
+        }
+        in_progress[ridx] = false;
+        computed[ridx] = true;
+    }
+
+    fn synthesizeAllLayouts(self: *Analyzer) std.mem.Allocator.Error![]CheckedRecord {
+        const out = try self.alloc.alloc(CheckedRecord, self.record_defs.items.len);
+        const computed = try self.alloc.alloc(bool, self.record_defs.items.len);
+        const in_progress = try self.alloc.alloc(bool, self.record_defs.items.len);
+        @memset(computed, false);
+        @memset(in_progress, false);
+        for (0..self.record_defs.items.len) |ridx| {
+            try self.synthesizeRecordLayout(ridx, computed, in_progress, out);
         }
         return out;
     }
@@ -9287,20 +9926,27 @@ const Analyzer = struct {
         return try list.toOwnedSlice(self.alloc);
     }
 
+    fn isLawByte(ty: *const Ty) bool {
+        return ty.* == .int and !ty.int.signed and ty.int.bits == 8;
+    }
+
     fn tyToParamDomain(self: *const Analyzer, name: []const u8, ty: *const Ty) std.mem.Allocator.Error!law_verifier.LawParamDomain {
         const inner = if (ty.* == .view) ty.view.target else ty;
         switch (inner.*) {
             .bool => return .{ .name = name, .kind = .bool_ty },
             .int => |it| return .{ .name = name, .kind = .{ .int_ty = .{ .int_ty = it, .range = inner.rangeOf() } } },
             .int_range => |ir| return .{ .name = name, .kind = .{ .int_ty = .{ .int_ty = ir.synthesized, .range = ir.range } } },
-            .option => return .{ .name = name, .kind = .option_ty },
-            .fn_ty => |ft| {
-                if (ft.ret.* == .option) return .{ .name = name, .kind = .fn_opt_ty };
-                return .{ .name = name, .kind = .fn_scalar_ty };
+            .option => |payload| {
+                const domain = try self.alloc.create(law_verifier.LawParamDomain);
+                domain.* = try self.tyToParamDomain(name, payload);
+                return .{ .name = name, .kind = .{ .option_ty = domain } };
             },
-            .type_var => {
-                const it = IntType{ .signed = false, .bits = 8 };
-                return .{ .name = name, .kind = .{ .int_ty = .{ .int_ty = it, .range = IntRange.ofType(it) } } };
+            .fn_ty => |ft| {
+                if (ft.params.len == 1 and isLawByte(ft.params[0])) {
+                    if (isLawByte(ft.ret)) return .{ .name = name, .kind = .fn_scalar_ty };
+                    if (ft.ret.* == .option and isLawByte(ft.ret.option)) return .{ .name = name, .kind = .fn_opt_ty };
+                }
+                return .{ .name = name, .kind = .other };
             },
             .record => |ridx| {
                 const rdef = self.record_defs.items[ridx];
@@ -9391,6 +10037,80 @@ const Analyzer = struct {
         }
     }
 
+    fn checkFrame(self: *Analyzer, paths: []const ast.FieldPath, span: ast.Span) !?[]const u8 {
+        if (paths.len == 0) {
+            const msg = "preserves requires a record parameter and field";
+            self.addError(.law_violation, span, msg);
+            return msg;
+        }
+        var failure: ?[]const u8 = null;
+        for (paths) |fp| {
+            const msg: ?[]const u8 = check: {
+                if (fp.len != 2) break :check "preserves requires a direct field path of the form parameter.field";
+                const vb = self.lookupVar(fp[0].slice(self.source)) orelse break :check "unknown parameter in preserves path";
+                const ridx = recordOfType(vb.ty) orelse break :check "preserves path requires a record parameter";
+                const fidx = self.findRecordField(ridx, fp[1].slice(self.source)) orelse break :check "preserved field does not exist on record";
+                for (self.checked_functions.items) |*cf| {
+                    for (cf.writes) |w| {
+                        if (w.record_idx == ridx and w.field_idx == fidx)
+                            break :check "constitutional law violation: function mutates preserved field";
+                    }
+                    if (cf.target_record != ridx or std.mem.indexOfScalar(usize, cf.preserves, fidx) != null) continue;
+                    const fields = try self.alloc.alloc(usize, cf.preserves.len + 1);
+                    @memcpy(fields[0..cf.preserves.len], cf.preserves);
+                    fields[cf.preserves.len] = fidx;
+                    cf.preserves = fields;
+                }
+                break :check null;
+            };
+            if (msg) |reason| {
+                self.addError(.law_violation, if (fp.len == 0) span else ast.Span.merge(fp[0], fp[fp.len - 1]), reason);
+                if (failure == null) failure = reason;
+            }
+        }
+        return failure;
+    }
+
+    fn finishLaw(self: *Analyzer, name: []const u8, span: ast.Span, clauses: []CheckedLawClause, certs: []const law_verifier.SymbolicLawCert) !void {
+        var verdict: ?LawVerdict = null;
+        var detail: []const u8 = "law has no claims";
+        var first_witness: ?[]const u8 = null;
+        var mixed = false;
+        for (clauses) |cl| {
+            const v = cl.verdict orelse continue;
+            if (verdict != null and verdict.? != v) mixed = true;
+            if (first_witness == null) first_witness = cl.counterexample;
+            if (verdict == null or lawVerdictPriority(v) > lawVerdictPriority(verdict.?)) {
+                verdict = v;
+                detail = cl.detail;
+            }
+        }
+        if (mixed and lawVerdictPriority(verdict.?) < lawVerdictPriority(.unverified_symbolic))
+            detail = "proved by multiple methods (see clauses)";
+        try self.checked_laws.append(self.alloc, .{
+            .name = name,
+            .span = span,
+            .clauses = clauses,
+            .verdict = verdict orelse .unverified_symbolic,
+            .tier_detail = detail,
+            .counterexample = first_witness,
+            .symbolic_certs = certs,
+        });
+    }
+
+    fn lawVerdictPriority(verdict: LawVerdict) u8 {
+        return switch (verdict) {
+            .falsified => 7,
+            .violated => 6,
+            .unverified_symbolic => 5,
+            .proved_tier3_lean => 4,
+            .proved_tier2_symbolic => 3,
+            .proved_tier1_exhaustive => 2,
+            .proved_interval => 1,
+            .proved_tier0 => 0,
+        };
+    }
+
     fn checkLaws(self: *Analyzer, checked_records: []const CheckedRecord) std.mem.Allocator.Error!void {
         _ = checked_records;
         const fn_asts = try self.collectModuleFnAsts();
@@ -9405,12 +10125,10 @@ const Analyzer = struct {
             try self.pushScope();
             defer self.popScope();
 
-            var law_rec_idx: ?usize = null;
             var param_domains = try self.alloc.alloc(law_verifier.LawParamDomain, ld.params.len);
             for (ld.params, 0..) |p, pi| {
                 const pty = if (p.ty) |t| try self.resolveType(t) else try self.allocTy(.err);
                 const pname = p.name.slice(self.source);
-                if (law_rec_idx == null) law_rec_idx = recordOfType(pty);
                 param_domains[pi] = try self.tyToParamDomain(pname, pty);
                 try self.scopes.append(self.alloc, .{
                     .name = pname,
@@ -9428,6 +10146,7 @@ const Analyzer = struct {
                 .alloc = self.alloc,
                 .source = self.source,
                 .fns = fn_asts,
+                .expr_types = &self.expr_types,
                 .resolved_calls = &self.resolved_fn_calls,
             };
             for (sym_bindings) |sb| _ = sym_ctx.bindVar(sb.name, sb.non_negative);
@@ -9435,59 +10154,21 @@ const Analyzer = struct {
             var guards_ast: std.ArrayList(*const ast.Expr) = .empty;
             var sym_certs: std.ArrayList(law_verifier.SymbolicLawCert) = .empty;
             var has_symbolic_guard = false;
-            var has_claim = false;
-            var all_proved = ld.clauses.len > 0;
-            var violated = false;
-            var falsified = false;
-            var tier0_ok = false;
-            var tier1_ok = false;
-            var tier2_ok = false;
-            var interval_ok = false;
-            var tier1_max_states: usize = 0;
-            var first_counterexample: ?[]const u8 = null;
+            const clauses = try self.alloc.alloc(CheckedLawClause, ld.clauses.len);
 
+            self.field_ranges.clearRetainingCapacity();
             for (ld.clauses, 0..) |cl, ci| {
+                const evidence = &clauses[ci];
+                evidence.* = CheckedLawClause.init(cl);
                 switch (cl) {
                     .preserves => |pr| {
-                        has_claim = true;
-                        for (pr.paths) |fp| {
-                            if (fp.len < 2) continue;
-                            const pname = fp[0].slice(self.source);
-                            const fname = fp[1].slice(self.source);
-                            const vb = self.lookupVar(pname) orelse continue;
-                            const ridx = recordOfType(vb.ty) orelse continue;
-                            const fidx = self.findRecordField(ridx, fname) orelse {
-                                self.addError(.law_violation, fp[1], "preserved field does not exist on record");
-                                violated = true;
-                                continue;
-                            };
-                            // Tier 0: verify no checked function operating on `ridx` writes `fidx`, and attach `fidx` to `preserves`.
-                            for (self.checked_functions.items) |*cf| {
-                                if (cf.target_record != null and cf.target_record.? == ridx) {
-                                    var writes_preserved = false;
-                                    for (cf.writes) |w| {
-                                        if (w.record_idx == ridx and w.field_idx == fidx) {
-                                            writes_preserved = true;
-                                            break;
-                                        }
-                                    }
-                                    if (writes_preserved) {
-                                        self.addError(.law_violation, fp[1], "constitutional law violation: function mutates preserved field");
-                                        violated = true;
-                                    } else {
-                                        var updated: std.ArrayList(usize) = .empty;
-                                        for (cf.preserves) |prev| try updated.append(self.alloc, prev);
-                                        var dup = false;
-                                        for (updated.items) |u| if (u == fidx) {
-                                            dup = true;
-                                        };
-                                        if (!dup) try updated.append(self.alloc, fidx);
-                                        cf.preserves = try updated.toOwnedSlice(self.alloc);
-                                    }
-                                }
-                            }
+                        if (try self.checkFrame(pr.paths, pr.span)) |reason| {
+                            evidence.verdict = .violated;
+                            evidence.detail = reason;
+                        } else {
+                            evidence.verdict = .proved_tier0;
+                            evidence.detail = "Tier 0 (structural frame)";
                         }
-                        if (!violated) tier0_ok = true;
                     },
                     .when => |wh| {
                         _ = try self.checkExpr(wh.expr, try self.allocTy(.bool));
@@ -9501,7 +10182,6 @@ const Analyzer = struct {
                         }
                     },
                     .always, .never, .expr => {
-                        has_claim = true;
                         const is_never = (cl == .never);
                         const cl_span = switch (cl) {
                             .always => |a| a.span,
@@ -9520,16 +10200,19 @@ const Analyzer = struct {
                         const itruth = try self.evalIntervalPredicate(goal_expr, has_symbolic_guard);
                         const interval_proved = (is_never and itruth == .always_false) or (!is_never and itruth == .always_true);
                         if (interval_proved) {
-                            interval_ok = true;
+                            evidence.verdict = .proved_interval;
+                            evidence.detail = "Tier 2 (interval bounds)";
                             continue;
                         }
 
                         if (law_verifier.tryProveSymbolicClause(self.alloc, &sym_ctx, guards_ast.items, goal_expr, is_never)) |sym_ok| {
-                            tier2_ok = true;
+                            evidence.verdict = .proved_tier2_symbolic;
+                            evidence.detail = "Tier 2 (symbolic auto-prover)";
                             const cert_name = if (ld.clauses.len <= 1)
                                 lname
                             else
                                 try std.fmt.allocPrint(self.alloc, "{s}__c{d}", .{ lname, ci });
+                            evidence.certificate = cert_name;
                             try sym_certs.append(self.alloc, .{
                                 .name = cert_name,
                                 .kind = if (is_never) .never else .always,
@@ -9539,14 +10222,15 @@ const Analyzer = struct {
                             continue;
                         }
 
-                        switch (law_verifier.runTier1ClauseResolved(self.alloc, self.source, fn_asts, rec_infos, &self.resolved_fn_calls, param_domains, guards_ast.items, goal_expr, is_never)) {
+                        switch (law_verifier.runTier1ClauseResolved(self.alloc, self.source, fn_asts, rec_infos, &self.resolved_fn_calls, param_domains, guards_ast.items, goal_expr, is_never, &self.expr_types)) {
                             .proved_exhaustive => |states| {
-                                tier1_ok = true;
-                                tier1_max_states = @max(tier1_max_states, states);
+                                evidence.verdict = .proved_tier1_exhaustive;
+                                evidence.detail = try std.fmt.allocPrint(self.alloc, "Tier 1 (exhaustive, {d} states)", .{states});
                             },
                             .falsified => |witness| {
-                                falsified = true;
-                                if (first_counterexample == null) first_counterexample = witness;
+                                evidence.verdict = .falsified;
+                                evidence.counterexample = witness;
+                                evidence.detail = witness;
                                 const msg = try std.fmt.allocPrint(self.alloc, "constitutional law '{s}' falsified at {s}", .{ lname, witness });
                                 self.addError(.law_violation, cl_span, msg);
                             },
@@ -9554,10 +10238,9 @@ const Analyzer = struct {
                                 const interval_violated = (is_never and (itruth == .always_true or itruth == .can_fail)) or
                                     (!is_never and (itruth == .always_false or itruth == .can_fail));
                                 if (interval_violated) {
-                                    violated = true;
+                                    evidence.verdict = .violated;
+                                    evidence.detail = "constitutional law violated over possible input intervals";
                                     self.addError(.law_violation, cl_span, "constitutional law violated over possible input intervals");
-                                } else {
-                                    all_proved = false;
                                 }
                             },
                         }
@@ -9565,47 +10248,7 @@ const Analyzer = struct {
                 }
             }
 
-            if (!has_claim) all_proved = false;
-
-            const verdict: LawVerdict = if (falsified)
-                .falsified
-            else if (violated)
-                .violated
-            else if (!all_proved)
-                .unverified_symbolic
-            else if (tier2_ok)
-                .proved_tier2_symbolic
-            else if (tier1_ok)
-                .proved_tier1_exhaustive
-            else if (interval_ok)
-                .proved_interval
-            else if (tier0_ok)
-                .proved_tier0
-            else
-                .unverified_symbolic;
-
-            const detail: []const u8 = switch (verdict) {
-                .proved_tier0 => "Tier 0 (structural frame)",
-                .proved_tier1_exhaustive => try std.fmt.allocPrint(self.alloc, "Tier 1 (exhaustive, {d} states)", .{tier1_max_states}),
-                .proved_tier2_symbolic => "Tier 2 (symbolic auto-prover)",
-                .proved_interval => "Tier 2 (interval bounds)",
-                .proved_tier3_lean => "Tier 3 (Lean 4.35.0 kernel)",
-                .falsified => if (first_counterexample) |ce|
-                    try std.fmt.allocPrint(self.alloc, "FALSIFIED ({s})", .{ce})
-                else
-                    "FALSIFIED",
-                .violated => "VIOLATED (Tier 0 / interval)",
-                .unverified_symbolic => "UNPROVED",
-            };
-
-            try self.checked_laws.append(self.alloc, .{
-                .name = lname,
-                .span = decl.span,
-                .verdict = verdict,
-                .tier_detail = detail,
-                .counterexample = first_counterexample,
-                .symbolic_certs = try sym_certs.toOwnedSlice(self.alloc),
-            });
+            try self.finishLaw(lname, decl.span, clauses, try sym_certs.toOwnedSlice(self.alloc));
         }
 
         try self.checkInstanceLaws(fn_asts, rec_infos);
@@ -9621,7 +10264,17 @@ const Analyzer = struct {
         const empty_blk = ast.Block{ .span = .{ .start = 0, .end = 0 }, .attrs = &.{}, .stmts = &.{}, .tail = null };
 
         for (self.instance_defs.items) |inst| {
-            if (inst.is_external_rust or inst.type_params.len > 0) continue;
+            if (inst.is_external_rust or inst.type_params.len > 0) {
+                var required: std.ArrayList(TraitLawDef) = .empty;
+                try self.collectTraitAndSuperLaws(inst.trait_idx, &required);
+                for (required.items) |entry| {
+                    const name = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ inst.name, entry.law.name.slice(self.source) });
+                    const clauses = try self.alloc.alloc(CheckedLawClause, entry.law.clauses.len);
+                    for (entry.law.clauses, clauses) |clause, *evidence| evidence.* = CheckedLawClause.init(clause);
+                    try self.finishLaw(name, inst.span, clauses, &.{});
+                }
+                continue;
+            }
 
             var inst_fns: std.ArrayList(law_verifier.FnAstEntry) = .empty;
             for (inst.methods) |cm| {
@@ -9676,19 +10329,14 @@ const Analyzer = struct {
 
                 var guards_ast: std.ArrayList(*const ast.Expr) = .empty;
                 var sym_certs: std.ArrayList(law_verifier.SymbolicLawCert) = .empty;
-                var has_claim = false;
-                var all_proved = lw.clauses.len > 0;
-                var falsified = false;
-                var tier1_ok = false;
-                var tier2_ok = false;
-                var tier1_max_states: usize = 0;
-                var first_counterexample: ?[]const u8 = null;
+                const clauses = try self.alloc.alloc(CheckedLawClause, lw.clauses.len);
 
                 for (lw.clauses, 0..) |cl, ci| {
+                    const evidence = &clauses[ci];
+                    evidence.* = CheckedLawClause.init(cl);
                     switch (cl) {
                         .when => |wh| try guards_ast.append(self.alloc, wh.expr),
                         .always, .never, .expr => {
-                            has_claim = true;
                             const is_never = (cl == .never);
                             const cl_span = switch (cl) {
                                 .always => |a| a.span,
@@ -9703,11 +10351,13 @@ const Analyzer = struct {
                                 else => unreachable,
                             };
                             if (law_verifier.tryProveSymbolicClause(self.alloc, &sym_ctx, guards_ast.items, goal_expr, is_never)) |sym_ok| {
-                                tier2_ok = true;
+                                evidence.verdict = .proved_tier2_symbolic;
+                                evidence.detail = "Tier 2 (symbolic auto-prover)";
                                 const cert_name = if (lw.clauses.len <= 1)
                                     lname
                                 else
                                     try std.fmt.allocPrint(self.alloc, "{s}__c{d}", .{ lname, ci });
+                                evidence.certificate = cert_name;
                                 try sym_certs.append(self.alloc, .{
                                     .name = cert_name,
                                     .kind = if (is_never) .never else .always,
@@ -9717,55 +10367,29 @@ const Analyzer = struct {
                                 });
                                 continue;
                             }
-                            switch (law_verifier.runTier1ClauseResolved(self.alloc, self.source, all_fns, rec_infos, null, param_domains, guards_ast.items, goal_expr, is_never)) {
+                            switch (law_verifier.runTier1ClauseResolved(self.alloc, self.source, all_fns, rec_infos, null, param_domains, guards_ast.items, goal_expr, is_never, &self.expr_types)) {
                                 .proved_exhaustive => |states| {
-                                    tier1_ok = true;
-                                    tier1_max_states = @max(tier1_max_states, states);
+                                    evidence.verdict = .proved_tier1_exhaustive;
+                                    evidence.detail = try std.fmt.allocPrint(self.alloc, "Tier 1 (exhaustive, {d} states)", .{states});
                                 },
                                 .falsified => |witness| {
-                                    falsified = true;
-                                    if (first_counterexample == null) first_counterexample = witness;
+                                    evidence.verdict = .falsified;
+                                    evidence.counterexample = witness;
+                                    evidence.detail = witness;
                                     const msg = try std.fmt.allocPrint(self.alloc, "instance '{s}' violates trait law '{s}' at {s}", .{ inst.local_name, lw.name.slice(self.source), witness });
                                     self.addError(.law_violation, inst.span, msg);
                                     _ = cl_span;
                                 },
-                                .inconclusive => {
-                                    all_proved = false;
-                                },
+                                .inconclusive => {},
                             }
                         },
-                        .preserves => {},
+                        .preserves => {
+                            evidence.detail = "trait instance preserves checking is unsupported";
+                        },
                     }
                 }
 
-                if (!has_claim) all_proved = false;
-                const verdict: LawVerdict = if (falsified)
-                    .falsified
-                else if (!all_proved)
-                    .unverified_symbolic
-                else if (tier2_ok)
-                    .proved_tier2_symbolic
-                else if (tier1_ok)
-                    .proved_tier1_exhaustive
-                else
-                    .unverified_symbolic;
-                const detail: []const u8 = switch (verdict) {
-                    .proved_tier2_symbolic => "Tier 2 (trait law symbolic)",
-                    .proved_tier1_exhaustive => try std.fmt.allocPrint(self.alloc, "Tier 1 (trait law exhaustive, {d} states)", .{tier1_max_states}),
-                    .falsified => if (first_counterexample) |ce|
-                        try std.fmt.allocPrint(self.alloc, "FALSIFIED ({s})", .{ce})
-                    else
-                        "FALSIFIED",
-                    else => "Tier 1 (bounded sample OK)",
-                };
-                try self.checked_laws.append(self.alloc, .{
-                    .name = lname,
-                    .span = inst.span,
-                    .verdict = verdict,
-                    .tier_detail = detail,
-                    .counterexample = first_counterexample,
-                    .symbolic_certs = try sym_certs.toOwnedSlice(self.alloc),
-                });
+                try self.finishLaw(lname, inst.span, clauses, try sym_certs.toOwnedSlice(self.alloc));
             }
         }
     }
@@ -9987,6 +10611,8 @@ pub fn analyzeWithModulesAndManifest(
         .foreign_contracts = try az.foreign_contracts.toOwnedSlice(alloc),
         .type_decl_params = az.type_decl_params,
         .call_trait_resolutions = az.call_trait_resolutions,
+        .numeral_trait_resolutions = az.numeral_trait_resolutions,
+        .assign_trait_resolutions = az.assign_trait_resolutions,
         .std_intrinsic_calls = az.std_intrinsic_calls,
     };
 }

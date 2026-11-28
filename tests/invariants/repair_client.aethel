@@ -1,0 +1,6 @@
+import Character
+fn main() {
+  let mut c = Character { x: 5, y: 5 }
+  c.x = 0
+  c.y = 0
+}

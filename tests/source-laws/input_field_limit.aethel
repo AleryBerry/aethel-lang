@@ -1,0 +1,3 @@
+law respects_limit(input: Limits) {
+  never clamp(input) > input.maximum
+}

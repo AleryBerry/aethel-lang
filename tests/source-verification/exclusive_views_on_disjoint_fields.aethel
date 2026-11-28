@@ -4,7 +4,7 @@ type Pair {
 }
 
 fn main() -> u8 {
-  let mut pair = Pair { left: 17u8, right: 23u8, };
+  let mut pair = Pair { left: 17, right: 23, };
   view exclusive outer = pair.left {
     view exclusive inner = pair.right {
       let _ = outer;

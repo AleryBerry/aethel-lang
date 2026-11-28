@@ -8,5 +8,5 @@
 ////   set.insert(s, x) / set.contains(s, x) / set.remove(s, x) / set.clear(s)
 
 pub fn empty_count() -> u64 {
-  0u64
+  0
 }

@@ -1,0 +1,3 @@
+fn conflicting(value: u8, value: bool) -> u8 { 12 }
+
+fn main() -> u8 { 19 }

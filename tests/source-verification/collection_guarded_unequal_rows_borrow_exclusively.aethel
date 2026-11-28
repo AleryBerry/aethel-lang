@@ -1,0 +1,23 @@
+@layout(aos)
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut rows: Collection(Pair) = [
+    Pair { left: 37, right: 0, },
+    Pair { left: 83, right: 1, },
+  ];
+  let i = rows[0].right;
+  let j = rows[1].right;
+  if i < 2 {
+    if j < 2 {
+      if i != j {
+        view exclusive first = rows[i].left {
+          view exclusive second = rows[j].left {
+            first = 72;
+            second = 90;
+          };
+        };
+      } else { };
+    } else { };
+  } else { };
+  rows[1].left
+}

@@ -67,6 +67,14 @@ structure Interval where
 
 def Interval.Contains (s : Interval) (i : Nat) : Prop := s.lo ≤ i ∧ i < s.hi
 
+def Interval.intersect (a b : Interval) : Interval := ⟨max a.lo b.lo, min a.hi b.hi⟩
+
+theorem Interval.intersect_contains (a b : Interval) (i : Nat) :
+    (a.intersect b).Contains i ↔ a.Contains i ∧ b.Contains i := by
+  simp only [intersect, Contains, Nat.max_le, Nat.lt_min]
+  exact ⟨fun ⟨⟨lowA, lowB⟩, highA, highB⟩ => ⟨⟨lowA, highA⟩, lowB, highB⟩,
+    fun ⟨⟨lowA, highA⟩, lowB, highB⟩ => ⟨⟨lowA, lowB⟩, highA, highB⟩⟩
+
 def Interval.disjoint (a b : Interval) : Bool :=
   decide (a.hi ≤ b.lo ∨ b.hi ≤ a.lo ∨ a.hi ≤ a.lo ∨ b.hi ≤ b.lo)
 

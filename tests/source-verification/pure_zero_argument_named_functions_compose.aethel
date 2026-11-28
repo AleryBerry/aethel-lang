@@ -1,0 +1,3 @@
+fn initial() -> u8 { 53 }
+fn supplier() -> fn(()) -> u8 { initial }
+fn main() -> u8 { supplier()() }

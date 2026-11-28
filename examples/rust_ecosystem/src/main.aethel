@@ -1,0 +1,159 @@
+// Stage I Expanded Showcase: Multi-Crate Real Rust Ecosystem Verification
+// Exercises core functionality of serde + serde_json, bytemuck, rayon, tokio, and regex.
+
+import std/str
+import std/vec
+
+@layout(flat)
+@derive(rust, "serde::Serialize", "serde::Deserialize", "PartialEq")
+pub type WindowBounds {
+  pub width: u32,
+  pub height: u32,
+}
+
+@layout(flat)
+@derive(rust, "serde::Serialize", "serde::Deserialize", "PartialEq")
+pub type EngineConfig {
+  @rust_attr("serde(rename = \"target_fps\")")
+  pub fps: u32,
+  pub vsync: bool,
+  @rust_attr("serde(default)")
+  pub worker_threads: u32,
+  pub bounds: WindowBounds,
+}
+
+@layout(flat)
+@derive(rust, "serde::Serialize", "serde::Deserialize", "PartialEq")
+pub type TelemetryPoint {
+  pub frame: u32,
+  pub dt_ms: f32,
+}
+
+@layout(flat)
+@derive(rust, "bytemuck::Pod", "bytemuck::Zeroable", "PartialEq")
+pub type GpuVertex {
+  pub x: f32,
+  pub y: f32,
+  pub z: f32,
+  pub rgba: u32,
+}
+
+@layout(flat)
+pub type ScoreEntry {
+  pub id: u32,
+  pub score: u32,
+}
+
+@external(rust, "self", "test_serde_suite")
+pub fn test_serde_suite(cfg: EngineConfig, batch: [TelemetryPoint], on_json: fn(String) -> ()) -> bool
+
+@external(rust, "self", "test_bytemuck_suite")
+pub fn test_bytemuck_suite(verts: [mut GpuVertex]) -> u32
+
+@external(rust, "self", "test_rayon_suite")
+pub fn test_rayon_suite(
+  floats: [mut f32],
+  scores: [mut ScoreEntry],
+  fma_chunk: fn([mut f32]) -> (),
+  score_map: fn(u32) -> u64,
+) -> u64
+
+@external(rust, "self", "test_tokio_suite")
+pub fn test_tokio_suite(on_event: fn(String, u32) -> ()) -> u32
+
+@external(rust, "self", "test_regex_suite")
+pub fn test_regex_suite(log_text: String, on_capture: fn(String, String, u32) -> ()) -> u32
+
+pub fn log_json(js: String) {
+  println("serde_json=", js)
+}
+
+pub fn fma_chunk(xs: [mut f32]) {
+  for i in 0..xs.len {
+    xs[i] = xs[i] * 2.0 + 1.0
+  }
+}
+
+pub fn map_square_u64(v: u32) -> u64 {
+  let w = v as u64
+  w * 3 + 1
+}
+
+pub fn log_tokio(tag: String, val: u32) {
+  let label = str.concat("tokio:", tag)
+  println(label, "=", val)
+}
+
+pub fn log_capture(lvl: String, mod_name: String, code: u32) {
+  println("regex_cap:", lvl, "/", mod_name, "=", code)
+}
+
+pub fn main() -> i32 {
+  // 1. serde + serde_json
+  let mut telemetry: Vec(TelemetryPoint) = vec.with_capacity(256)
+  let mut dt_acc: f32 = 0.0
+  for i in 0..256 {
+    vec.push(telemetry, TelemetryPoint { frame: i as u32, dt_ms: dt_acc })
+    dt_acc = dt_acc + 0.25
+  }
+  let cfg = EngineConfig {
+    fps: 144,
+    vsync: true,
+    worker_threads: 4,
+    bounds: WindowBounds { width: 2560, height: 1440 },
+  }
+  let serde_ok = test_serde_suite(cfg, vec.as_slice(telemetry), log_json)
+  if !serde_ok { return 1 }
+  println("serde_ok=true batch_len=", vec.len(telemetry))
+
+  // 2. bytemuck
+  let mut verts: Vec(GpuVertex) = vec.with_capacity(64)
+  let mut vx_acc: f32 = 0.0
+  for _ in 0..64 {
+    vec.push(verts, GpuVertex { x: vx_acc, y: 1.0, z: 2.0, rgba: 0x00112233 })
+    vx_acc = vx_acc + 1.0
+  }
+  let pod_ck = test_bytemuck_suite(vec.as_mut_slice(verts))
+  if pod_ck == 0 { return 2 }
+  let alpha_ok = case vec.get(verts, 0) {
+    Some(v) -> v.rgba == 0xFF112233
+    None -> false
+  }
+  if !alpha_ok { return 3 }
+  println("bytemuck_ok=true checksum=", pod_ck)
+
+  // 3. rayon (16,384 floats + 1,024 ScoreEntry sort)
+  let mut floats: Vec(f32) = vec.with_capacity(16384)
+  let mut f_acc: f32 = 0.0
+  for i in 0..16384 {
+    vec.push(floats, f_acc)
+    if i % 100 == 99 { f_acc = 0.0 } else { f_acc = f_acc + 1.0 }
+  }
+  let mut scores: Vec(ScoreEntry) = vec.with_capacity(1024)
+  for i in 0..1024 {
+    vec.push(scores, ScoreEntry { id: i as u32, score: ((1023 - i) as u32) })
+  }
+  let rayon_tot = test_rayon_suite(vec.as_mut_slice(floats), vec.as_mut_slice(scores), fma_chunk, map_square_u64)
+  let sort_ok = case vec.get(scores, 0) {
+    Some(s0) -> case vec.get(scores, 1023) {
+      Some(s1) -> s0.score == 0 && s1.score == 1023
+      None -> false
+    }
+    None -> false
+  }
+  if !sort_ok { return 4 }
+  println("rayon_ok=true total=", rayon_tot)
+
+  // 4. tokio
+  let tokio_tot = test_tokio_suite(log_tokio)
+  if tokio_tot != 147 { return 5 }
+  println("tokio_ok=true total=", tokio_tot)
+
+  // 5. regex
+  let logs = "INFO [render] code=200 secret=hunter2\nWARN [audio] code=404\nERROR [ecs] code=500\n"
+  let regex_code = test_regex_suite(logs, log_capture)
+  if regex_code != 303 { return 6 }
+  println("regex_ok=true code=", regex_code)
+
+  0
+}

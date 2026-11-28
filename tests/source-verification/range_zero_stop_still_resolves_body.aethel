@@ -1,0 +1,6 @@
+type Meter { beginning: u8, result: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { beginning: 48, result: 58, };
+  for _ in meter.beginning..0 { meter.unknown = 1; };
+  meter.result
+}

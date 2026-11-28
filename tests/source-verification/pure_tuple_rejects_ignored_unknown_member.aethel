@@ -1,0 +1,4 @@
+fn main() -> u8 {
+  let pair = (31, missing);
+  pair.0
+}

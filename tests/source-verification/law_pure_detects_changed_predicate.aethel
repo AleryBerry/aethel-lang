@@ -1,0 +1,11 @@
+fn handles(value: Result(u8, bool)) -> bool {
+  case value {
+    Ok(code) -> true
+    Err(blocked) -> if blocked { false } else { true }
+  }
+}
+
+fn main() -> u8 {
+  let request = Err(false): Result(u8, bool);
+  if handles(request) { 89 } else { 12 }
+}

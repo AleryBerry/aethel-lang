@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let parsed = Err(56): Result(bool, u8);
+  case parsed {
+    Err(code) -> code
+    Ok(flag) -> if flag { 3 } else { 6 }
+  }
+}

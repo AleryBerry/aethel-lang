@@ -1,0 +1,16 @@
+[package]
+name = "rust_w1_w2"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "w1_rust"
+path = "src/bin/w1_rust.rs"
+
+[[bin]]
+name = "w2_rust_aos"
+path = "src/bin/w2_rust_aos.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

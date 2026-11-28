@@ -1,0 +1,2 @@
+fn keep(value: u8) -> u8 { value }
+fn main() -> u8 { keep() }

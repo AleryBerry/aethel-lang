@@ -1,0 +1,10 @@
+type Row { selector: u8, input: u8, output: u8, }
+fn main() -> u8 {
+  let mut row = Row { selector: 1, input: 53, output: 0, };
+  view shared sample = row.input {
+    case row.selector { 1 -> { row.output = sample; } _ -> { row.output = 3; } };
+    row.input = 6;
+  };
+  if row.input != 6 { row.output = 0; } else { };
+  row.output
+}

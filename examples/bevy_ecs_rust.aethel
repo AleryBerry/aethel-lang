@@ -34,27 +34,27 @@ pub fn rust_step_aosoa_tiles(t: View(Collection(SimdParticle), Exclusive), dt: f
 
 pub fn main() {
   let mut entities: Collection(Entity) = [
-    Entity { px: 0.0f32, py: 1.0f32, vx: 4.0f32, vy: 2.0f32, health: 100i32 },
-    Entity { px: 2.0f32, py: 3.0f32, vx: 6.0f32, vy: -1.0f32, health: 80i32 },
-    Entity { px: 5.0f32, py: 0.0f32, vx: 2.0f32, vy: 3.0f32, health: 60i32 },
-    Entity { px: 1.0f32, py: 4.0f32, vx: -2.0f32, vy: 5.0f32, health: 40i32 },
+    Entity { px: 0.0, py: 1.0, vx: 4.0, vy: 2.0, health: 100 },
+    Entity { px: 2.0, py: 3.0, vx: 6.0, vy: -1.0, health: 80 },
+    Entity { px: 5.0, py: 0.0, vx: 2.0, vy: 3.0, health: 60 },
+    Entity { px: 1.0, py: 4.0, vx: -2.0, vy: 5.0, health: 40 },
   ]
 
   let mut particles: Collection(SimdParticle) = [
-    SimdParticle { x: 0.0f32, vx: 1.0f32 },
-    SimdParticle { x: 1.0f32, vx: 2.0f32 },
-    SimdParticle { x: 2.0f32, vx: 3.0f32 },
-    SimdParticle { x: 3.0f32, vx: 4.0f32 },
-    SimdParticle { x: 4.0f32, vx: 5.0f32 },
-    SimdParticle { x: 5.0f32, vx: 6.0f32 },
-    SimdParticle { x: 6.0f32, vx: 7.0f32 },
-    SimdParticle { x: 7.0f32, vx: 8.0f32 },
+    SimdParticle { x: 0.0, vx: 1.0 },
+    SimdParticle { x: 1.0, vx: 2.0 },
+    SimdParticle { x: 2.0, vx: 3.0 },
+    SimdParticle { x: 3.0, vx: 4.0 },
+    SimdParticle { x: 4.0, vx: 5.0 },
+    SimdParticle { x: 5.0, vx: 6.0 },
+    SimdParticle { x: 6.0, vx: 7.0 },
+    SimdParticle { x: 7.0, vx: 8.0 },
   ]
 
-  let cfg = PhysicsStep { dt: 0.5f32, damping: 1.0f32 }
+  let cfg = PhysicsStep { dt: 0.5, damping: 1.0 }
   rust_integrate_positions(entities, cfg)
-  rust_apply_damage(entities, 15i32)
-  rust_step_aosoa_tiles(particles, 0.5f32)
+  rust_apply_damage(entities, 15)
+  rust_step_aosoa_tiles(particles, 0.5)
 
   println("SoA Entity[0] px=", entities[0].px, " health=", entities[0].health)
   println("AoSoA(8) Particle[7] x=", particles[7].x)

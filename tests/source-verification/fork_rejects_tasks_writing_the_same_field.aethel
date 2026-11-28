@@ -1,0 +1,9 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 42, right: 11, };
+  fork {
+    { pair.left = 75; }
+    { pair.left = 76; }
+  } join;
+  pair.left
+}

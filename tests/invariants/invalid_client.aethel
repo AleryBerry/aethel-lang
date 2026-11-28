@@ -1,0 +1,5 @@
+import Character
+fn main() {
+  let mut c = Character { x: 5, y: 5 }
+  c.x = c.x -| c.y
+}

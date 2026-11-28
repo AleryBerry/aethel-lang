@@ -30,16 +30,16 @@ test "1. Stage I: @derive(rust, ...), @rust_attr, bool extern struct, [FlatRec] 
         \\pub fn visit_config(cfg: EngineConfig, cb: fn(View(EngineConfig, Exclusive), [mut f32]) -> ())
         \\
         \\pub fn update_cfg(c: View(EngineConfig, Exclusive), lanes: [mut f32]) {
-        \\  c.fps = 120u32
+        \\  c.fps = 120
         \\  if lanes.len > 0 {
-        \\    lanes[0] = lanes[0] + 1.0f32
+        \\    lanes[0] = lanes[0] + 1.0
         \\  }
         \\}
         \\
         \\pub fn main() {
-        \\  let vs: [GpuVertex] = [GpuVertex { x: 1.0f32, y: 2.0f32, color: 0xff00ff00u32 }]
+        \\  let vs: [GpuVertex] = [GpuVertex { x: 1.0, y: 2.0, color: 0xff00ff00 }]
         \\  let _ = submit_vertices(vs)
-        \\  let cfg = EngineConfig { fps: 60u32, vsync: true }
+        \\  let cfg = EngineConfig { fps: 60, vsync: true }
         \\  visit_config(cfg, update_cfg)
         \\}
     ;
@@ -190,10 +190,10 @@ test "3. Stage I: Vec as_slice and as_mut_slice lowering over flat C-ABI records
         \\pub fn paint_verts(xs: [mut GpuVertex], rgba: u32)
         \\
         \\pub fn main() {
-        \\  let mut verts: Vec(GpuVertex) = vec.with_capacity(4u64)
-        \\  vec.push(verts, GpuVertex { x: 1.0f32, y: 2.0f32, color: 1u32 })
+        \\  let mut verts: Vec(GpuVertex) = vec.with_capacity(4)
+        \\  vec.push(verts, GpuVertex { x: 1.0, y: 2.0, color: 1 })
         \\  let _ = hash_verts(vec.as_slice(verts))
-        \\  paint_verts(vec.as_mut_slice(verts), 99u32)
+        \\  paint_verts(vec.as_mut_slice(verts), 99)
         \\}
     ;
 
@@ -256,15 +256,15 @@ test "Stage I 4: @layout(soa) map_in_place emits @Vector(8, T) column slice SIMD
         \\}
         \\
         \\fn sum_px(cols: Collection(Body) ~>.{ px }) -> f32 {
-        \\  cols |> fold(0.0f32, fn(s, b) { s + b.px })
+        \\  cols |> fold(0.0, fn(s, b) { s + b.px })
         \\}
         \\
         \\pub fn main() -> i32 {
-        \\  let mut v: Vec(Body) = vec.with_capacity(16u64)
-        \\  vec.push(v, Body { px: 1.0f32, py: 2.0f32, vx: 3.0f32, cold_id: 7u32 })
-        \\  step(vec.as_collection(v), 0.5f32)
+        \\  let mut v: Vec(Body) = vec.with_capacity(16)
+        \\  vec.push(v, Body { px: 1.0, py: 2.0, vx: 3.0, cold_id: 7 })
+        \\  step(vec.as_collection(v), 0.5)
         \\  let _t = sum_px(vec.as_collection(v))
-        \\  0i32
+        \\  0
         \\}
     ;
     const files = [_]@import("module_loader.zig").MemoryFile{
@@ -318,20 +318,20 @@ test "Stage I 5: non-SIMD @layout(soa) map_in_place writes only modified columns
         \\
         \\fn bump_cond(cols: Collection(Body2) ~> mut .{ px, vx }) {
         \\  cols |> map_in_place(fn(b) {
-        \\    let mut step = 0i32
-        \\    while step < 1i32 {
+        \\    let mut step = 0
+        \\    while step < 1 {
         \\      b.px = b.px + b.vx
-        \\      step = step + 1i32
+        \\      step = step + 1
         \\    }
         \\  })
         \\}
         \\
         \\pub fn main() -> i32 {
-        \\  let mut v: Vec(Body2) = vec.with_capacity(8u64)
-        \\  vec.push(v, Body2 { px: 0.0f32, vx: 1.0f32, cold: 99u32 })
+        \\  let mut v: Vec(Body2) = vec.with_capacity(8)
+        \\  vec.push(v, Body2 { px: 0.0, vx: 1.0, cold: 99 })
         \\  bump_cond(vec.as_collection(v))
-        \\  rust_step(vec.as_collection(v), 0.5f32)
-        \\  0i32
+        \\  rust_step(vec.as_collection(v), 0.5)
+        \\  0
         \\}
     ;
     const files = [_]@import("module_loader.zig").MemoryFile{
@@ -403,24 +403,24 @@ test "Stage I 6: @select SIMD, +% SIMD fold, exact with_capacity, str.repeat, L1
         \\
         \\fn step_select(cols: Collection(BodySimd) ~> mut .{ px, vx }) {
         \\  cols |> map_in_place(fn(b) {
-        \\    if b.vx > 0.0f32 {
+        \\    if b.vx > 0.0 {
         \\      b.px = b.px + b.vx
         \\    } else {
-        \\      b.vx = b.vx * 0.5f32
+        \\      b.vx = b.vx * 0.5
         \\    }
         \\  })
         \\}
         \\
         \\fn fold_wrap(cols: Collection(BodySimd) ~>.{ tag }) -> u64 {
-        \\  cols |> fold(0u64, fn(s, b) { s +% (b.tag +% 1u64) })
+        \\  cols |> fold(0, fn(s, b) { s +% (b.tag +% 1) })
         \\}
         \\
         \\fn check_auto_small(cols: Collection(SmallAuto) ~>.{ hot_flag, hot_val }) -> u64 {
-        \\  cols |> fold(0u64, fn(s, a) { if a.hot_flag { s +% (a.hot_val as u64) } else { s } })
+        \\  cols |> fold(0, fn(s, a) { if a.hot_flag { s +% (a.hot_val as u64) } else { s } })
         \\}
         \\
         \\fn check_auto_large(cols: Collection(LargeAuto) ~>.{ hot_flag, hot_val }) -> u64 {
-        \\  cols |> fold(0u64, fn(s, a) { if a.hot_flag { s +% (a.hot_val as u64) } else { s } })
+        \\  cols |> fold(0, fn(s, a) { if a.hot_flag { s +% (a.hot_val as u64) } else { s } })
         \\}
         \\
         \\fn cb_sum(xs: [f32]) -> f32 {
@@ -432,23 +432,23 @@ test "Stage I 6: @select SIMD, +% SIMD fold, exact with_capacity, str.repeat, L1
         \\}
         \\
         \\pub fn main() -> i32 {
-        \\  let mut v: Vec(BodySimd) = vec.with_capacity(64u64)
-        \\  vec.push(v, BodySimd { px: 1.0f32, vx: 2.0f32, tag: 3u64 })
+        \\  let mut v: Vec(BodySimd) = vec.with_capacity(64)
+        \\  vec.push(v, BodySimd { px: 1.0, vx: 2.0, tag: 3 })
         \\  step_select(vec.as_collection(v))
         \\  let s1: u64 = fold_wrap(vec.as_collection(v))
         \\
-        \\  let mut vs: Vec(SmallAuto) = vec.with_capacity(64u64)
-        \\  vec.push(vs, SmallAuto { hot_flag: true, flag_b: false, flag_c: true, hot_val: 7u8 })
+        \\  let mut vs: Vec(SmallAuto) = vec.with_capacity(64)
+        \\  vec.push(vs, SmallAuto { hot_flag: true, flag_b: false, flag_c: true, hot_val: 7 })
         \\  let a1: u64 = check_auto_small(vec.as_collection(vs))
         \\
-        \\  let mut vl: Vec(LargeAuto) = vec.with_capacity(20000u64)
-        \\  vec.push(vl, LargeAuto { hot_flag: true, flag_b: false, flag_c: true, hot_val: if a1 == 0u64 { 1u8 } else { 7u8 } })
+        \\  let mut vl: Vec(LargeAuto) = vec.with_capacity(20000)
+        \\  vec.push(vl, LargeAuto { hot_flag: true, flag_b: false, flag_c: true, hot_val: if a1 == 0 { 1 } else { 7 } })
         \\  let _ = check_auto_large(vec.as_collection(vl))
         \\
-        \\  let rep = str.repeat("ab", 16u64)
+        \\  let rep = str.repeat("ab", 16)
         \\  let _ = str.len(rep)
         \\  let _ = rust_step_cb(vec.as_collection(v), cb_sum)
-        \\  0i32
+        \\  0
         \\}
     ;
     const files = [_]@import("module_loader.zig").MemoryFile{
@@ -517,4 +517,61 @@ test "Stage I 6: @select SIMD, +% SIMD fold, exact with_capacity, str.repeat, L1
         &rust_lto_buf.writer,
     );
     try std.testing.expect(std.mem.indexOf(u8, rust_lto_buf.written(), "#[inline(always)]\n    fn __aethel_soa_noalias_call<'a") != null);
+}
+
+test "Stage I 7: L1d hotness unpacks u12 in SmallAuto (<= 32 KiB) and packs u12 in LargeAuto (> 32 KiB)" {
+    const src =
+        \\import std/vec
+        \\@layout(auto)
+        \\pub type SmallU12 {
+        \\  pub hot_x: u12,
+        \\  pub cold_y: u4,
+        \\}
+        \\@layout(auto)
+        \\pub type LargeU12 {
+        \\  pub hot_x: u12,
+        \\  pub cold_y: u4,
+        \\}
+        \\fn sum_small(cols: Collection(SmallU12) ~>.{ hot_x }) -> u64 {
+        \\  cols |> fold(0, fn(s, a) { s +% (a.hot_x as u64) })
+        \\}
+        \\fn sum_large(cols: Collection(LargeU12) ~>.{ hot_x }) -> u64 {
+        \\  cols |> fold(0, fn(s, a) { s +% (a.hot_x as u64) })
+        \\}
+        \\pub fn main() -> i32 {
+        \\  let mut vs: Vec(SmallU12) = vec.with_capacity(64)
+        \\  vec.push(vs, SmallU12 { hot_x: 100, cold_y: 3 })
+        \\  let s = sum_small(vec.as_collection(vs))
+        \\  let mut vl: Vec(LargeU12) = vec.with_capacity(20000)
+        \\  vec.push(vl, LargeU12 { hot_x: if s == 0 { 1 } else { 2 }, cold_y: 3 })
+        \\  let _ = sum_large(vec.as_collection(vl))
+        \\  0
+        \\}
+    ;
+    const files = [_]@import("module_loader.zig").MemoryFile{
+        .{ .module_key = "main", .path = "main.aethel", .source = src },
+    };
+    var loaded = try @import("module_loader.zig").loadFromMemory(std.testing.allocator, "main", &files);
+    defer loaded.deinit();
+    var ctree = try parser.parse(std.testing.allocator, loaded.combined_source);
+    defer ctree.deinit();
+    const mod_infos = try std.testing.allocator.alloc(sema.ModuleSliceInfo, loaded.slices.len);
+    defer std.testing.allocator.free(mod_infos);
+    for (loaded.slices, 0..) |sl, idx| {
+        mod_infos[idx] = .{ .module_id = sl.module_id, .module_key = sl.module_key, .start = sl.start, .end = sl.end };
+    }
+    var checked = try sema.analyzeWithModules(std.testing.allocator, &ctree, mod_infos, loaded.entry_module_id);
+    defer checked.deinit();
+    try std.testing.expect(!checked.hasErrors());
+    var small_bit_off: ??u8 = null;
+    var large_bit_off: ??u8 = null;
+    for (checked.records) |r| {
+        if (std.mem.eql(u8, r.name, "SmallU12")) {
+            small_bit_off = r.record_layout.fields[0].bit_offset;
+        } else if (std.mem.eql(u8, r.name, "LargeU12")) {
+            large_bit_off = r.record_layout.fields[0].bit_offset;
+        }
+    }
+    try std.testing.expect(small_bit_off != null and small_bit_off.? == null);
+    try std.testing.expect(large_bit_off != null and large_bit_off.? != null);
 }

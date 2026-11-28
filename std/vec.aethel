@@ -12,5 +12,5 @@
 ////   vec.clear(v) / vec.as_slice(v) / vec.as_mut_slice(v) / vec.as_collection(v)
 
 pub fn initial_capacity() -> u64 {
-  8u64
+  8
 }

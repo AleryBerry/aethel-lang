@@ -1,0 +1,5 @@
+fn main() -> u8 {
+  let capture = fn(value: u8) { fn(ignored: bool) { value } };
+  let saved = capture(67);
+  saved(false)
+}

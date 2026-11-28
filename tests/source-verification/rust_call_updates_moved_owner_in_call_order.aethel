@@ -1,0 +1,17 @@
+@external(rust, "batch", "first")
+pub fn first(left: [mut u8], source: [u8]) -> ()
+
+@external(rust, "batch", "last")
+pub fn last(left: [mut u8]) -> ()
+
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut seed = Pair { left: 10, right: 73, };
+  let mut row = move seed;
+  view exclusive local = row.left {
+    local = row.right;
+  };
+  first(row.left, row.right);
+  last(row.left);
+  row.left
+}

@@ -18,14 +18,14 @@ fn check_threshold(res: Result(i32, u8)) -> i32 {
 }
 
 fn main() {
-  let a: [f32] = [1.0f32, 2.0f32, 3.0f32, 4.0f32]
-  let mut b: [mut f32] = [2.0f32, 3.0f32, 4.0f32, 5.0f32]
+  let a: [f32] = [1.0, 2.0, 3.0, 4.0]
+  let mut b: [mut f32] = [2.0, 3.0, 4.0, 5.0]
 
   let dot_before = fast_dot(a, b)
 
   // Disjoint half-open mutable slices [0..2] and [2..4] mutated safely in Rust.
-  scale_in_place(b[0..2], 2.0f32)
-  scale_in_place(b[2..4], 3.0f32)
+  scale_in_place(b[0..2], 2.0)
+  scale_in_place(b[2..4], 3.0)
   let dot_after = fast_dot(a, b)
 
   // Opaque RustOwn affine handle lifecycle: push -> shared sum -> single drop.

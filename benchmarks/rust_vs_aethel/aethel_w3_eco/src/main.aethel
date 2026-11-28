@@ -1,0 +1,111 @@
+import std/vec
+import std/str
+
+@layout(flat)
+@derive(rust, "serde::Serialize", "serde::Deserialize", "PartialEq")
+pub type WindowBounds {
+  pub width: u32,
+  pub height: u32,
+}
+
+@layout(flat)
+@derive(rust, "serde::Serialize", "serde::Deserialize", "PartialEq")
+pub type EngineConfig {
+  @rust_attr("serde(rename = \"target_fps\")")
+  pub fps: u32,
+  pub vsync: bool,
+  @rust_attr("serde(default)")
+  pub worker_threads: u32,
+  pub bounds: WindowBounds,
+}
+
+@layout(flat)
+@derive(rust, "bytemuck::Pod", "bytemuck::Zeroable")
+pub type GpuVertex {
+  pub x: f32,
+  pub y: f32,
+  pub z: f32,
+  pub rgba: u32,
+}
+
+@external(rust, "self", "bench_serde")
+pub fn bench_serde(cfg: EngineConfig, iters: u32) -> u64
+
+@external(rust, "self", "bench_bytemuck")
+pub fn bench_bytemuck(verts: [mut GpuVertex]) -> u64
+
+@external(rust, "self", "bench_rayon")
+pub fn bench_rayon(
+  floats: [mut f32],
+  fma_chunk: fn([mut f32]) -> (),
+  reduce_word: fn(u32) -> u64,
+) -> u64
+
+@external(rust, "self", "bench_tokio")
+pub fn bench_tokio(msgs_per_producer: u32, on_msg: fn(u32) -> u64) -> u64
+
+@external(rust, "self", "bench_regex")
+pub fn bench_regex(log_text: String, on_cap: fn(String, u32) -> u64) -> u64
+
+pub fn fma_chunk(xs: [mut f32]) {
+  for i in 0..xs.len {
+    xs[i] = xs[i] * 2.0 + 1.0
+  }
+}
+
+pub fn reduce_word(bits: u32) -> u64 {
+  let w = bits as u64
+  w *| 3 +| 1
+}
+
+pub fn on_tokio_msg(v: u32) -> u64 {
+  let w = v as u64
+  w *| 3 +| 1
+}
+
+pub fn on_regex_cap(lvl: String, code: u32) -> u64 {
+  let l64 = lvl.len as u64
+  let c64 = code as u64
+  l64 *| 1000 +| c64
+}
+
+pub fn main() -> i32 {
+  let cfg = EngineConfig {
+    fps: 144,
+    vsync: true,
+    worker_threads: 4,
+    bounds: WindowBounds { width: 2560, height: 1440 },
+  }
+  let serde_sum = bench_serde(cfg, 20000)
+
+  let mut verts: Vec(GpuVertex) = vec.with_capacity(500000)
+  for i in 0..500000 {
+    let idx = i as u32
+    vec.push(verts, GpuVertex { x: 1.5, y: 2.5, z: 3.5, rgba: idx & 16777215 })
+  }
+  let bytemuck_sum = bench_bytemuck(vec.as_mut_slice(verts))
+
+  let mut floats: Vec(f32) = vec.with_capacity(1000000)
+  let mut fv: f32 = 0.0
+  for _ in 0..1000000 {
+    vec.push(floats, fv)
+    fv = fv + 0.25
+    if fv >= 128.0 {
+      fv = 0.0
+    }
+  }
+  let rayon_sum = bench_rayon(vec.as_mut_slice(floats), fma_chunk, reduce_word)
+
+  let tokio_sum = bench_tokio(500, on_tokio_msg)
+
+  let unit = "INFO:render=200 WARN:audio=404 ERROR:ecs=500 INFO:io=101\n"
+  let mut log_text = ""
+  for _ in 0..2500 {
+    log_text = str.concat(log_text, unit)
+  }
+  let regex_sum = bench_regex(log_text, on_regex_cap)
+
+  let total = serde_sum +| bytemuck_sum +| rayon_sum +| tokio_sum +| regex_sum
+  println("w3_aethel_eco checksum=", total)
+  0
+}

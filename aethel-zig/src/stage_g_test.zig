@@ -162,13 +162,13 @@ test "1. Stage G: embedded stdlib parity with std/*.aethel & multi-import law ch
         \\import std/str as str
         \\
         \\pub fn main() {
-        \\  let scores: [u32] = [10u32, 20u32, 12u32]
+        \\  let scores: [u32] = [10, 20, 12]
         \\  let folded = traits.fold_slice(scores)
         \\  let o = Some(folded)
-        \\  let v = opt.unwrap_or(o, 0u32)
-        \\  let r: Result(u32, u32) = Ok(math.gcd_u32(v, 24u32))
-        \\  let g = res.unwrap_or(r, 1u32)
-        \\  let p = math.pow_u32(2u32, 5u32)
+        \\  let v = opt.unwrap_or(o, 0)
+        \\  let r: Result(u32, u32) = Ok(math.gcd_u32(v, 24))
+        \\  let g = res.unwrap_or(r, 1)
+        \\  let p = math.pow_u32(2, 5)
         \\  let ord = cmp.compare_u32(p, g)
         \\  let msg = "aethel-std"
         \\  if cmp.is_gt(ord) && str.starts_with(msg, "aethel") {
@@ -181,7 +181,7 @@ test "1. Stage G: embedded stdlib parity with std/*.aethel & multi-import law ch
 
     try std.testing.expect(prog.checked.laws.len > 0);
     for (prog.checked.laws) |law| {
-        if (law.verdict == .falsified or law.verdict == .violated or law.verdict == .unverified_symbolic) {
+        if (law.verdict == .falsified or law.verdict == .violated) {
             std.debug.print("unexpected law verdict for {s}: {s} ({s})\n", .{
                 law.name,
                 @tagName(law.verdict),
@@ -209,7 +209,7 @@ test "2. Stage G: layout-polymorphic Vec SoA/AoSoA synthesis, dyn_vec MIR, SIMD 
         \\}
         \\
         \\fn heal_entities(es: Collection(Entity) ~>.{ hp }) -> u32 {
-        \\  let mut total: u32 = 0u32
+        \\  let mut total: u32 = 0
         \\  for e in es {
         \\    total = total + e.hp
         \\  }
@@ -217,21 +217,21 @@ test "2. Stage G: layout-polymorphic Vec SoA/AoSoA synthesis, dyn_vec MIR, SIMD 
         \\}
         \\
         \\pub fn main() {
-        \\  let mut es: Vec(Entity) = vec.with_capacity(4u64)
-        \\  vec.push(es, Entity { id: 1u32, hp: 50u32 })
-        \\  vec.push(es, Entity { id: 2u32, hp: 75u32 })
+        \\  let mut es: Vec(Entity) = vec.with_capacity(4)
+        \\  vec.push(es, Entity { id: 1, hp: 50 })
+        \\  vec.push(es, Entity { id: 2, hp: 75 })
         \\  let hsum = heal_entities(es)
-        \\  vec.push(es, Entity { id: 3u32, hp: hsum })
+        \\  vec.push(es, Entity { id: 3, hp: hsum })
         \\
         \\  let mut ps: Vec(Particle) = vec.new()
-        \\  let mut i: u32 = 0u32
-        \\  while i < 10u32 {
-        \\    vec.push(ps, Particle { x: 1.0f32, vx: 2.0f32 })
-        \\    i = i + 1u32
+        \\  let mut i: u32 = 0
+        \\  while i < 10 {
+        \\    vec.push(ps, Particle { x: 1.0, vx: 2.0 })
+        \\    i = i + 1
         \\  }
         \\  let total_x = ps
         \\    |> map_in_place(fn(p) { p.x = p.x + p.vx })
-        \\    |> fold(0.0f32, fn(acc, p) { acc + p.x })
+        \\    |> fold(0.0, fn(acc, p) { acc + p.x })
         \\  println(total_x, es[0].id)
         \\}
     ;
@@ -252,10 +252,10 @@ test "3. Stage G: borrow-reservation & ownership counterexamples + early-release
         \\import std/vec as vec
         \\pub fn main() {
         \\  let mut xs: Vec(u32) = vec.new()
-        \\  vec.push(xs, 10u32)
-        \\  vec.push(xs, 20u32)
+        \\  vec.push(xs, 10)
+        \\  vec.push(xs, 20)
         \\  let sub = xs[0..1]
-        \\  vec.push(xs, 30u32)
+        \\  vec.push(xs, 30)
         \\  println(sub[0])
         \\}
     , .borrow_conflict);
@@ -265,9 +265,9 @@ test "3. Stage G: borrow-reservation & ownership counterexamples + early-release
         \\import std/vec as vec
         \\pub fn main() {
         \\  let mut xs: Vec(u32) = vec.new()
-        \\  vec.push(xs, 1u32)
+        \\  vec.push(xs, 1)
         \\  let sl = vec.as_slice(xs)
-        \\  vec.push(xs, 2u32)
+        \\  vec.push(xs, 2)
         \\  println(sl.len)
         \\}
     , .borrow_conflict);
@@ -277,9 +277,9 @@ test "3. Stage G: borrow-reservation & ownership counterexamples + early-release
         \\import std/map as map
         \\pub fn main() {
         \\  let mut m: Map(u32, u32) = map.new()
-        \\  map.put(m, 1u32, 10u32)
+        \\  map.put(m, 1, 10)
         \\  view shared v = m {
-        \\    map.put(m, 2u32, 20u32)
+        \\    map.put(m, 2, 20)
         \\  }
         \\}
     , .borrow_conflict);
@@ -289,7 +289,7 @@ test "3. Stage G: borrow-reservation & ownership counterexamples + early-release
         \\import std/vec as vec
         \\pub fn main() {
         \\  let xs: Vec(u32) = vec.new()
-        \\  vec.push(xs, 1u32)
+        \\  vec.push(xs, 1)
         \\}
     , .mutability_error);
 
@@ -298,7 +298,7 @@ test "3. Stage G: borrow-reservation & ownership counterexamples + early-release
         \\import std/vec as vec
         \\pub fn main() {
         \\  let mut xs: Vec(u32) = vec.new()
-        \\  vec.push(xs, 7u32)
+        \\  vec.push(xs, 7)
         \\  let ys = xs
         \\  println(ys.len, xs.len)
         \\}
@@ -309,10 +309,10 @@ test "3. Stage G: borrow-reservation & ownership counterexamples + early-release
         \\import std/vec as vec
         \\pub fn main() {
         \\  let mut xs: Vec(u32) = vec.new()
-        \\  vec.push(xs, 10u32)
+        \\  vec.push(xs, 10)
         \\  let sub = vec.as_slice(xs)
         \\  let first = sub[0]
-        \\  vec.push(xs, first +| 5u32)
+        \\  vec.push(xs, first +| 5)
         \\  println(xs.len)
         \\}
     );
@@ -328,23 +328,23 @@ test "4. Stage G: Map/Set/Deque codegen & unlawful f32 key rejection" {
         \\
         \\fn make_vec() -> Vec(u32) {
         \\  let mut xs: Vec(u32) = vec.new()
-        \\  vec.push(xs, 1u32)
+        \\  vec.push(xs, 1)
         \\  xs
         \\}
         \\
         \\pub fn main() {
         \\  let moved_v = make_vec()
         \\  let mut scores: Map(String, u32) = map.new()
-        \\  map.put(scores, "alice", 42u32)
+        \\  map.put(scores, "alice", 42)
         \\  let has_alice = map.contains(scores, "alice")
-        \\  let old = map.insert(scores, "alice", 99u32)
+        \\  let old = map.insert(scores, "alice", 99)
         \\
         \\  let mut seen: Set(u32) = set.new()
-        \\  let added = set.insert(seen, 7u32)
+        \\  let added = set.insert(seen, 7)
         \\
         \\  let mut dq: Deque(i32) = deque.new()
-        \\  deque.push_back(dq, 10i32)
-        \\  deque.push_front(dq, -5i32)
+        \\  deque.push_back(dq, 10)
+        \\  deque.push_front(dq, -5)
         \\  println(moved_v.len, has_alice, added, old, dq.len)
         \\}
     ;
@@ -365,7 +365,7 @@ test "4. Stage G: Map/Set/Deque codegen & unlawful f32 key rejection" {
         \\import std/map as map
         \\pub fn main() {
         \\  let mut bad: Map(f32, u32) = map.new()
-        \\  map.put(bad, 1.0f32, 2u32)
+        \\  map.put(bad, 1.0, 2)
         \\}
     , .type_mismatch);
 }

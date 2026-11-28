@@ -1,0 +1,3 @@
+law unrelated_output(row: Pair) {
+  always absent(row) == 100
+}

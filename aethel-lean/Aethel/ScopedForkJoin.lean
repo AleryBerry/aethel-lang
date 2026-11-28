@@ -20,6 +20,36 @@ structure TaskFootprint where
   writes : List ByteLocation
   deriving Repr, DecidableEq
 
+def TaskFootprint.ofByteAccesses (accesses : List ByteAccess) : TaskFootprint :=
+  ⟨accesses.filterMap (fun | .read location => some location | .write .. => none),
+    accesses.filterMap (fun | .read _ => none | .write location _ => some location)⟩
+
+def TaskFootprint.ofProgram (resources : ResourceState) (program : Program) : Option TaskFootprint :=
+  (program.mapM (Instruction.byteAccess resources)).map ofByteAccesses
+
+theorem TaskFootprint.writeValuesAt_empty {resources : ResourceState} {program : Program}
+    {footprint : TaskFootprint} {location : ByteLocation}
+    (decoded : ofProgram resources program = some footprint) (outside : location ∉ footprint.writes) :
+    program.filterMap (Instruction.writeValueAt resources location) = [] := by
+  obtain ⟨accesses, resolved, rfl⟩ := Option.map_eq_some_iff.mp decoded
+  clear decoded
+  induction program generalizing accesses with
+  | nil => rfl
+  | cons op rest ih =>
+    simp only [List.mapM_cons, bind, pure, Option.bind_eq_some_iff, Option.some.injEq] at resolved
+    obtain ⟨access, head, tail, suffix, rfl⟩ := resolved
+    cases access with
+    | read source =>
+      have tailOutside : location ∉ (ofByteAccesses tail).writes := outside
+      have noWrite : op.writeValueAt resources location = none := by simp [Instruction.writeValueAt, head]
+      simp only [List.filterMap_cons, noWrite, ih tail suffix tailOutside]
+    | write target value =>
+      have different : target ≠ location := fun same => outside (same ▸ List.mem_cons_self)
+      have tailOutside : location ∉ (ofByteAccesses tail).writes := fun member =>
+        outside (List.mem_cons_of_mem target member)
+      have noWrite : op.writeValueAt resources location = none := by simp [Instruction.writeValueAt, head, different]
+      simp only [List.filterMap_cons, noWrite, ih tail suffix tailOutside]
+
 def TaskFootprint.touched (f : TaskFootprint) : List ByteLocation :=
   f.reads ++ f.writes
 
@@ -32,6 +62,73 @@ def checkForkDisjoint (a b : TaskFootprint) : Bool :=
 /-- Compatibility of the physical reads and writes of two tasks. -/
 def ForkDisjoint (a b : TaskFootprint) : Prop :=
   a.toFootprint.Compatible b.toFootprint
+
+theorem mapM_member {resolve : α → Option β} {inputs : List α} {outputs : List β}
+    {input : α} (decoded : inputs.mapM resolve = some outputs) (member : input ∈ inputs) :
+    ∃ output ∈ outputs, resolve input = some output := by
+  induction inputs generalizing outputs with
+  | nil => cases member
+  | cons first rest ih =>
+    simp only [List.mapM_cons, pure, bind, Option.bind_eq_some_iff, Option.some.injEq] at decoded
+    obtain ⟨head, exactHead, tail, exactTail, rfl⟩ := decoded
+    rcases List.mem_cons.mp member with rfl | later
+    · exact ⟨head, List.mem_cons_self, exactHead⟩
+    · obtain ⟨footprint, found, exactFootprint⟩ := ih exactTail later
+      exact ⟨footprint, List.mem_cons_of_mem _ found, exactFootprint⟩
+
+theorem mapM_eq_of_mem {a b : α → Option β} {entries : List α}
+    (same : ∀ entry ∈ entries, a entry = b entry) : entries.mapM a = entries.mapM b := by
+  induction entries with
+  | nil => rfl
+  | cons head tail ih =>
+    rw [List.mapM_cons, List.mapM_cons, same _ List.mem_cons_self,
+      ih (fun entry member => same entry (List.mem_cons_of_mem _ member))]
+
+private theorem TaskFootprint.ofProgram_contains_read {resources : ResourceState} {program : Program}
+    {footprint : TaskFootprint} {op : Instruction} {location : ByteLocation}
+    (decoded : ofProgram resources program = some footprint) (member : op ∈ program)
+    (read : op.byteAccess resources = some (.read location)) : location ∈ footprint.reads := by
+  obtain ⟨accesses, resolved, rfl⟩ := Option.map_eq_some_iff.mp decoded
+  obtain ⟨access, present, actual⟩ := mapM_member resolved member
+  rw [read, Option.some.injEq] at actual
+  exact List.mem_filterMap.mpr ⟨_, actual ▸ present, rfl⟩
+
+theorem TaskFootprint.pairwise_writeValuesAt {resources : ResourceState} {programs : List Program}
+    {footprints : List TaskFootprint} (decoded : programs.mapM (ofProgram resources) = some footprints)
+    (compatible : footprints.Pairwise ForkDisjoint) (location : ByteLocation) :
+    programs.Pairwise (fun a b => a.filterMap (Instruction.writeValueAt resources location) = [] ∨
+      b.filterMap (Instruction.writeValueAt resources location) = []) := by
+  induction programs generalizing footprints with
+  | nil => exact .nil
+  | cons first rest ih =>
+    simp only [List.mapM_cons, pure, bind, Option.bind_eq_some_iff, Option.some.injEq] at decoded
+    obtain ⟨head, exactHead, tail, exactTail, rfl⟩ := decoded
+    obtain ⟨apart, remaining⟩ := List.pairwise_cons.mp compatible
+    apply List.pairwise_cons.mpr ⟨?_, ih exactTail remaining⟩
+    intro other member
+    obtain ⟨footprint, found, exactFootprint⟩ := mapM_member exactTail member
+    by_cases written : location ∈ head.writes
+    · exact .inr (writeValuesAt_empty exactFootprint ((apart footprint found).1 location written).2)
+    · exact .inl (writeValuesAt_empty exactHead written)
+
+theorem TaskFootprint.siblings_do_not_write_reads {resources : ResourceState} {earlier later : List Program}
+    {reader sibling : Program} {footprints : List TaskFootprint} {op : Instruction} {location : ByteLocation}
+    (decoded : (earlier ++ reader :: later).mapM (ofProgram resources) = some footprints)
+    (compatible : footprints.Pairwise ForkDisjoint) (readerOp : op ∈ reader)
+    (read : op.byteAccess resources = some (.read location)) (other : sibling ∈ earlier ++ later) :
+    sibling.filterMap (Instruction.writeValueAt resources location) = [] := by
+  simp only [List.mapM_append, List.mapM_cons, bind, pure, Option.bind_eq_some_iff,
+    Option.some.injEq] at decoded
+  obtain ⟨past, exactEarlier, _, ⟨current, exactReader, future, exactLater, rfl⟩, rfl⟩ := decoded
+  obtain ⟨_, tail, crosses⟩ := List.pairwise_append.mp compatible
+  have inReader := ofProgram_contains_read exactReader readerOp read
+  rcases List.mem_append.mp other with before | after
+  · obtain ⟨footprint, present, exactOther⟩ := mapM_member exactEarlier before
+    exact writeValuesAt_empty exactOther (fun write =>
+      ((crosses footprint present current List.mem_cons_self).1 location write).1 inReader)
+  · obtain ⟨footprint, present, exactOther⟩ := mapM_member exactLater after
+    exact writeValuesAt_empty exactOther (fun write =>
+      (((List.pairwise_cons.mp tail).1 footprint present).2 location write).1 inReader)
 
 theorem checkForkDisjoint_correct (a b : TaskFootprint) :
     checkForkDisjoint a b = true ↔ ForkDisjoint a b :=

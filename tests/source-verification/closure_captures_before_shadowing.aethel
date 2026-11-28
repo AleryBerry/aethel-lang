@@ -1,0 +1,6 @@
+fn main() -> u8 {
+  let captured = 61;
+  let get = fn(ignored: u8) { captured };
+  let captured = 29;
+  get(captured)
+}

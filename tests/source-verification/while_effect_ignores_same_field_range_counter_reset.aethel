@@ -1,0 +1,10 @@
+type Meter { remaining: u8, pulses: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { remaining: 52, pulses: 17, };
+  while meter.remaining > 9 decreases meter.remaining {
+    meter.remaining = meter.remaining -| 14;
+    for _ in meter.remaining..meter.remaining { meter.remaining = 250; };
+    meter.pulses = meter.pulses -| 2;
+  };
+  meter.pulses
+}

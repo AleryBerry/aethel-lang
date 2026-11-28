@@ -1,0 +1,3 @@
+law stage_output(row: Triple) {
+  always stage(row) == 83
+}

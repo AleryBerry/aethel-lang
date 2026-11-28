@@ -1,0 +1,15 @@
+@layout(aosoa(2))
+type Cell { value: u8, next: u8, }
+fn main() -> u8 {
+  let mut cells: Collection(Cell) = [
+    Cell { value: 66, next: 255, },
+    Cell { value: 74, next: 1, },
+  ];
+  let index = cells[0].next;
+  if index < 2 {
+    cells[index].value = 18;
+  } else {
+    cells[0].value = cells[1].value;
+  };
+  cells[0].value
+}

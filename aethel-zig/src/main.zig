@@ -208,10 +208,14 @@ fn runCli(
                 rec.conflicts.len,
             });
             if (explain_layout) {
-                var naive_bytes: usize = 0;
-                for (rec.record_layout.fields) |fp| {
-                    naive_bytes += @max(@as(usize, 1), fp.size);
+                var flat_cursor: usize = 0;
+                var flat_align: usize = 1;
+                for (rec.fields) |cf| {
+                    const slot = aethel.layout.naturalSlot(@max(@as(u16, 1), cf.bits));
+                    flat_align = @max(flat_align, slot.alignment);
+                    flat_cursor = aethel.layout.alignUp(flat_cursor, slot.alignment) + slot.size;
                 }
+                const naive_bytes = aethel.layout.alignUp(flat_cursor, flat_align);
                 const saved_bytes: isize = @as(isize, @intCast(naive_bytes)) - @as(isize, @intCast(rec.record_layout.size));
                 try stdout.print("    naive_size={d} saved={d}B", .{ naive_bytes, saved_bytes });
                 if (rec.collection_layout) |cl| {
@@ -232,11 +236,12 @@ fn runCli(
                     const is_hot = fi < rec.hot_fields.len and rec.hot_fields[fi];
                     const temp_label: []const u8 = if (is_hot) "hot" else "cold";
                     if (fp.bit_offset) |boff| {
-                        try stdout.print("    field {s}: bits={d} byte={d} bit={d} ({s}, ffd_packed)\n", .{
+                        try stdout.print("    field {s}: bits={d} byte={d} bit={d} span={d}B ({s}, bit_packed)\n", .{
                             cf.name,
                             cf.bits,
                             fp.byte_offset,
                             boff,
+                            fp.size,
                             temp_label,
                         });
                     } else {
@@ -803,11 +808,7 @@ fn handleVerify(
     for (checked.laws) |law| {
         switch (law.verdict) {
             .proved_tier0, .proved_tier1_exhaustive, .proved_tier2_symbolic, .proved_interval, .proved_tier3_lean => {
-                const lean_note: []const u8 = if (lean_summary != null and (law.symbolic_certs.len > 0 or law.verdict == .proved_tier0))
-                    " + Lean Tier 3"
-                else
-                    "";
-                try stdout.print("  [PROVED]    {s} -- {s}{s}\n", .{ law.name, law.tier_detail, lean_note });
+                try stdout.print("  [PROVED]    {s} -- {s}\n", .{ law.name, law.tier_detail });
             },
             .falsified => {
                 any_blocked = true;
@@ -819,13 +820,21 @@ fn handleVerify(
             },
             .unverified_symbolic => {
                 any_blocked = true;
-                try stdout.print("  [UNPROVED]  {s} -- requires Lean Tier 3 proof or bounded domain\n", .{law.name});
+                try stdout.print("  [UNPROVED]  {s} -- {s}\n", .{ law.name, law.tier_detail });
             },
+        }
+        for (law.clauses, 1..) |clause, clause_number| {
+            try stdout.print("              clause {d} ({s}): {s}", .{ clause_number, @tagName(clause.kind), clause.detail });
+            if (clause.certificate) |name| {
+                try stdout.print(" -- MIR certificate {s}", .{name});
+                if (lean_summary != null) try stdout.writeAll(" accepted by Lean");
+            }
+            try stdout.writeByte('\n');
         }
     }
     for (checked.functions) |cf| {
         if (cf.decreases_certs.len > 0) {
-            const lean_note: []const u8 = if (lean_summary != null) " + Lean Tier 3" else "";
+            const lean_note: []const u8 = if (lean_summary != null) " (MIR certificates accepted by Lean)" else "";
             try stdout.print("  [DECREASES] fn {s} -- {d} termination measure(s) proved{s}\n", .{
                 cf.name,
                 cf.decreases_certs.len,
@@ -862,6 +871,11 @@ fn handleVerify(
         return 1;
     }
 
+    if (checked.laws.len == 0) {
+        try stdout.print("Verdict: NO LAWS CHECKED ({d} decreases cert(s))\n", .{total_decreases_certs});
+        try stdout.flush();
+        return 0;
+    }
     try stdout.print("Verdict: ALL LAWS PROVED ({d} law(s), {d} decreases cert(s))\n", .{ checked.laws.len, total_decreases_certs });
     try stdout.flush();
     return 0;

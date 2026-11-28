@@ -1,0 +1,12 @@
+type Pair { left: u8, right: u8, }
+fn change(pair: Pair ~>.{left}) {
+  view exclusive item = pair.left { item = 72; };
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 41, };
+  view shared keep = pair.right {
+    change(pair);
+    if keep != 41 { pair.left = 0; } else { };
+  };
+  pair.left
+}

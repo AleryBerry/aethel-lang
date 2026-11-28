@@ -1,0 +1,12 @@
+type Triple { first: u8, second: u8, third: u8, }
+fn copy(triple: Triple ~>.{first, second}) {
+  triple.second = triple.first;
+}
+fn main() -> u8 {
+  let mut triple = Triple { first: 42, second: 11, third: 9, };
+  view shared keep = triple.third {
+    copy(triple);
+    let _ = keep;
+  };
+  triple.second
+}

@@ -1,0 +1,9 @@
+type Meter { bound: u8, result: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { bound: 93, result: 0, };
+  view exclusive held = meter.bound {
+    for _ in meter.bound..meter.bound { };
+    meter.result = held;
+  };
+  meter.result
+}

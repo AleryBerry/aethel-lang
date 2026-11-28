@@ -14,7 +14,9 @@ inductive CoreType where
   | bool : CoreType
   | nat : CoreType
   | int (signed : Bool) (bits : Nat) : CoreType
+  | parameter (name : String) : CoreType
   | prod (left right : CoreType) : CoreType
+  | sum (left right : CoreType) : CoreType
   | adt (tag : Nat) (payload : CoreType) : CoreType
   | handle (elemTy : CoreType) : CoreType
   | view (elemTy : CoreType) (mode : AccessMode) : CoreType
@@ -23,6 +25,9 @@ inductive CoreType where
 
 abbrev CoreType.byte : CoreType := .int false 8
 abbrev CoreType.uint16 : CoreType := .int false 16
+
+def CoreType.sumPayload (left : Bool) (variants : CoreType × CoreType) : CoreType :=
+  if left then variants.1 else variants.2
 
 /-- The unified abstract syntax tree of the sequential core language. -/
 inductive CoreExpr where
@@ -33,6 +38,8 @@ inductive CoreExpr where
   | pair (fst snd : CoreExpr) : CoreExpr
   | fst (p : CoreExpr) : CoreExpr
   | snd (p : CoreExpr) : CoreExpr
+  | inject (left : Bool) (variants : CoreType × CoreType) (payload : CoreExpr) : CoreExpr
+  | matchSum (scrutinee : CoreExpr) (binder : Nat) (onLeft onRight : CoreExpr) : CoreExpr
   | adt (tag : Nat) (payload : CoreExpr) : CoreExpr
   | matchTag (scrutinee : CoreExpr) (tag : Nat) (onMatch : CoreExpr) (onElse : CoreExpr) : CoreExpr
   | var (id : Nat) : CoreExpr
@@ -57,7 +64,7 @@ def isVal : CoreExpr → Bool
   | .unit | .bool _ | .nat _ | .int _ _ _ => true
   | .lam _ _ _ _ => true
   | .pair a b => isVal a && isVal b
-  | .adt _ p => isVal p
+  | .adt _ p | .inject _ _ p => isVal p
   | _ => false
 
 /-- Inductive value predicate characterizing irreducibles. -/
@@ -69,6 +76,8 @@ inductive Value : CoreExpr → Prop where
   | lam (p : Nat) (ty : CoreType) (body : CoreExpr) (eff : Effect) :
       Value (.lam p ty body eff)
   | pair {a b : CoreExpr} : Value a → Value b → Value (.pair a b)
+  | inject (left : Bool) (variants : CoreType × CoreType) {p : CoreExpr} :
+      Value p → Value (.inject left variants p)
   | adt (tag : Nat) {p : CoreExpr} : Value p → Value (.adt tag p)
 
 theorem isVal_correct (e : CoreExpr) : isVal e = true ↔ Value e := by
@@ -87,6 +96,9 @@ theorem isVal_correct (e : CoreExpr) : isVal e = true ↔ Value e := by
       | pair ha hb => exact ⟨iha.mpr ha, ihb.mpr hb⟩
   | fst _ => simp [isVal]; intro h; cases h
   | snd _ => simp [isVal]; intro h; cases h
+  | inject left variants p ih =>
+    exact ⟨fun ready => .inject left variants (ih.mp ready), fun h => by cases h; exact ih.mpr ‹Value p›⟩
+  | matchSum _ _ _ _ => simp [isVal]; intro h; cases h
   | adt tag p ih =>
     simp only [isVal]
     constructor
@@ -115,6 +127,11 @@ def subst (varId : Nat) (val : CoreExpr) : CoreExpr → CoreExpr
   | .pair a b => .pair (subst varId val a) (subst varId val b)
   | .fst p => .fst (subst varId val p)
   | .snd p => .snd (subst varId val p)
+  | .inject left variants p => .inject left variants (subst varId val p)
+  | .matchSum input binder onLeft onRight =>
+    .matchSum (subst varId val input) binder
+      (if binder = varId then onLeft else subst varId val onLeft)
+      (if binder = varId then onRight else subst varId val onRight)
   | .adt tag p => .adt tag (subst varId val p)
   | .matchTag s tag onMatch onElse =>
     .matchTag (subst varId val s) tag (subst varId val onMatch) (subst varId val onElse)
@@ -174,6 +191,15 @@ inductive WellTyped : Ctx → CoreExpr → CoreType → Effect → Prop where
   | snd {ctx : Ctx} {p : CoreExpr} {tyA tyB : CoreType} {eff : Effect} :
       WellTyped ctx p (.prod tyA tyB) eff →
       WellTyped ctx (.snd p) tyB eff
+  | inject {ctx : Ctx} (left : Bool) (variants : CoreType × CoreType) {p : CoreExpr} {eff : Effect} :
+      WellTyped ctx p (CoreType.sumPayload left variants) eff →
+      WellTyped ctx (.inject left variants p) (.sum variants.1 variants.2) eff
+  | matchSum {ctx : Ctx} (binder : Nat) {input onLeft onRight : CoreExpr}
+      {left right result : CoreType} {inputEff leftEff rightEff : Effect} :
+      WellTyped ctx input (.sum left right) inputEff →
+      WellTyped ((binder, left) :: ctx) onLeft result leftEff →
+      WellTyped ((binder, right) :: ctx) onRight result rightEff →
+      WellTyped ctx (.matchSum input binder onLeft onRight) result (inputEff.union (leftEff.union rightEff))
   | adt {ctx : Ctx} (tag : Nat) {p : CoreExpr} {tyP : CoreType} {eff : Effect} :
       WellTyped ctx p tyP eff →
       WellTyped ctx (.adt tag p) (.adt tag tyP) eff

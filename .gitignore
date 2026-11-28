@@ -2,7 +2,13 @@ aethel-lean/.lake/
 aethel-zig/.zig-cache/
 aethel-zig/zig-out/
 .aethel-build/
+.bench-bin/
+target/
+node_modules/
 /.agents/
+/.claude/
+/.gemini/
+/.mcp.json
 /scratch/
 __pycache__/
 *.tmp

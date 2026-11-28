@@ -24,10 +24,14 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocat
         const tok = lex.next();
         try raw_tokens.append(alloc, tok);
         if (tok.tag.isError()) {
+            const msg = if (tok.tag == .invalid_number)
+                try invalidNumberMessage(alloc, tok.loc.slice(source))
+            else
+                lexerErrorMessage(tok.tag);
             try diagnostics.append(alloc, .{
                 .span = Span.fromLoc(tok.loc),
                 .kind = .lexer_error,
-                .message = lexerErrorMessage(tok.tag),
+                .message = msg,
             });
         } else {
             try clean_tokens.append(alloc, tok);
@@ -55,11 +59,33 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocat
     };
 }
 
+fn invalidNumberMessage(alloc: std.mem.Allocator, lexeme: []const u8) std.mem.Allocator.Error![]const u8 {
+    // Detect glued primitive type suffixes like `32u8`, `1_000_u32`, `1.5f32` and suggest `as`.
+    var i: usize = lexeme.len;
+    while (i > 0) : (i -= 1) {
+        const ch = lexeme[i - 1];
+        if (ch == 'u' or ch == 'i' or ch == 'f') {
+            const suf = lexeme[i - 1 ..];
+            if (lexer.parsePrimitiveType(suf) != null and i > 1) {
+                const mantissa = std.mem.trimEnd(u8, lexeme[0 .. i - 1], "_");
+                if (mantissa.len > 0) {
+                    return try std.fmt.allocPrint(
+                        alloc,
+                        "numeric type suffixes like '{s}' are not supported; write '{s}' or '({s} as {s})'",
+                        .{ lexeme, mantissa, mantissa, suf },
+                    );
+                }
+            }
+        }
+    }
+    return "malformed numeric literal";
+}
+
 fn lexerErrorMessage(tag: Token.Tag) []const u8 {
     return switch (tag) {
         .invalid_char => "invalid character in source",
         .invalid_utf8 => "invalid UTF-8 byte sequence",
-        .invalid_number => "malformed numeric literal or width suffix",
+        .invalid_number => "malformed numeric literal",
         .unterminated_string => "unterminated string literal",
         .invalid_escape => "invalid string escape sequence",
         else => "lexer error",
@@ -1312,7 +1338,7 @@ const Parser = struct {
             },
             .upper_ident => {
                 const slice = tok.loc.slice(self.source);
-                if (std.mem.eql(u8, slice, "Int") and self.peek2().tag == .l_paren) {
+                if ((std.mem.eql(u8, slice, "Int") or std.mem.eql(u8, slice, "Integer")) and self.peek2().tag == .l_paren) {
                     return try self.parseIntRangeType();
                 }
                 return try self.parseNamedType();

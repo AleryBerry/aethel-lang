@@ -1,4 +1,6 @@
 import Aethel.CategoricalTraits
+import Aethel.NumericHierarchy
+import Aethel.ComplexModel
 import Aethel.RustBorrowBridge
 import Aethel.RustTraitBridge
 import Aethel.RustComplexABI
@@ -6,7 +8,7 @@ import Aethel.RustComplexABI
 namespace Aethel.Phase7.Tests
 
 open Aethel Aethel.Core Aethel.Permissions Aethel.RustFFI
-open Aethel.CategoricalTraits Aethel.RustBorrowBridge Aethel.RustTraitBridge Aethel.RustComplexABI
+open Aethel.CategoricalTraits Aethel.NumericHierarchy Aethel.ComplexModel Aethel.RustBorrowBridge Aethel.RustTraitBridge Aethel.RustComplexABI
 
 private def require (msg : String) (ok : Bool) : IO Unit := do
   unless ok do throw (IO.userError msg)
@@ -95,8 +97,44 @@ private def runRustBridgeTests : IO Unit := do
   require "64B AoSoA tile offset aligns to 64B boundary"
     (aosoaTileByteOffset tileSpec 2 1 0 % 64 == 0)
 
+private def runNumericHierarchyTests : IO Unit := do
+  let u8Range : IntInference.IntRange := ⟨0, 255, by decide⟩
+  let u12Range : IntInference.IntRange := ⟨0, 4095, by decide⟩
+  let u25Range : IntInference.IntRange := ⟨0, 33554431, by decide⟩
+  let u32Range : IntInference.IntRange := ⟨0, 4294967295, by decide⟩
+  require "u8 widens losslessly to u32"
+    (checkLosslessWiden (.intRange u8Range) (.intRange u32Range))
+  require "u8 widens losslessly to f32"
+    (checkLosslessWiden (.intRange u8Range) .f32)
+  require "u25 does not widen losslessly to f32"
+    (!checkLosslessWiden (.intRange u25Range) .f32)
+  require "u32 widens losslessly to f64"
+    (checkLosslessWiden (.intRange u32Range) .f64)
+  require "f32 widens losslessly to f64, f64 does not narrow to f32"
+    (checkLosslessWiden .f32 .f64 && !checkLosslessWiden .f64 .f32)
+  require "join(f32, u25) escalates to f64"
+    (joinNumericTy .f32 (.intRange u25Range) == some .f64)
+
+  let env : FieldRangeEnv := []
+  let narrowed := narrowFieldLt env ("p", "a") u12Range 2000
+  require "p.a < 2000 narrows field range to 0..=1999"
+    (narrowed.bind (fun e => lookupFieldRange e ("p", "a")) == some ⟨0, 1999, by decide⟩)
+  require "invalidateRoot clears narrowed field ranges for root"
+    ((narrowed.map (fun e => lookupFieldRange (invalidateRoot e "p") ("p", "a"))).join == none)
+
+  let z1 : Complex Int := ⟨1, 2⟩
+  let z2 : Complex Int := ⟨3, 4⟩
+  let cRing := Complex.ringTrait intRingTrait
+  require "Complex(Int) multiplication (1+2i)*(3+4i) == -5+10i"
+    (cRing.mul z1 z2 == ⟨-5, 10⟩)
+  require "Complex(Int) i*i == -1"
+    (cRing.mul (Complex.iUnit intRingTrait) (Complex.iUnit intRingTrait) == cRing.neg cRing.one)
+  require "Complex(Int) conj and normSq agree"
+    (cRing.mul z1 (Complex.conj intRingTrait z1) == ⟨Complex.normSq intRingTrait z1, 0⟩)
+
 def run : IO Unit := do
   runTraitRegistryTests
+  runNumericHierarchyTests
   runRustBridgeTests
 
 end Aethel.Phase7.Tests

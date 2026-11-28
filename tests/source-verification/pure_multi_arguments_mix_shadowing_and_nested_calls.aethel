@@ -1,0 +1,7 @@
+fn identity(value: u8) -> u8 { value }
+fn select(identity: u8, keep: bool, other: u8) -> u8 {
+  let identity = (identity, other);
+  if keep { identity.0 } else { identity.1 }
+}
+
+fn main() -> u8 { select(identity(63), true, identity(28)) }

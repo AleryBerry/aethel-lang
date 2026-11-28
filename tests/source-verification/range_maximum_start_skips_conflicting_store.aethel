@@ -1,0 +1,9 @@
+type Meter { bound: u8, result: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { bound: 255, result: 71, };
+  view shared held = meter.result {
+    for _ in 255..meter.bound { meter.result = 1; };
+    meter.bound = held;
+  };
+  meter.bound
+}

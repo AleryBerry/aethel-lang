@@ -1,0 +1,10 @@
+fn main() -> u8 {
+  let callback = fn(input: (bool, u8)) {
+    if input.0 { input.1 } else { 0 }
+  };
+  let ready = Ok(callback): Result(fn((bool, u8)) -> u8, ());
+  case ready {
+    Ok(apply) -> apply((true, 72))
+    Err(reason) -> 0
+  }
+}

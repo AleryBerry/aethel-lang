@@ -1,0 +1,10 @@
+type Meter { count: u8, total: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { count: 13, total: 38, };
+  while meter.count > 8 decreases meter.count {
+    meter.count = meter.count -| 3;
+    if meter.total > meter.total { meter.count = 250; } else { meter.total = meter.total -| 1; };
+  };
+  if meter.count != 7 { meter.total = 0; } else { };
+  meter.total
+}

@@ -16,15 +16,21 @@ inductive PureExpr where
   | pair (parenthesized : Bool) (first second : PureExpr)
   | projection (first : Bool) (product : PureExpr)
   | branch (condition yes no : PureExpr)
+  | inject (side : Bool) (variants : CoreType × CoreType) (payload : PureExpr)
+  | resultCase (input : PureExpr) (leftFirst : Bool)
+      (leftName : String) (onLeft : PureExpr) (rightName : String) (onRight : PureExpr)
   | grouped (expression : PureExpr)
 
-private def typeTokens : CoreType → Tokens
+def typeTokens : CoreType → Tokens
   | .unit => ["(", ")"]
   | .int false 8 => ["u8"]
   | .bool => ["bool"]
   | .arrow input output _ => ["fn", "("] ++ typeTokens input ++ [")", "->"] ++ typeTokens output
   | .prod first second => ["("] ++ typeTokens first ++ [","] ++ typeTokens second ++ [")"]
+  | .sum left right => ["Result", "("] ++ typeTokens left ++ [","] ++ typeTokens right ++ [")"]
   | _ => []
+
+private def variantName (side : Bool) : String := if side then "Ok" else "Err"
 
 def PureExpr.tokens : PureExpr → Tokens
   | .unit true => ["(", ")"]
@@ -44,9 +50,15 @@ def PureExpr.tokens : PureExpr → Tokens
   | .projection first product => product.tokens ++ [".", if first then "0" else "1"]
   | .branch condition yes no =>
     ["if"] ++ condition.tokens ++ ["{"] ++ yes.tokens ++ ["}", "else", "{"] ++ no.tokens ++ ["}"]
+  | .inject side variants payload =>
+    [variantName side, "("] ++ payload.tokens ++ [")", ":"] ++ typeTokens (.sum variants.1 variants.2)
+  | .resultCase input leftFirst leftName onLeft rightName onRight =>
+    let left := [variantName true, "(", leftName, ")", "->"] ++ onLeft.tokens
+    let right := [variantName false, "(", rightName, ")", "->"] ++ onRight.tokens
+    ["case"] ++ input.tokens ++ ["{"] ++ (if leftFirst then left ++ right else right ++ left) ++ ["}"]
   | .grouped expression => ["("] ++ expression.tokens ++ [")"]
 
-private def parsePureType : Nat → Tokens → Except Error (CoreType × Tokens)
+def parsePureType : Nat → Tokens → Except Error (CoreType × Tokens)
   | 0, _ => .error (.syntax "pure type")
   | fuel + 1, input => match input with
     | "(" :: ")" :: rest => .ok (.unit, rest)
@@ -56,11 +68,15 @@ private def parsePureType : Nat → Tokens → Except Error (CoreType × Tokens)
       return (.prod first second, ← expect [")"] rest)
     | "u8" :: rest => .ok (.byte, rest)
     | "bool" :: rest => .ok (.bool, rest)
+    | "Result" :: "(" :: rest => do
+      let (left, rest) ← parsePureType fuel rest
+      let (right, rest) ← parsePureType fuel (← expect [","] rest)
+      return (.sum left right, ← expect [")"] rest)
     | "fn" :: "(" :: rest => do
       let (domain, rest) ← parsePureType fuel rest
       let (codomain, rest) ← parsePureType fuel (← expect [")", "->"] rest)
       return (.arrow domain codomain .empty, rest)
-    | _ => .error (.syntax "u8, bool, unit, pair, or unary function type")
+    | _ => .error (.syntax "u8, bool, unit, pair, Result, or unary function type")
 
 mutual
   private def parsePureBlock : Nat → Tokens → Except Error (PureExpr × Tokens)
@@ -101,11 +117,38 @@ mutual
         let (yes, rest) ← parsePureBlock fuel (← expect ["{"] rest)
         let (no, rest) ← parsePureBlock fuel (← expect ["}", "else", "{"] rest)
         return (.branch condition yes no, ← expect ["}"] rest)
+      | "Ok" :: "(" :: rest => parsePureInjection fuel true rest
+      | "Err" :: "(" :: rest => parsePureInjection fuel false rest
+      | "case" :: rest => do
+        let (input, rest) ← parsePureExpr fuel rest
+        let (leftFirst, firstName, first, rest) ← parseResultArm fuel (← expect ["{"] rest)
+        let (secondSide, secondName, second, rest) ← parseResultArm fuel rest
+        if leftFirst == secondSide then throw (.syntax "case requires one Ok arm and one Err arm")
+        let result := if leftFirst then .resultCase input true firstName first secondName second
+          else .resultCase input false secondName second firstName first
+        return (result, ← expect ["}"] rest)
       | _ =>
         if let .ok (value, rest) := parseByte input then .ok (.byte value, rest)
         else do
           let (name, rest) ← readName false input
           return (.name name, rest)
+
+  private def parsePureInjection : Nat → Bool → Tokens → Except Error (PureExpr × Tokens)
+    | 0, _, _ => .error (.syntax "Result constructor")
+    | fuel + 1, side, input => do
+      let (payload, rest) ← parsePureExpr fuel input
+      let (annotation, rest) ← parsePureType fuel (← expect [")", ":"] rest)
+      let .sum left right := annotation | throw (.syntax "Result constructor type annotation")
+      return (.inject side (left, right) payload, rest)
+
+  private def parseResultArm : Nat → Tokens → Except Error (Bool × String × PureExpr × Tokens)
+    | fuel + 1, tag :: "(" :: rest => do
+      let side := tag == variantName true
+      if !(side || tag == variantName false) then throw (.syntax "expected Ok or Err arm")
+      let (binder, rest) ← readName false rest
+      let (body, rest) ← parsePureBlock fuel (← expect [")", "->"] rest)
+      return (side, binder, body, rest)
+    | _, _ => .error (.syntax "expected Ok or Err arm")
 
   private def parsePureApply : Nat → PureExpr → Tokens → Except Error (PureExpr × Tokens)
     | fuel + 1, callee, "(" :: ")" :: rest =>
@@ -131,8 +174,6 @@ mutual
         return (.pair false first remaining, rest)
       | _ => return (first, rest)
 end
-
-private def mainPrefix : Tokens := ["fn", "main", "(", ")", "->", "u8", "{"]
 
 structure PureParameter where
   name : String
@@ -180,7 +221,7 @@ structure PureModule where
   main : PureExpr
 
 def PureModule.tokens (source : PureModule) : Tokens :=
-  source.functions.flatMap PureFunction.tokens ++ mainPrefix ++ source.main.tokens ++ ["}"]
+  source.functions.flatMap PureFunction.tokens ++ byteMainPrefix ++ source.main.tokens ++ ["}"]
 
 def PureModule.expression (source : PureModule) : PureExpr :=
   source.functions.foldr (fun definition rest => .letBind definition.name definition.value rest) source.main
@@ -217,7 +258,7 @@ def parsePure (input : String) : Except Error (ParsedPure input) := do
   let source := tokens input
   let budget := 3 * source.length
   let (functions, rest) ← parsePureFunctions budget source.length source
-  let (main, rest) ← parsePureBlock budget (← expect mainPrefix rest)
+  let (main, rest) ← parsePureBlock budget (← expect byteMainPrefix rest)
   let [] ← expect ["}"] rest | throw (.syntax "end of file")
   let module : PureModule := ⟨functions, main⟩
   if spelled : source = module.tokens then return ⟨module, spelled⟩
@@ -244,6 +285,13 @@ inductive PureLowers : PureScope → PureExpr → CoreExpr → Prop where
   | branch : PureLowers scope condition compiledCondition → PureLowers scope yes compiledYes →
       PureLowers scope no compiledNo →
       PureLowers scope (.branch condition yes no) (.matchTag compiledCondition 1 compiledYes compiledNo)
+  | inject : PureLowers scope payload compiled →
+      PureLowers scope (.inject side variants payload) (.inject side variants compiled)
+  | resultCase : PureLowers scope input compiledInput →
+      PureLowers ((leftName, scope.length) :: scope) onLeft compiledLeft →
+      PureLowers ((rightName, scope.length) :: scope) onRight compiledRight →
+      PureLowers scope (.resultCase input leftFirst leftName onLeft rightName onRight)
+        (.matchSum compiledInput scope.length compiledLeft compiledRight)
   | grouped : PureLowers scope expression compiled → PureLowers scope (.grouped expression) compiled
 
 private def lowerPure (scope : PureScope) :
@@ -278,6 +326,15 @@ private def lowerPure (scope : PureScope) :
     let yes ← lowerPure scope yes
     let no ← lowerPure scope no
     return ⟨.matchTag condition.val 1 yes.val no.val, .branch condition.property yes.property no.property⟩
+  | .inject side variants payload => do
+    let payload ← lowerPure scope payload
+    return ⟨.inject side variants payload.val, .inject payload.property⟩
+  | .resultCase input _ leftName onLeft rightName onRight => do
+    let input ← lowerPure scope input
+    let left ← lowerPure ((leftName, scope.length) :: scope) onLeft
+    let right ← lowerPure ((rightName, scope.length) :: scope) onRight
+    return ⟨.matchSum input.val scope.length left.val right.val,
+      .resultCase input.property left.property right.property⟩
   | .grouped expression => do
     let expression ← lowerPure scope expression
     return ⟨expression.val, .grouped expression.property⟩
@@ -310,6 +367,12 @@ theorem PureLowers.unique {scope : PureScope} {expression : PureExpr} {first sec
   | branch _ _ _ condition yes no =>
     cases right with
     | branch otherCondition otherYes otherNo => rw [condition otherCondition, yes otherYes, no otherNo]
+  | inject _ payload =>
+    cases right with
+    | inject other => rw [payload other]
+  | resultCase _ _ _ input onLeft onRight =>
+    cases right with
+    | resultCase otherInput otherLeft otherRight => rw [input otherInput, onLeft otherLeft, onRight otherRight]
   | grouped _ inside =>
     cases right with
     | grouped other => exact inside other
@@ -432,32 +495,55 @@ private theorem PureLowers.normalizes {scope : PureScope} {expression : PureExpr
       · subst tag
         exact normalizes_after_match conditionRuns (.match_hit 1 ready) (ihYes typedYes assigned scopeIds)
       · exact normalizes_after_match conditionRuns (.match_miss tag 1 hit ready) (ihNo typedNo assigned scopeIds)
+  | inject _ ih =>
+    cases typed with
+    | inject _ _ payload =>
+      rw [substituteAll_inject]
+      exact (ih payload assigned scopeIds).inject
+  | @resultCase scope input compiledInput leftName onLeft compiledLeft rightName onRight compiledRight
+      _ _ _ _ ihInput ihLeft ihRight =>
+    cases typed with
+    | matchSum _ inputTyped leftTyped rightTyped =>
+      have fresh := scopeIds.fresh assigned
+      rw [substituteAll_matchSum _ _ _ _ _ fresh]
+      apply (ihInput inputTyped assigned scopeIds).matchSum
+      intro side payload ready
+      cases side
+      · exact assigned.subst_commute ready fresh ▸
+          ihRight rightTyped (.cons ready assigned) (scopeIds.push rightName _)
+      · exact assigned.subst_commute ready fresh ▸
+          ihLeft leftTyped (.cons ready assigned) (scopeIds.push leftName _)
   | grouped _ ih => exact ih typed assigned scopeIds
 
-inductive PureModuleTrace : PureScope → Ctx → List PureFunction → PureExpr → CoreExpr → Prop where
-  | main : PureLowers scope main core → WellTyped ctx core .byte .empty →
-      PureModuleTrace scope ctx [] main core
+inductive PureModuleTrace (result : CoreType) : PureScope → Ctx → List PureFunction → PureExpr → CoreExpr → Prop where
+  | main : PureLowers scope main core → WellTyped ctx core result .empty →
+      PureModuleTrace result scope ctx [] main core
   | named : definition.name ∉ scope.map Prod.fst →
       (definition.parameters.map PureParameter.name).Nodup →
       PureLowers scope definition.value function →
       WellTyped ctx function definition.signature .empty →
-      PureModuleTrace ((definition.name, scope.length) :: scope)
+      PureModuleTrace result ((definition.name, scope.length) :: scope)
         ((scope.length, definition.signature) :: ctx) rest main body →
-      PureModuleTrace scope ctx (definition :: rest) main (.letBind scope.length function body)
+      PureModuleTrace result scope ctx (definition :: rest) main (.letBind scope.length function body)
 
-theorem PureModuleTrace.lowers {scope : PureScope} {ctx : Ctx} {functions : List PureFunction}
-    {main : PureExpr} {expression : CoreExpr} (trace : PureModuleTrace scope ctx functions main expression) :
+theorem PureModuleTrace.lowers {result : CoreType} {scope : PureScope} {ctx : Ctx} {functions : List PureFunction}
+    {main : PureExpr} {expression : CoreExpr} (trace : PureModuleTrace result scope ctx functions main expression) :
     PureLowers scope (PureModule.expression ⟨functions, main⟩) expression := by
   induction trace with
   | main lowered _ => exact lowered
   | named _ _ lowered _ _ ih => exact .letBind lowered ih
 
-theorem PureModuleTrace.typed {scope : PureScope} {ctx : Ctx} {functions : List PureFunction}
-    {main : PureExpr} {expression : CoreExpr} (trace : PureModuleTrace scope ctx functions main expression) :
-    WellTyped ctx expression .byte .empty := by
+theorem PureModuleTrace.typed {result : CoreType} {scope : PureScope} {ctx : Ctx} {functions : List PureFunction}
+    {main : PureExpr} {expression : CoreExpr} (trace : PureModuleTrace result scope ctx functions main expression) :
+    WellTyped ctx expression result .empty := by
   induction trace with
   | main _ checked => exact checked
   | named _ _ _ checked _ ih => exact WellTyped.letBind _ checked ih
+
+theorem PureModuleTrace.normalizes {result : CoreType} {functions : List PureFunction}
+    {main : PureExpr} {expression : CoreExpr} (trace : PureModuleTrace result [] [] functions main expression) :
+    Normalizes result expression :=
+  trace.lowers.normalizes trace.typed .empty (by simp [ScopedIds])
 
 private def checkPureExpression (scope : PureScope) (ctx : Ctx) (expression : PureExpr) (expected : CoreType) :
     Except Error { core : CoreExpr // PureLowers scope expression core ∧ WellTyped ctx core expected .empty } := do
@@ -467,17 +553,17 @@ private def checkPureExpression (scope : PureScope) (ctx : Ctx) (expression : Pu
     return ⟨core, lowers, exactType.1 ▸ exactType.2 ▸ checked.typed⟩
   else throw .coreType
 
-private def lowerPureModule (main : PureExpr) :
+private def lowerPureModule (main : PureExpr) (result : CoreType) :
     (scope : PureScope) → (ctx : Ctx) → (functions : List PureFunction) →
-      Except Error { core : CoreExpr // PureModuleTrace scope ctx functions main core }
+      Except Error { core : CoreExpr // PureModuleTrace result scope ctx functions main core }
   | scope, ctx, [] => do
-    let checked ← checkPureExpression scope ctx main .byte
+    let checked ← checkPureExpression scope ctx main result
     return ⟨checked.val, .main checked.property.1 checked.property.2⟩
   | scope, ctx, definition :: rest => do
     if fresh : definition.name ∉ scope.map Prod.fst then
       if distinct : (definition.parameters.map PureParameter.name).Nodup then
         let function ← checkPureExpression scope ctx definition.value definition.signature
-        let body ← lowerPureModule main ((definition.name, scope.length) :: scope)
+        let body ← lowerPureModule main result ((definition.name, scope.length) :: scope)
           ((scope.length, definition.signature) :: ctx) rest
         return ⟨.letBind scope.length function.val body.val,
           .named fresh distinct function.property.1 function.property.2 body.property⟩
@@ -487,30 +573,38 @@ private def lowerPureModule (main : PureExpr) :
 structure VerifiedPure (input : String) where
   parsed : ParsedPure input
   expression : CoreExpr
-  trace : PureModuleTrace [] [] parsed.source.functions parsed.source.main expression
+  trace : PureModuleTrace .byte [] [] parsed.source.functions parsed.source.main expression
 
 theorem VerifiedPure.terminates {input : String} (verified : VerifiedPure input) :
     Normalizes .byte verified.expression :=
-  verified.trace.lowers.normalizes verified.trace.typed .empty (by simp [ScopedIds])
-
-private theorem VerifiedPure.accessible {input : String} (verified : VerifiedPure input) :
-    Acc ReductionOrder verified.expression := by
-  obtain ⟨_, ran, good⟩ := verified.terminates
-  exact ran.accessible good.isValue
+  verified.trace.normalizes
 
 private def VerifiedPure.normalForm {input : String} (verified : VerifiedPure input) : CoreExpr :=
-  reduceUntilValue ⟨verified.expression, verified.accessible⟩
+  verified.terminates.normalForm
 
 private theorem VerifiedPure.normalForm_runs {input : String} (verified : VerifiedPure input) :
-    Reduces {} verified.expression verified.normalForm ∧ Computable .byte verified.normalForm := by
-  obtain ⟨_, ran, good⟩ := verified.terminates
-  rw [VerifiedPure.normalForm, reduceUntilValue_correct ran good.isValue verified.accessible]
-  exact ⟨ran, good⟩
+    Reduces {} verified.expression verified.normalForm ∧ Computable .byte verified.normalForm :=
+  verified.terminates.normalForm_correct
 
 def verifyPure (input : String) : Except Error (VerifiedPure input) := do
   let parsed ← parsePure input
-  let ⟨expression, trace⟩ ← lowerPureModule parsed.source.main [] [] parsed.source.functions
+  let ⟨expression, trace⟩ ← lowerPureModule parsed.source.main .byte [] [] parsed.source.functions
   return ⟨parsed, expression, trace⟩
+
+structure VerifiedPureDefinition {input : String} (verified : VerifiedPure input) (name : String)
+    (result : CoreType) where
+  expression : CoreExpr
+  trace : PureModuleTrace result [] [] verified.parsed.source.functions (.name name) expression
+
+def VerifiedPure.definition {input : String} (verified : VerifiedPure input) (name : String) (result : CoreType) :
+    Except Error (VerifiedPureDefinition verified name result) := do
+  let ⟨expression, trace⟩ ← lowerPureModule (.name name) result [] [] verified.parsed.source.functions
+  return ⟨expression, trace⟩
+
+theorem VerifiedPureDefinition.terminates {input : String} {verified : VerifiedPure input} {name : String}
+    {result : CoreType} (selected : VerifiedPureDefinition verified name result) :
+    Normalizes result selected.expression :=
+  selected.trace.normalizes
 
 structure PureResult (expression : CoreExpr) where
   value : Int
@@ -562,7 +656,7 @@ def verifyPureMIR (input text : String) : Except Error (MatchingPureMIR input te
 theorem MatchingPureMIR.corresponds {input text : String} (matching : MatchingPureMIR input text) :
     ∃ (source : PureModule) (core : CoreExpr),
       decodeCanonicalMIR text = .ok (⟨currentSourceMIRVersion, core⟩ : PureMIR) ∧
-      tokens input = source.tokens ∧ PureModuleTrace [] [] source.functions source.main core ∧
+      tokens input = source.tokens ∧ PureModuleTrace .byte [] [] source.functions source.main core ∧
       WellTyped [] core .byte .empty :=
   ⟨matching.accepted.parsed.source, matching.accepted.expression, matching.decoded,
     matching.accepted.parsed.spelled, matching.accepted.trace, matching.accepted.trace.typed⟩

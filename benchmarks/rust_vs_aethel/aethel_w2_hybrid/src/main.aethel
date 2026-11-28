@@ -1,0 +1,55 @@
+import std/vec
+
+@layout(soa)
+pub type Body32B {
+  pub px: f32,
+  pub py: f32,
+  pub vx: f32,
+  pub vy: f32,
+  pub mass: f32,
+  pub inv_mass: f32,
+  pub flags: u32,
+  pub id: u32,
+}
+
+@external(rust, "self", "rust_step_soa")
+pub fn rust_step_soa(q: Collection(Body32B) ~> mut .{ px, py, vx, vy }, dt: f32)
+
+fn sum_bodies(bodies: Collection(Body32B) ~>.{ px, py }) -> f32 {
+  bodies
+    |> fold(0.0 as f32, fn(s, b) {
+      s + (b.px + b.py) * 0.0001
+    })
+}
+
+pub fn main() -> i32 {
+  let mut bodies: Vec(Body32B) = vec.with_capacity(1000000)
+
+  let mut f: f32 = 0.0
+  for i in 0..1000000 {
+    let idx = i as u32
+    vec.push(bodies, Body32B {
+      px: f,
+      py: f + 0.5,
+      vx: 1.25,
+      vy: -0.75,
+      mass: 2.0,
+      inv_mass: 0.5,
+      flags: idx & 7,
+      id: idx,
+    })
+    f = f + 0.125
+    if f >= 512.0 {
+      f = 0.0
+    }
+  }
+
+  for _frame in 0..200 {
+    rust_step_soa(vec.as_collection(bodies), 0.016)
+  }
+
+  let acc: f32 = sum_bodies(vec.as_collection(bodies))
+
+  println("w2_aethel_hybrid checksum=", acc)
+  0
+}

@@ -37,6 +37,16 @@ private def selectValue (input : CoreExpr) (tag : Nat) (yes no : CoreExpr) :
     if same : tag = 1 then some ⟨no, fun _ => same.symm ▸ .match_bool_false⟩ else none
   | _ => none
 
+private def selectSum (input : CoreExpr) (binder : Nat) (onLeft onRight : CoreExpr) :
+    Option (Reduction (.matchSum input binder onLeft onRight)) :=
+  match input with
+  | .inject side variants payload =>
+    if ready : isVal payload = true then
+      some ⟨.letBind binder payload (if side then onLeft else onRight),
+        fun _ => .sum_select side variants binder ((isVal_correct payload).mp ready)⟩
+    else none
+  | _ => none
+
 /-- One call-by-value reduction, with a witness from the small-step semantics. -/
 def reduce : (expression : CoreExpr) → Option (Reduction expression)
   | .pair first second =>
@@ -51,6 +61,12 @@ def reduce : (expression : CoreExpr) → Option (Reduction expression)
   | .snd product =>
     (projectValue false product).orElse fun _ =>
       (reduce product).map fun move => ⟨.snd move.next, fun state => .snd_eval (move.steps state)⟩
+  | .inject side variants payload =>
+    (reduce payload).map fun move => ⟨.inject side variants move.next, fun state =>
+      .inject_eval side variants (move.steps state)⟩
+  | .matchSum input binder onLeft onRight =>
+    (selectSum input binder onLeft onRight).orElse fun _ => (reduce input).map fun move =>
+      ⟨.matchSum move.next binder onLeft onRight, fun state => .sum_eval binder (move.steps state)⟩
   | .adt tag payload =>
     (reduce payload).map fun move => ⟨.adt tag move.next, fun state => .adt_eval tag (move.steps state)⟩
   | .matchTag input tag yes no =>
@@ -97,6 +113,9 @@ private theorem Step.has_reduction {state nextState : State} {expression next : 
       Option.orElse]
   | snd_val first second => simp [reduce, projectValue, (isVal_correct _).mpr first, (isVal_correct _).mpr second,
       Option.orElse]
+  | inject_eval _ _ _ ih => simp [reduce, ih]
+  | sum_eval _ _ ih => rw [reduce]; exact orElse_has_reduction _ _ (by simpa using ih)
+  | sum_select _ _ _ ready => simp [reduce, selectSum, (isVal_correct _).mpr ready, Option.orElse]
   | adt_eval _ _ ih => simp [reduce, ih]
   | match_eval _ _ ih => rw [reduce]; exact orElse_has_reduction _ _ (by simpa using ih)
   | match_hit _ value => simp [reduce, selectValue, (isVal_correct _).mpr value, Option.orElse]
@@ -198,6 +217,13 @@ theorem reduceUntilValue_correct {expression final : CoreExpr}
     obtain ⟨reduction, found, rfl⟩ := Option.map_eq_some_iff.mp ((reduce_correct ..).mpr first).1
     rw [reduceUntilValue, found]
     exact ih value _
+
+theorem Reduces.final_unique {expression left right : CoreExpr}
+    (first : Reduces {} expression left) (second : Reduces {} expression right)
+    (leftValue : Value left) (rightValue : Value right) : left = right :=
+  let accessible := first.accessible leftValue
+  (reduceUntilValue_correct first leftValue accessible).symm.trans
+    (reduceUntilValue_correct second rightValue accessible)
 
 theorem Reduces.preservation {state : State} {expression final : CoreExpr}
     (reductions : Reduces state expression final) {type : CoreType} {effect : Effect}

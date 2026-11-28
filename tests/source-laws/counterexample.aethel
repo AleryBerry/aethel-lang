@@ -1,0 +1,3 @@
+law no_seven(row: Pair) {
+  never limit(row) == 7
+}

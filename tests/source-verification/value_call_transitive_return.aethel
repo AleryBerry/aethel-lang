@@ -1,0 +1,14 @@
+type Triple { first: u8, second: u8, third: u8, }
+fn transform(triple: Triple ~>.{first}) -> u8 {
+  triple.first = 83;
+  triple.first
+}
+fn stage(triple: Triple ~>.{first, second}) -> u8 {
+  triple.second = transform(triple);
+  triple.second
+}
+fn main() -> u8 {
+  let mut triple = Triple { first: 42, second: 11, third: 1, };
+  triple.third = stage(triple);
+  triple.third
+}

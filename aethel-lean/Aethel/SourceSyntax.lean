@@ -13,7 +13,7 @@ inductive SourcePlace where
   | field (path : FieldPath)
   | view (name : String)
 
-abbrev SourceStoreTask := List (FieldPath × UInt8)
+abbrev SourceTask := List (TaskAccess FieldPath)
 
 inductive ByteBranch where
   | conditional (comparison : Comparison) (right : ByteOperand SourcePlace)
@@ -41,7 +41,7 @@ inductive Body where
       (afterDecrease next : Body)
   | call (name argument : String) (next : Body)
   | bindView (binding callee argument : String) (inside : Body)
-  | forkStores (tasks : List SourceStoreTask) (next : Body)
+  | fork (tasks : List SourceTask) (next : Body)
 
 private def SourcePlace.viewUses : SourcePlace → List String
   | .field _ => []
@@ -65,7 +65,7 @@ def Body.viewUses : Body → List String
     first.viewUses ++ stop.viewUses ++ body.viewUses ++ next.viewUses
   | .view _ _ target body next => target.viewUses ++ body.viewUses ++ next.viewUses
   | .countdown _ _ _ _ body next => body.viewUses ++ next.viewUses
-  | .call _ _ next | .bindView _ _ _ next | .forkStores _ next => next.viewUses
+  | .call _ _ next | .bindView _ _ _ next | .fork _ next => next.viewUses
 
 inductive HelperResult where
   | unit
@@ -98,40 +98,47 @@ def Source.currentRoot (source : Source) : String :=
 private def emitToken (word : List Char) (rest : List String) : List String :=
   if word.isEmpty then rest else String.ofList word.reverse :: rest
 
-private def tokenize : List Char → List Char → List String
+private def tokenize (decimal : Bool) : List Char → List Char → List String
   | [], word => emitToken word []
-  | '/' :: '/' :: chars, word => emitToken word (tokenize (chars.dropWhile (· != '\n')) [])
-  | '-' :: '>' :: chars, word => emitToken word ("->" :: tokenize chars [])
-  | '-' :: '|' :: chars, word => emitToken word ("-|" :: tokenize chars [])
-  | '=' :: '=' :: chars, word => emitToken word ("==" :: tokenize chars [])
-  | '!' :: '=' :: chars, word => emitToken word ("!=" :: tokenize chars [])
-  | '<' :: '=' :: chars, word => emitToken word ("<=" :: tokenize chars [])
-  | '>' :: '=' :: chars, word => emitToken word (">=" :: tokenize chars [])
-  | '~' :: '>' :: chars, word => emitToken word ("~>" :: tokenize chars [])
-  | '.' :: '.' :: chars, word => emitToken word (".." :: tokenize chars [])
+  | '/' :: '/' :: chars, word => emitToken word (tokenize decimal (chars.dropWhile (· != '\n')) [])
+  | '-' :: '>' :: chars, word => emitToken word ("->" :: tokenize decimal chars [])
+  | '-' :: '|' :: chars, word => emitToken word ("-|" :: tokenize decimal chars [])
+  | '=' :: '=' :: chars, word => emitToken word ("==" :: tokenize decimal chars [])
+  | '!' :: '=' :: chars, word => emitToken word ("!=" :: tokenize decimal chars [])
+  | '<' :: '=' :: chars, word => emitToken word ("<=" :: tokenize decimal chars [])
+  | '>' :: '=' :: chars, word => emitToken word (">=" :: tokenize decimal chars [])
+  | '~' :: '>' :: chars, word => emitToken word ("~>" :: tokenize decimal chars [])
+  | '.' :: '.' :: chars, word => emitToken word (".." :: tokenize decimal chars [])
+  | '.' :: next :: chars, word =>
+    if decimal && next.isDigit && word.head?.any Char.isDigit then
+      tokenize decimal (next :: chars) ('.' :: word)
+    else emitToken word ("." :: tokenize decimal (next :: chars) [])
   | c :: chars, word =>
     if c.isWhitespace then
-      emitToken word (tokenize chars [])
-    else if "{}().,:=;<>".contains c then
-      emitToken word (String.singleton c :: tokenize chars [])
+      emitToken word (tokenize decimal chars [])
+    else if "{}[]().,:=;<>".contains c then
+      emitToken word (String.singleton c :: tokenize decimal chars [])
     else
-      tokenize chars (c :: word)
+      tokenize decimal chars (c :: word)
 termination_by chars _ => chars.length
 decreasing_by
   all_goals simp_wf <;> try omega
   exact Nat.lt_of_le_of_lt (List.dropWhile_sublist _).length_le (by omega)
 
 def tokens (input : String) : List String :=
-  tokenize input.toList []
+  tokenize false input.toList []
 
-private def FieldPath.tokens (p : FieldPath) : List String :=
+def tokensWithDecimals (input : String) : List String :=
+  tokenize true input.toList []
+
+def FieldPath.tokens (p : FieldPath) : List String :=
   [p.root, ".", p.field]
 
 private def SourcePlace.tokens : SourcePlace → List String
   | .field path => path.tokens
   | .view name => [name]
 
-private def modeToken : AccessMode → String
+def modeToken : AccessMode → String
   | .shared => "shared"
   | .exclusive => "exclusive"
 
@@ -139,9 +146,9 @@ private def modeTypeToken : AccessMode → String
   | .shared => "Shared"
   | .exclusive => "Exclusive"
 
-def byteToken (value : UInt8) : String := toString value ++ "u8"
+def byteToken (value : UInt8) : String := toString value
 
-private def ByteOperand.tokens {α : Type} (encode : α → List String) : ByteOperand α → List String
+def ByteOperand.tokens {α : Type} (encode : α → List String) : ByteOperand α → List String
   | .literal value => [byteToken value]
   | .place target => encode target
 
@@ -149,7 +156,7 @@ private def FieldPath.countdownPrefix (counter : FieldPath) : List String :=
   counter.tokens ++ ["{"] ++ counter.tokens ++ ["="] ++ counter.tokens ++
     ["-|"]
 
-private def comparisonToken : Comparison → String
+def comparisonToken : Comparison → String
   | .equal => "=="
   | .unequal => "!="
   | .less => "<"
@@ -157,8 +164,10 @@ private def comparisonToken : Comparison → String
   | .greater => ">"
   | .greaterEqual => ">="
 
-private def SourceStoreTask.tokens (task : SourceStoreTask) : List String :=
-  task.flatMap fun (field, value) => field.tokens ++ ["=", byteToken value, ";"]
+private def SourceTask.tokens (task : SourceTask) : List String :=
+  task.flatMap fun access => match access with
+  | .read field => ["let", "_", "="] ++ field.tokens ++ [";"]
+  | .write field value => field.tokens ++ ["=", byteToken value, ";"]
 
 /-- The grammar spells out each operation, scope delimiter, and initializer. -/
 private def Body.tokens : Body → List String
@@ -187,7 +196,7 @@ private def Body.tokens : Body → List String
   | .call name argument next => [name, "(", argument, ")", ";"] ++ next.tokens
   | .bindView binding callee argument inside =>
     ["let", binding, "=", callee, "(", argument, ")", ";"] ++ inside.tokens
-  | .forkStores tasks next =>
+  | .fork tasks next =>
     ["fork", "{"] ++ tasks.flatMap (fun task => ["{"] ++ task.tokens ++ ["}"]) ++
       ["}", "join", ";"] ++ next.tokens
 
@@ -226,7 +235,7 @@ private def Body.head (body : Body) : Option (Body.Head body) := by
   case' countdown counter threshold amount positive body next =>
     refine some ⟨next, .countdown counter threshold amount positive body, rfl, ?_, ?_, ?_, ?_⟩
   case' call name argument next => refine some ⟨next, .call name argument, rfl, ?_, ?_, ?_, ?_⟩
-  case' forkStores tasks next => refine some ⟨next, .forkStores tasks, rfl, ?_, ?_, ?_, ?_⟩
+  case' fork tasks next => refine some ⟨next, .fork tasks, rfl, ?_, ?_, ?_, ?_⟩
   all_goals first
     | (intro tail; simp [Body.tokens, Body.viewUses, List.append_assoc]; done)
     | (intros; simp_wf; omega)
@@ -300,15 +309,23 @@ private def Helper.tokens (record : String) (helper : Helper) : List String :=
     List.intersperse "," helper.paths ++ ["}", ")"] ++ helper.result.signatureTokens ++ ["{"] ++
     helper.body.tokens ++ helper.result.valueTokens ++ ["}"]
 
-def Source.tokens (source : Source) : List String :=
-  ["type", source.record, "{"] ++
-    source.fields.flatMap (fun (name, _) => [name, ":", "u8", ","]) ++
-    ["}"] ++ source.functions.flatMap (Helper.tokens source.record) ++
-    ["fn", "main", "(", ")", "->", "u8", "{", "let", "mut", source.root, "=", source.record, "{"] ++
-    source.fields.flatMap (fun (name, value) => [name, ":", byteToken value, ","]) ++
-    ["}", ";"] ++
+def recordDeclarationTokens (record : String) (fields : List String) : List String :=
+  ["type", record, "{"] ++ fields.flatMap (fun name => [name, ":", "u8", ","]) ++ ["}"]
+
+def recordLiteralTokens (record : String) (fields : List (String × UInt8)) : List String :=
+  [record, "{"] ++ fields.flatMap (fun (name, value) => [name, ":", byteToken value, ","]) ++ ["}"]
+
+def byteMainPrefix : List String := ["fn", "main", "(", ")", "->", "u8", "{"]
+
+def Source.tokensWithCallTrailer (source : Source) (trailer : List String) : List String :=
+  recordDeclarationTokens source.record (source.fields.map Prod.fst) ++
+    source.functions.flatMap (Helper.tokens source.record) ++
+    byteMainPrefix ++ ["let", "mut", source.root, "="] ++ recordLiteralTokens source.record source.fields ++ [";"] ++
     source.moves.flatMap (fun move => ["let", "mut", move.toName, "=", "move", move.fromName, ";"]) ++
-    source.body.tokens ++ source.result.tokens ++ ["}"]
+    source.body.tokens ++ trailer ++ source.result.tokens ++ ["}"]
+
+def Source.tokens (source : Source) : List String :=
+  source.tokensWithCallTrailer []
 
 inductive Error where
   | syntax (expected : String)
@@ -327,6 +344,9 @@ inductive Error where
   | invalidMove (fromName toName : String)
   | sourceMIRMismatch
   | invalidSourceMIR
+  | rustModelRequired
+  | invalidRustModel (message : String)
+  | rustTraceRejected
   | resourceConflict
   | unknownBinding (name : String)
   | coreType
@@ -357,13 +377,12 @@ def expect (expected : Tokens) (input : Tokens) : Except Error Tokens :=
 
 def parseByte : Tokens → Except Error (UInt8 × Tokens)
   | word :: rest => do
-    let [digits, ""] := word.splitOn "u8" | throw (.syntax "decimal u8 literal")
-    let some n := digits.toNat? | throw (.syntax "decimal u8 literal")
+    let some n := word.toNat? | throw (.syntax "decimal u8 literal")
     if n < 256 then return (UInt8.ofNat n, rest)
     else throw (.syntax "u8 literal in 0..255")
   | [] => .error (.syntax "u8 literal")
 
-private def parseField (input : Tokens) : Except Error (FieldPath × Tokens) := do
+def parseField (input : Tokens) : Except Error (FieldPath × Tokens) := do
   let (root, rest) ← readName false input
   let (field, rest) ← readName false (← expect ["."] rest)
   return (⟨root, field⟩, rest)
@@ -376,7 +395,7 @@ private def parsePlace (input : Tokens) : Except Error (SourcePlace × Tokens) :
     return (.field ⟨name, field⟩, rest)
   | _ => return (.view name, rest)
 
-private def parseDeclFields : Nat → Tokens → Except Error (List String × Tokens)
+def parseDeclFields : Nat → Tokens → Except Error (List String × Tokens)
   | _, "}" :: rest => .ok ([], rest)
   | 0, _ => .error (.syntax "record field or }")
   | fuel + 1, input => do
@@ -384,19 +403,19 @@ private def parseDeclFields : Nat → Tokens → Except Error (List String × To
     let (fields, rest) ← parseDeclFields fuel (← expect [":", "u8", ","] rest)
     return (name :: fields, rest)
 
-private def parseInitializers : List String → Tokens → Except Error (List (String × UInt8) × Tokens)
-  | [], input => do return ([], ← expect ["}", ";"] input)
+def parseInitializers (ending : Tokens) : List String → Tokens → Except Error (List (String × UInt8) × Tokens)
+  | [], input => do return ([], ← expect ending input)
   | field :: fields, input => do
     let (value, rest) ← parseByte (← expect [field, ":"] input)
-    let (values, rest) ← parseInitializers fields (← expect [","] rest)
+    let (values, rest) ← parseInitializers ending fields (← expect [","] rest)
     return ((field, value) :: values, rest)
 
-private def parseMode : Tokens → Except Error (AccessMode × Tokens)
+def parseMode : Tokens → Except Error (AccessMode × Tokens)
   | "shared" :: rest => .ok (.shared, rest)
   | "exclusive" :: rest => .ok (.exclusive, rest)
   | _ => .error (.syntax "shared or exclusive")
 
-private def parseComparison : Tokens → Except Error (Comparison × Tokens)
+def parseComparison : Tokens → Except Error (Comparison × Tokens)
   | "==" :: rest => .ok (.equal, rest)
   | "!=" :: rest => .ok (.unequal, rest)
   | "<" :: rest => .ok (.less, rest)
@@ -405,27 +424,33 @@ private def parseComparison : Tokens → Except Error (Comparison × Tokens)
   | ">=" :: rest => .ok (.greaterEqual, rest)
   | _ => .error (.syntax "byte comparison")
 
-private def parseOperand (parseTarget : Tokens → Except Error (place × Tokens)) (input : Tokens) :
+def parseOperand (parseTarget : Tokens → Except Error (place × Tokens)) (input : Tokens) :
     Except Error (ByteOperand place × Tokens) := do
   if let .ok (value, rest) := parseByte input then
     return (.literal value, rest)
   let (source, rest) ← parseTarget input
   return (.place source, rest)
 
-private def parseStoreTask : Nat → Tokens → Except Error (SourceStoreTask × Tokens)
+private def parseTask : Nat → Tokens → Except Error (SourceTask × Tokens)
   | _, "}" :: rest => .ok ([], rest)
-  | 0, _ => .error (.syntax "literal store or }")
+  | 0, _ => .error (.syntax "task access or }")
   | fuel + 1, input => do
-    let (field, rest) ← parseField input
-    let (value, rest) ← parseByte (← expect ["="] rest)
-    let (tail, rest) ← parseStoreTask fuel (← expect [";"] rest)
-    return ((field, value) :: tail, rest)
+    let (access, rest) ← match input with
+      | "let" :: "_" :: "=" :: rest => do
+        let (field, rest) ← parseField rest
+        pure (.read field, rest)
+      | _ => do
+        let (field, rest) ← parseField input
+        let (value, rest) ← parseByte (← expect ["="] rest)
+        pure (.write field value, rest)
+    let (tail, rest) ← parseTask fuel (← expect [";"] rest)
+    return (access :: tail, rest)
 
-private def parseStoreTasks : Nat → Tokens → Except Error (List SourceStoreTask × Tokens)
+private def parseTasks : Nat → Tokens → Except Error (List SourceTask × Tokens)
   | _, "}" :: rest => .ok ([], rest)
   | fuel + 1, "{" :: rest => do
-    let (task, rest) ← parseStoreTask fuel rest
-    let (tail, rest) ← parseStoreTasks fuel rest
+    let (task, rest) ← parseTask fuel rest
+    let (tail, rest) ← parseTasks fuel rest
     return (task :: tail, rest)
   | _, _ => .error (.syntax "fork task block or }")
 
@@ -484,9 +509,9 @@ private def parseBody : Nat → Tokens → Except Error (Body × Tokens)
         return (.countdown counter threshold amount positive afterDecrease next, rest)
       else throw .invalidDecreases
     | "fork" :: rest => do
-      let (tasks, rest) ← parseStoreTasks fuel (← expect ["{"] rest)
+      let (tasks, rest) ← parseTasks fuel (← expect ["{"] rest)
       let (next, rest) ← parseBody fuel (← expect ["join", ";"] rest)
-      return (.forkStores tasks next, rest)
+      return (.fork tasks next, rest)
     | name :: "(" :: argument :: ")" :: ";" :: rest => do
       let (name, _) ← readName false [name]
       let (argument, _) ← readName false [argument]
@@ -556,18 +581,23 @@ private def parseMoves : Nat → Tokens → Except Error (List OwnerMove × Toke
     return (⟨owner, target⟩ :: rest, tail)
   | _, rest => .ok ([], rest)
 
-def parseSource (input : List String) : Except Error Source := do
+def parseSourceWithCallTrailer {α : Type} (parseTrailer : Tokens → Except Error (α × Tokens))
+    (input : Tokens) : Except Error (Source × α) := do
   let (record, rest) ← readName true (← expect ["type"] input)
   let (fields, rest) ← parseDeclFields input.length (← expect ["{"] rest)
   let (functions, rest) ← parseHelpers record input.length input.length rest
   let (root, rest) ← readName false
-    (← expect ["fn", "main", "(", ")", "->", "u8", "{", "let", "mut"] rest)
-  let (initial, rest) ← parseInitializers fields (← expect ["=", record, "{"] rest)
+    (← expect (byteMainPrefix ++ ["let", "mut"]) rest)
+  let (initial, rest) ← parseInitializers ["}", ";"] fields (← expect ["=", record, "{"] rest)
   let (moves, rest) ← parseMoves input.length rest
   let (body, rest) ← parseBody input.length rest
+  let (trailer, rest) ← parseTrailer rest
   let (result, rest) ← parseField rest
   let [] ← expect ["}"] rest | throw (.syntax "end of file")
-  return ⟨record, root, initial, moves, functions, body, result⟩
+  return (⟨record, root, initial, moves, functions, body, result⟩, trailer)
+
+def parseSource (input : Tokens) : Except Error Source := do
+  return (← parseSourceWithCallTrailer (fun rest => pure ((), rest)) input).1
 
 structure LawGuard where
   place : FieldPath
@@ -587,10 +617,17 @@ structure ReturnLaw where
   bound : ByteOperand FieldPath
   expected : Bool
 
+def lawExpectationToken (expected : Bool) : String := if expected then "always" else "never"
+
+def parseLawExpectation : Tokens → Except Error (Bool × Tokens)
+  | "always" :: rest => .ok (true, rest)
+  | "never" :: rest => .ok (false, rest)
+  | _ => .error (.syntax "always or never")
+
 def ReturnLaw.tokens (law : ReturnLaw) : List String :=
   ["law", law.name, "(", law.parameter, ":", law.record, ")", "{"] ++
   (law.guard.map LawGuard.tokens).getD [] ++ [
-    if law.expected then "always" else "never", law.helper, "(", law.parameter, ")",
+    lawExpectationToken law.expected, law.helper, "(", law.parameter, ")",
     comparisonToken law.comparison] ++ ByteOperand.tokens FieldPath.tokens law.bound ++ ["}"]
 
 private def parseReturnLaw (input : Tokens) : Except Error (ReturnLaw × Tokens) := do
@@ -604,33 +641,36 @@ private def parseReturnLaw (input : Tokens) : Except Error (ReturnLaw × Tokens)
       let (bound, rest) ← parseByte rest
       pure (some (⟨place, comparison, bound⟩ : LawGuard), rest)
     | rest => pure (none, rest)
-  let (expected, tail) ← match tail with
-    | "always" :: rest => pure (true, rest)
-    | "never" :: rest => pure (false, rest)
-    | _ => throw (.syntax "always or never")
+  let (expected, tail) ← parseLawExpectation tail
   let (helper, tail) ← readName false tail
   let (comparison, tail) ← parseComparison (← expect ["(", parameter, ")"] tail)
   let (bound, tail) ← parseOperand parseField tail
   let tail ← expect ["}"] tail
   return (⟨name, record, parameter, guard, helper, comparison, bound, expected⟩, tail)
 
-private def parseLawDeclarations : Nat → Tokens → Except Error (List ReturnLaw)
+private def parseLawDeclarations {α : Type} (parseLaw : Tokens → Except Error (α × Tokens)) :
+    Nat → Tokens → Except Error (List α)
   | _, [] => pure []
   | 0, _ => throw (.syntax "end of law file")
   | fuel + 1, input => do
-    let (law, rest) ← parseReturnLaw input
-    return law :: (← parseLawDeclarations fuel rest)
+    let (law, rest) ← parseLaw input
+    return law :: (← parseLawDeclarations parseLaw fuel rest)
 
-structure ParsedReturnLaws (input : String) where
-  declarations : List ReturnLaw
-  spelled : tokens input = declarations.flatMap ReturnLaw.tokens
+structure ParsedLaws {α : Type} (spell : α → Tokens) (input : String) where
+  declarations : List α
+  spelled : tokens input = declarations.flatMap spell
 
-def parseReturnLaws (input : String) : Except Error (ParsedReturnLaws input) := do
+def parseLaws {α : Type} (parseLaw : Tokens → Except Error (α × Tokens)) (spell : α → Tokens)
+    (input : String) : Except Error (ParsedLaws spell input) := do
   let inputTokens := tokens input
-  let declarations ← parseLawDeclarations inputTokens.length inputTokens
+  let declarations ← parseLawDeclarations parseLaw inputTokens.length inputTokens
   if declarations.isEmpty then throw (.syntax "law")
-  else if spelled : inputTokens = declarations.flatMap ReturnLaw.tokens then
+  else if spelled : inputTokens = declarations.flatMap spell then
     return ⟨declarations, spelled⟩
-  else throw (.syntax "canonical return law")
+  else throw (.syntax "canonical law")
+
+abbrev ParsedReturnLaws := ParsedLaws ReturnLaw.tokens
+
+def parseReturnLaws := parseLaws parseReturnLaw ReturnLaw.tokens
 
 end Aethel.SourceVerification

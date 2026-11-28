@@ -1,0 +1,15 @@
+type Packet { header: u8, flags: u8, payload: u8, output: u8, }
+fn main() -> u8 {
+  let mut packet = Packet { header: 0, flags: 0, payload: 0, output: 0, };
+  fork {
+    { packet.header = 2; packet.header = 19; }
+    { packet.flags = 3; }
+    { packet.payload = 25; packet.payload = 72; }
+  } join;
+  if packet.header == 19 {
+    if packet.flags == 3 { packet.output = packet.payload; } else { packet.output = 2; };
+  } else {
+    packet.output = 1;
+  };
+  packet.output
+}

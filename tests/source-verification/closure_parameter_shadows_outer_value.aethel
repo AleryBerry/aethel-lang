@@ -1,0 +1,6 @@
+fn main() -> u8 {
+  let value = 23;
+  let identity = fn(value: u8) { value };
+  let selected = identity(88);
+  if false { value } else { selected }
+}

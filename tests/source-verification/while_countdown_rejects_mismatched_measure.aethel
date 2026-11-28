@@ -1,0 +1,8 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 5, right: 11, };
+  while pair.left > 0 decreases pair.right {
+    pair.left = pair.left -| 1;
+  };
+  pair.left
+}

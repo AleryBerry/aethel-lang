@@ -79,6 +79,9 @@ def AccessMode.Compatible (a b : AccessMode) : Prop := a = .shared ∧ b = .shar
 instance (a b : AccessMode) : Decidable (a.Allows b) :=
   inferInstanceAs (Decidable (b = .shared ∨ a = .exclusive))
 
+instance (a b : AccessMode) : Decidable (a.Compatible b) :=
+  inferInstanceAs (Decidable (a = .shared ∧ b = .shared))
+
 /-- Eligibility is expressed independently as a proposition. In this byte kernel
 each view covers one byte; wider paths and packed proxies require later rules. -/
 def State.Available (s : State) (p : ByteLocation) (mode : AccessMode)
@@ -89,7 +92,7 @@ def State.Available (s : State) (p : ByteLocation) (mode : AccessMode)
 instance (s : State) (p : ByteLocation) (mode : AccessMode) (through : Option ViewId) :
     Decidable (s.Available p mode through) :=
   inferInstanceAs (Decidable (∀ v ∈ s.views,
-    through = some v.id ∨ p ≠ v.location ∨ (mode = .shared ∧ v.mode = .shared)))
+    through = some v.id ∨ p ≠ v.location ∨ mode.Compatible v.mode))
 
 def State.Unreserved (s : State) (owner : OwnerId) : Prop :=
   ∀ v ∈ s.views, v.location.allocation ≠ owner

@@ -172,7 +172,7 @@ test "5. Gleam ergonomics: use, lambdas, labeled calls, case arms/guards/ranges/
     var tree = try parseOk(
         \\fn classify(pair: (u8, Status), xs: [u8]) -> u8 {
         \\  use user, _ <- fetch(id: 42, retry: true)
-        \\  let handler = fn(e) { e.pos = e.pos +% 1i8 }
+        \\  let handler = fn(e) { e.pos = e.pos +% 1 }
         \\  let _ = case pair.1, user {
         \\    Idle, (0..=10 | 20..=30) as n | Moving(speed: 1..4 as n), _ if n > 2 -> {
         \\      handler(pair.0)
@@ -332,7 +332,7 @@ test "10. error recovery, combined lexer+parser diagnostics, deep nesting guard,
         \\  let y = 1 +
         \\}
         \\pub fn recovered() -> u7 {
-        \\  42_u7
+        \\  42_
         \\}
     ;
     var tree = try parser.parse(std.testing.allocator, bad_src);

@@ -1,0 +1,8 @@
+type Meter { count: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { count: 42, };
+  while meter.count > 256 decreases meter.count {
+    meter.count = meter.count -| 1;
+  };
+  meter.count
+}

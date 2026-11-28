@@ -37,47 +37,47 @@ fn checked_step_res(r: Result(i32, u32), bonus: i32) -> Result(i32, u32) {
 fn update_and_sum(signals: View(Collection(Signal), Exclusive), dt: f32) -> f32 {
   signals
     |> map_in_place(fn(s) { s.x += s.vx * dt })
-    |> map_in_place(fn(s) { s.x += 0.5f32 })
-    |> fold(0.0f32, fn(acc, s) { acc + s.x })
+    |> map_in_place(fn(s) { s.x += 0.5 })
+    |> fold(0.0, fn(acc, s) { acc + s.x })
 }
 
 fn main() {
   // 1. Rank-1 generics + capturing reusable closure
-  let stride: i32 = 5i32
+  let stride: i32 = 5
   let gen_flag: bool = identity(true)
-  let stepped = apply_twice(identity(10i32), fn(n: i32) -> i32 { n +% stride })
+  let stepped = apply_twice(identity(10), fn(n: i32) -> i32 { n +% stride })
 
   // 2. Benton LNL affine `once fn` closure consuming a collection resource
-  let oneshot: Collection(u32) = [ 11u32, 22u32, 33u32 ]
+  let oneshot: Collection(u32) = [ 11, 22, 33 ]
   let consume_once: once fn() -> u32 = once fn() -> u32 { oneshot[0] +% oneshot[1] }
   let consumed = consume_once()
 
   // 3. Fused 2-stage SIMD AoSoA(8) pipeline + fold deforestation over 10 items
   let mut fleet: Collection(Signal) = [
-    Signal { tag: 1u32, bias: 0.0f32, x: 0.0f32, vx: 2.0f32 },
-    Signal { tag: 2u32, bias: 0.0f32, x: 1.0f32, vx: 2.0f32 },
-    Signal { tag: 3u32, bias: 0.0f32, x: 2.0f32, vx: 2.0f32 },
-    Signal { tag: 4u32, bias: 0.0f32, x: 3.0f32, vx: 2.0f32 },
-    Signal { tag: 5u32, bias: 0.0f32, x: 4.0f32, vx: 2.0f32 },
-    Signal { tag: 6u32, bias: 0.0f32, x: 5.0f32, vx: 2.0f32 },
-    Signal { tag: 7u32, bias: 0.0f32, x: 6.0f32, vx: 2.0f32 },
-    Signal { tag: 8u32, bias: 0.0f32, x: 7.0f32, vx: 2.0f32 },
-    Signal { tag: 9u32, bias: 0.0f32, x: 8.0f32, vx: 2.0f32 },
-    Signal { tag: 10u32, bias: 0.0f32, x: 9.0f32, vx: 2.0f32 },
+    Signal { tag: 1, bias: 0.0, x: 0.0, vx: 2.0 },
+    Signal { tag: 2, bias: 0.0, x: 1.0, vx: 2.0 },
+    Signal { tag: 3, bias: 0.0, x: 2.0, vx: 2.0 },
+    Signal { tag: 4, bias: 0.0, x: 3.0, vx: 2.0 },
+    Signal { tag: 5, bias: 0.0, x: 4.0, vx: 2.0 },
+    Signal { tag: 6, bias: 0.0, x: 5.0, vx: 2.0 },
+    Signal { tag: 7, bias: 0.0, x: 6.0, vx: 2.0 },
+    Signal { tag: 8, bias: 0.0, x: 7.0, vx: 2.0 },
+    Signal { tag: 9, bias: 0.0, x: 8.0, vx: 2.0 },
+    Signal { tag: 10, bias: 0.0, x: 9.0, vx: 2.0 },
   ]
-  let signal_sum = update_and_sum(fleet, 0.5f32)
+  let signal_sum = update_and_sum(fleet, 0.5)
 
   // 4. Option / Result combinator chains + `?` propagation
-  let opt_out = parse_scaled_opt(Some(7i32), 3i32)
-    |> map(fn(v) { v +% 4i32 })
-    |> unwrap_or(-1i32)
-  let res_out = Some(12i32)
-    |> ok_or(404u32)
-    |> and_then(fn(v) { checked_step_res(Ok(v), 8i32) })
-    |> map(fn(v) { v *% 2i32 })
-    |> unwrap_or(0i32)
-  let early_none = parse_scaled_opt(None, 3i32) |> unwrap_or(-99i32)
-  let early_err = checked_step_res(Err(500u32), 8i32) |> unwrap_or(-77i32)
+  let opt_out = parse_scaled_opt(Some(7), 3)
+    |> map(fn(v) { v +% 4 })
+    |> unwrap_or(-1)
+  let res_out = Some(12)
+    |> ok_or(404)
+    |> and_then(fn(v) { checked_step_res(Ok(v), 8) })
+    |> map(fn(v) { v *% 2 })
+    |> unwrap_or(0)
+  let early_none = parse_scaled_opt(None, 3) |> unwrap_or(-99)
+  let early_err = checked_step_res(Err(500), 8) |> unwrap_or(-77)
 
   println("Generics:", gen_flag, " apply_twice=", stepped)
   println("LNL once fn consumed=", consumed)

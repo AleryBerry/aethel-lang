@@ -1,0 +1,12 @@
+type Pair { left: u8, right: u8, }
+fn set_right(target: Pair ~>.{right}) {
+  target.right = 31;
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 23, };
+  view shared held = pair.left {
+    set_right(pair);
+    let _ = held;
+  };
+  pair.right
+}

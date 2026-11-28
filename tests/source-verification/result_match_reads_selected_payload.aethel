@@ -1,0 +1,6 @@
+fn main() -> u8 {
+  case Ok(43): Result(u8, u8) {
+    Ok(value) -> value
+    Err(reason) -> 0
+  }
+}

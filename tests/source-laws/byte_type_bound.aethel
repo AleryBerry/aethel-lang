@@ -1,0 +1,3 @@
+law result_in_byte_range(row: Triple) {
+  always stage(row) <= 255
+}

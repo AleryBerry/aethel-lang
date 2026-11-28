@@ -1,0 +1,21 @@
+@layout(aosoa(2))
+type Cell { value: u8, next: u8, }
+fn main() -> u8 {
+  let mut cells: Collection(Cell) = [
+    Cell { value: 44, next: 0, },
+    Cell { value: 94, next: 1, },
+  ];
+  let i = cells[0].next;
+  let j = cells[1].next;
+  if i < 2 {
+    if j < 2 {
+      view exclusive first = cells[i].value {
+        view exclusive second = cells[j].value {
+          first = 62;
+          second = 79;
+        };
+      };
+    } else { };
+  } else { };
+  cells[1].value
+}

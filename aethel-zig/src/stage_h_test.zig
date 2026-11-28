@@ -76,7 +76,7 @@ test "2. Stage H: String (&str) and stateless Aethel -> Rust callback Zig & Rust
         \\
         \\pub fn main() {
         \\  register_greeter("prefix", my_greeter)
-        \\  let _ = map_u32(10u32, fn(v: u32) -> u32 { v +| 1u32 })
+        \\  let _ = map_u32(10, fn(v: u32) -> u32 { v +| 1 })
         \\}
     ;
 
@@ -148,7 +148,7 @@ test "3. Stage H: negative counterexamples (capturing callback, fn_once, String 
         \\@external(rust, "reg_cb")
         \\pub fn reg_cb(cb: fn(u32) -> u32)
         \\pub fn main() {
-        \\  let bias: u32 = 5u32
+        \\  let bias: u32 = 5
         \\  reg_cb(fn(x: u32) -> u32 { x +| bias })
         \\}
     , null, null);
@@ -224,7 +224,7 @@ test "4. Stage H: end-to-end local Cargo crate + String & retained Aethel callba
         \\
         \\pub fn on_event(msg: String, base: u32) -> u32 {
         \\  println("cb:", msg)
-        \\  base +| 2u32
+        \\  base +| 2
         \\}
         \\
         \\pub fn main() {

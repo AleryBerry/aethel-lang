@@ -40,6 +40,18 @@ def infer : (context : Ctx) → (expression : CoreExpr) → Option (Inferred con
     match shape : pair.type with
     | .prod _ second => return ⟨second, pair.effect, .snd (shape ▸ pair.typed)⟩
     | _ => none
+  | ctx, .inject side variants payload => do
+    let payload ← (← infer ctx payload).asType (CoreType.sumPayload side variants)
+    return ⟨.sum variants.1 variants.2, payload.val, .inject side variants payload.property⟩
+  | ctx, .matchSum input binder onLeft onRight => do
+    let input ← infer ctx input
+    match shape : input.type with
+    | .sum left right =>
+      let leftArm ← infer ((binder, left) :: ctx) onLeft
+      let rightArm ← (← infer ((binder, right) :: ctx) onRight).asType leftArm.type
+      return ⟨leftArm.type, input.effect.union (leftArm.effect.union rightArm.val),
+        .matchSum binder (shape ▸ input.typed) leftArm.typed rightArm.property⟩
+    | _ => none
   | ctx, .adt tag payload => do
     let payload ← infer ctx payload
     return ⟨.adt tag payload.type, payload.effect, .adt tag payload.typed⟩

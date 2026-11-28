@@ -1,0 +1,13 @@
+fn flatten(value: Result(Result(u8, bool), u8)) -> u8 {
+  case value {
+    Ok(inner) -> case inner {
+      Ok(payload) -> payload
+      Err(missing) -> if missing { 31 } else { 30 }
+    }
+    Err(code) -> code
+  }
+}
+fn main() -> u8 {
+  let inner = Err(false): Result(u8, bool);
+  flatten(Ok(inner): Result(Result(u8, bool), u8))
+}

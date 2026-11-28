@@ -1,0 +1,93 @@
+//// Complex numbers over commutative Semiring/Ring/Field types,
+//// verified in `Aethel.ComplexModel`.
+
+import std/cmp.{Eq, eq}
+import std/traits.{FromInt, Semiring, Ring, Field, from_int, zero, one, add, mul, neg, sub, div}
+
+pub type Complex(a) {
+  pub re: a,
+  pub im: a,
+}
+
+pub fn complex(re: a, im: a) -> Complex(a) {
+  Complex { re: re, im: im }
+}
+
+pub fn i_unit() -> Complex(a) with Semiring(a) {
+  Complex { re: zero(), im: one() }
+}
+
+pub fn conj(z: Complex(a)) -> Complex(a) with Ring(a) {
+  Complex { re: z.re, im: -z.im }
+}
+
+pub fn norm_sq(z: Complex(a)) -> a with Ring(a) {
+  z.re * z.re + z.im * z.im
+}
+
+pub default instance complex_eq: Eq(Complex(a)) with Eq(a) {
+  fn eq(x: Complex(a), y: Complex(a)) -> bool {
+    eq(x.re, y.re) && eq(x.im, y.im)
+  }
+}
+
+pub default instance complex_ring: Ring(Complex(a)) with Ring(a) {
+  fn from_int(n: i32) -> Complex(a) {
+    Complex { re: from_int(n), im: zero() }
+  }
+  fn zero() -> Complex(a) {
+    Complex { re: zero(), im: zero() }
+  }
+  fn one() -> Complex(a) {
+    Complex { re: one(), im: zero() }
+  }
+  fn add(x: Complex(a), y: Complex(a)) -> Complex(a) {
+    Complex { re: x.re + y.re, im: x.im + y.im }
+  }
+  fn mul(x: Complex(a), y: Complex(a)) -> Complex(a) {
+    Complex {
+      re: x.re * y.re - x.im * y.im,
+      im: x.re * y.im + x.im * y.re,
+    }
+  }
+  fn neg(x: Complex(a)) -> Complex(a) {
+    Complex { re: -x.re, im: -x.im }
+  }
+  fn sub(x: Complex(a), y: Complex(a)) -> Complex(a) {
+    Complex { re: x.re - y.re, im: x.im - y.im }
+  }
+}
+
+pub default instance complex_field: Field(Complex(a)) with Field(a) {
+  fn from_int(n: i32) -> Complex(a) {
+    Complex { re: from_int(n), im: zero() }
+  }
+  fn zero() -> Complex(a) {
+    Complex { re: zero(), im: zero() }
+  }
+  fn one() -> Complex(a) {
+    Complex { re: one(), im: zero() }
+  }
+  fn add(x: Complex(a), y: Complex(a)) -> Complex(a) {
+    Complex { re: x.re + y.re, im: x.im + y.im }
+  }
+  fn mul(x: Complex(a), y: Complex(a)) -> Complex(a) {
+    Complex {
+      re: x.re * y.re - x.im * y.im,
+      im: x.re * y.im + x.im * y.re,
+    }
+  }
+  fn neg(x: Complex(a)) -> Complex(a) {
+    Complex { re: -x.re, im: -x.im }
+  }
+  fn sub(x: Complex(a), y: Complex(a)) -> Complex(a) {
+    Complex { re: x.re - y.re, im: x.im - y.im }
+  }
+  fn div(z: Complex(a), w: Complex(a)) -> Complex(a) {
+    let d: a = w.re * w.re + w.im * w.im
+    Complex {
+      re: (z.re * w.re + z.im * w.im) / d,
+      im: (z.im * w.re - z.re * w.im) / d,
+    }
+  }
+}

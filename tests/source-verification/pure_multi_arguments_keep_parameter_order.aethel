@@ -1,0 +1,5 @@
+fn decide(on: bool, yes: u8, no: u8) -> u8 {
+  if on { yes } else { no }
+}
+
+fn main() -> u8 { decide(false, 82, 19) }

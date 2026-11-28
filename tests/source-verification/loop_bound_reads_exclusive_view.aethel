@@ -1,0 +1,14 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 2, right: 20, };
+  view exclusive count = pair.left {
+    for _ in 0..count {
+      if pair.right == 20 {
+        pair.right = 21;
+      } else {
+        pair.right = 22;
+      };
+    };
+  };
+  pair.right
+}

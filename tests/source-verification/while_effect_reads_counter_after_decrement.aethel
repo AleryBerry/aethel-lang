@@ -1,0 +1,12 @@
+type Meter { remaining: u8, status: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { remaining: 14, status: 0, };
+  while meter.remaining > 0 decreases meter.remaining {
+    meter.remaining = meter.remaining -| 5;
+    case meter.remaining {
+      0 -> { meter.status = 71; }
+      _ -> { meter.status = 20; }
+    };
+  };
+  meter.status
+}

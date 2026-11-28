@@ -1,0 +1,13 @@
+type Pair { first: u8, second: u8, }
+type Sample { flag: u1, pair: Pair, head: u17, }
+fn main() -> u8 {
+  let mut row = Sample {
+    flag: 1,
+    pair: Pair { first: 7, second: 9, },
+    head: 131071,
+  };
+  view exclusive pair = row.pair {
+    pair.first = 255;
+  };
+  row.pair.second
+}

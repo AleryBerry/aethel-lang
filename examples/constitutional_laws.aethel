@@ -43,39 +43,39 @@ law min_le_add_u32(a: u32, b: u32, c: u32) {
 }
 
 fn sum_countdown(mut n: u32) -> u32 {
-  let mut acc: u32 = 0u32
-  while n > 0u32 decreases n {
+  let mut acc: u32 = 0
+  while n > 0 decreases n {
     acc = acc +% n
-    n = n - 1u32
+    n = n - 1
   }
   acc
 }
 
 fn count_up_sum() -> u32 {
-  let mut i: u32 = 0u32
-  let mut acc: u32 = 0u32
-  while i < 10u32 decreases 10u32 - i {
+  let mut i: u32 = 0
+  let mut acc: u32 = 0
+  while i < 10 decreases 10 - i {
     acc = acc +% i
-    i = i + 1u32
+    i = i + 1
   }
   acc
 }
 
 fn factorial_down(n: u32) -> u32 decreases n {
-  if n == 0u32 {
-    1u32
+  if n == 0 {
+    1
   } else {
-    n *% factorial_down(n - 1u32)
+    n *% factorial_down(n - 1)
   }
 }
 
 fn main() {
-  let mut hero = Combatant { id: 1u32, hp: 100u32, shield: 25u32 }
-  take_hit(hero, 40u32)
-  let tri = sum_countdown(5u32)
+  let mut hero = Combatant { id: 1, hp: 100, shield: 25 }
+  take_hit(hero, 40)
+  let tri = sum_countdown(5)
   let up = count_up_sum()
-  let fact5 = factorial_down(5u32)
-  let recovered = (hero.hp) + 40u32
+  let fact5 = factorial_down(5)
+  let recovered = (hero.hp) + 40
   println("hero.hp=", hero.hp, " recovered=", recovered, " masked=", mask_low(13, 6))
   println("sum_countdown(5)=", tri, " count_up(10)=", up, " fact(5)=", fact5)
 }

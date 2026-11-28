@@ -49,16 +49,16 @@ fn lazy_and_early_release(mut s: Spaceship) -> i32 {
 fn parallel_array_ops(mut arr: [mut u32], i: u32, j: u32, mid: u32) {
   if i != j {
     fork {
-      { arr[i] = arr[i] +% 10u32 }
-      { arr[j] = arr[j] +% 20u32 }
+      { arr[i] = arr[i] +% 10 }
+      { arr[j] = arr[j] +% 20 }
     } join
   }
 
   view exclusive left = arr[0..mid] {
     view exclusive right = arr[mid..arr.len] {
       fork {
-        { left[0] = left[0] +% 1u32 }
-        { right[0] = right[0] +% 2u32 }
+        { left[0] = left[0] +% 1 }
+        { right[0] = right[0] +% 2 }
       } join
     }
   }

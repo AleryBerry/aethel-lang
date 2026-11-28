@@ -1,0 +1,9 @@
+type Meter { first: u8, last: u8, total: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { first: 11, last: 3, total: 57, };
+  view shared held = meter.total {
+    for _ in meter.first..meter.last { meter.total = 0; };
+    let _ = held;
+  };
+  meter.total
+}

@@ -1,0 +1,16 @@
+type Row { first: u8, second: u8, result: u8, }
+fn main() -> u8 {
+  let mut row = Row { first: 46, second: 63, result: 0, };
+  view exclusive parent = row.first {
+    view exclusive sibling = row.second {
+      view shared child = parent {
+        if sibling == 63 {
+          row.result = child;
+        } else {
+          row.result = 1;
+        };
+      };
+    };
+  };
+  row.result
+}

@@ -1,0 +1,10 @@
+[
+  {
+    "target": {"package": "batch", "symbol": "compare"},
+    "accesses": [
+      {"address": {"argument": 0, "byte": 0}, "write": null},
+      {"address": {"argument": 1, "byte": 0}, "write": null},
+      {"address": {"argument": 2, "byte": 0}, "write": 104}
+    ]
+  }
+]

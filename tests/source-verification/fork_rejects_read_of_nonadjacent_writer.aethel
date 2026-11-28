@@ -1,0 +1,10 @@
+type Row { input: u8, left: u8, right: u8, }
+fn main() -> u8 {
+  let mut row = Row { input: 48, left: 57, right: 0, };
+  fork {
+    { row.left = 41; }
+    { let _ = row.input; }
+    { let _ = row.left; row.right = 27; }
+  } join;
+  row.right
+}

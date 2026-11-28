@@ -38,10 +38,10 @@ fn main() {
   let dp = v2.dot(p, q)
   let clamped = clamp(dp +% math.SCALE, 0, 30)
   let cs = v2.clamped_sum(p, 0, 10)
-  let capped = math.cap_score(42u32, 25u32)
+  let capped = math.cap_score(42, 25)
   let bucket = classify_hp(75)
   let opt_v = unwrap_score(Some(clamped))
   let res_v = eval_result(Ok(dp))
-  let flag_s = describe_flag(math.abs_diff(10u32, 4u32) == 6u32)
+  let flag_s = describe_flag(math.abs_diff(10, 4) == 6)
   println("dot=", dp, " clamped=", opt_v, " cs=", cs, " capped=", capped, " bucket=", bucket, " res=", res_v, " flag=", flag_s)
 }

@@ -1,0 +1,10 @@
+type Meter { first: u8, last: u8, total: u8, }
+fn count(meter: Meter ~>.{last, total}) -> u8 {
+  for _ in meter.first..meter.last { meter.total = meter.total -| 3; };
+  meter.total
+}
+fn main() -> u8 {
+  let mut meter = Meter { first: 3, last: 10, total: 31, };
+  meter.total = count(meter);
+  meter.total
+}

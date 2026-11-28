@@ -1,0 +1,8 @@
+fn remember(first: u8, choose_first: bool, second: u8) -> fn(()) -> u8 {
+  fn(unused: ()) { if choose_first { first } else { second } }
+}
+
+fn main() -> u8 {
+  let captured = remember(35, false, 74);
+  captured()
+}

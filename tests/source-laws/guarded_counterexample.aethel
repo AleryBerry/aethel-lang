@@ -1,0 +1,4 @@
+law bounded_under_guard(row: Pair) {
+  when row.left > 7
+  always limit(row) <= 7
+}

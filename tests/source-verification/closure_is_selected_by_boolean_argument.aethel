@@ -1,0 +1,6 @@
+fn main() -> u8 {
+  let pick = fn(take_first: bool) {
+    if take_first { fn(value: u8) { value } } else { fn(value: u8) { 37 } }
+  };
+  pick(false)(88)
+}

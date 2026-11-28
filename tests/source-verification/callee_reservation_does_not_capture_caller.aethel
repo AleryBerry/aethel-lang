@@ -1,0 +1,16 @@
+type Pair { left: u8, right: u8, }
+fn inspect(target: Pair ~>.{right}) {
+  view shared held = target.right { let _ = held; };
+}
+fn delegated(target: Pair ~>.{right}) {
+  inspect(target);
+  target.right = 68;
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 23, };
+  view exclusive held = pair.left {
+    delegated(pair);
+    let _ = held;
+  };
+  pair.right
+}

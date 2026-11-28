@@ -464,6 +464,80 @@ const Emitter = struct {
             \\    return s[a..b];
             \\}
             \\
+            \\fn aethelReadBits(comptime T: type, bytes: []const u8, comptime bit_off: usize) T {
+            \\    const bits: usize = if (T == bool) 1 else @typeInfo(T).int.bits;
+            \\    const UInt = @Int(.unsigned, bits);
+            \\    const byte_start = bit_off / 8;
+            \\    const shift = bit_off % 8;
+            \\    const span = (shift + bits + 7) / 8;
+            \\    var extracted: UInt = 0;
+            \\    if (comptime (span <= 8)) {
+            \\        const Window = @Int(.unsigned, span * 8);
+            \\        var raw: Window = 0;
+            \\        inline for (0..span) |i| {
+            \\            raw |= @as(Window, bytes[byte_start + i]) << @intCast(i * 8);
+            \\        }
+            \\        extracted = @truncate(raw >> @intCast(shift));
+            \\    } else {
+            \\        for (0..span) |i| {
+            \\            const b: u8 = bytes[byte_start + i];
+            \\            if (i == 0) {
+            \\                extracted |= @as(UInt, b >> @intCast(shift));
+            \\            } else {
+            \\                const dst_shift = i * 8 - shift;
+            \\                if (dst_shift < bits) {
+            \\                    extracted |= @as(UInt, b) << @intCast(dst_shift);
+            \\                }
+            \\            }
+            \\        }
+            \\    }
+            \\    return if (T == bool) (extracted != 0) else @bitCast(extracted);
+            \\}
+            \\
+            \\fn aethelWriteBits(comptime T: type, bytes: []u8, comptime bit_off: usize, val: T) void {
+            \\    const bits: usize = if (T == bool) 1 else @typeInfo(T).int.bits;
+            \\    const UInt = @Int(.unsigned, bits);
+            \\    const uval: UInt = if (T == bool) @intFromBool(val) else @bitCast(val);
+            \\    const byte_start = bit_off / 8;
+            \\    const shift = bit_off % 8;
+            \\    const span = (shift + bits + 7) / 8;
+            \\    if (comptime (span <= 8)) {
+            \\        const Window = @Int(.unsigned, span * 8);
+            \\        var raw: Window = 0;
+            \\        if (shift != 0 or (span == 1 and bits < 8)) {
+            \\            raw |= @as(Window, bytes[byte_start]);
+            \\        }
+            \\        if (span > 1 and ((shift + bits) % 8) != 0) {
+            \\            raw |= @as(Window, bytes[byte_start + span - 1]) << @intCast((span - 1) * 8);
+            \\        }
+            \\        const mask: Window = (@as(Window, std.math.maxInt(UInt))) << @intCast(shift);
+            \\        raw = (raw & ~mask) | (@as(Window, uval) << @intCast(shift));
+            \\        inline for (0..span) |i| {
+            \\            bytes[byte_start + i] = @truncate(raw >> @intCast(i * 8));
+            \\        }
+            \\    } else {
+            \\        for (0..span) |i| {
+            \\            const b_start: usize = i * 8;
+            \\            const b_end: usize = b_start + 8;
+            \\            const lo: usize = @max(b_start, shift);
+            \\            const hi: usize = @min(b_end, shift + bits);
+            \\            if (lo >= hi) continue;
+            \\            const mask_lo: u8 = @as(u8, 0xff) << @intCast(lo - b_start);
+            \\            const mask_hi: u8 = @as(u8, 0xff) >> @intCast(b_end - hi);
+            \\            const byte_mask: u8 = mask_lo & mask_hi;
+            \\            const payload_byte: u8 = if (i == 0)
+            \\                @as(u8, @truncate(uval)) << @intCast(shift)
+            \\            else
+            \\                @truncate(uval >> @intCast(b_start - shift));
+            \\            if (byte_mask == 0xff) {
+            \\                bytes[byte_start + i] = payload_byte;
+            \\            } else {
+            \\                bytes[byte_start + i] = (bytes[byte_start + i] & ~byte_mask) | (payload_byte & byte_mask);
+            \\            }
+            \\        }
+            \\    }
+            \\}
+            \\
             \\fn AethelVec(comptime T: type) type {
             \\    return struct {
             \\        items_ptr: ?[*]align(64) T = null,
@@ -1247,28 +1321,32 @@ const Emitter = struct {
         return true;
     }
 
-    fn recordBinCount(rec: *const sema.CheckedRecord, byte_off: usize) usize {
-        var count: usize = 0;
+    fn isFieldPacked(rec: *const sema.CheckedRecord, fidx: usize) bool {
+        if (rec.is_flat_c or fidx >= rec.record_layout.fields.len) return false;
+        return rec.record_layout.fields[fidx].bit_offset != null;
+    }
+
+    fn recordHasPackedFields(rec: *const sema.CheckedRecord) bool {
+        if (rec.is_flat_c) return false;
         for (rec.record_layout.fields) |fp| {
-            if (fp.bit_offset != null and fp.byte_offset == byte_off) count += 1;
-        }
-        return count;
-    }
-
-    fn fieldBinByte(rec: *const sema.CheckedRecord, fidx: usize) ?usize {
-        if (fidx >= rec.record_layout.fields.len) return null;
-        const fp = rec.record_layout.fields[fidx];
-        if (fp.bit_offset != null and recordBinCount(rec, fp.byte_offset) >= 2) {
-            return fp.byte_offset;
-        }
-        return null;
-    }
-
-    fn recordHasAnyBin(rec: *const sema.CheckedRecord) bool {
-        for (0..rec.fields.len) |fi| {
-            if (fieldBinByte(rec, fi) != null) return true;
+            if (fp.bit_offset != null) return true;
         }
         return false;
+    }
+
+    fn recordPackRegion(rec: *const sema.CheckedRecord) ?struct { base: usize, len: usize } {
+        if (!recordHasPackedFields(rec)) return null;
+        var min_b: usize = std.math.maxInt(usize);
+        var max_b: usize = 0;
+        for (rec.record_layout.fields) |fp| {
+            if (fp.bit_offset != null) {
+                if (fp.byte_offset < min_b) min_b = fp.byte_offset;
+                const end_b = fp.byte_offset + fp.size;
+                if (end_b > max_b) max_b = end_b;
+            }
+        }
+        if (min_b > max_b) return null;
+        return .{ .base = min_b, .len = @max(@as(usize, 1), max_b - min_b) };
     }
 
     const BackingKind = union(enum) {
@@ -1278,7 +1356,7 @@ const Emitter = struct {
     };
 
     fn recordBackingKind(rec: *const sema.CheckedRecord) BackingKind {
-        if (rec.fields.len == 0 or recordHasAnyBin(rec)) return .aos_slice;
+        if (rec.fields.len == 0 or recordHasPackedFields(rec)) return .aos_slice;
         if (rec.collection_layout) |cl| {
             return switch (cl) {
                 .soa => .soa,
@@ -1682,8 +1760,8 @@ const Emitter = struct {
                         rec.conflicts.len,
                         if (rec.is_flat_c) " (flat C-ABI)" else "",
                     });
-                    const has_bins = !rec.is_flat_c and recordHasAnyBin(&rec);
-                    var can_assert_size = has_bins or rec.is_flat_c;
+                    const pack_reg = recordPackRegion(&rec);
+                    var can_assert_size = (pack_reg != null) or rec.is_flat_c;
                     for (rec.fields) |f| {
                         switch (f.ty.*) {
                             .int, .int_range, .f32, .f64, .bool => {},
@@ -1721,7 +1799,6 @@ const Emitter = struct {
                         }
                     }
 
-                    var emitted_bins = std.AutoHashMapUnmanaged(usize, void).empty;
                     try self.w.writeAll("const ");
                     try self.emitIdent(name);
                     try self.w.writeAll(if (use_extern_struct) " = extern struct {\n" else " = struct {\n");
@@ -1729,43 +1806,33 @@ const Emitter = struct {
                     const iter_len = if (order.len == rec.fields.len) order.len else rec.fields.len;
                     for (0..iter_len) |oi| {
                         const fi = if (order.len == rec.fields.len) order[oi] else oi;
-                        if (!rec.is_flat_c and fieldBinByte(&rec, fi) != null) {
-                            const bbyte = fieldBinByte(&rec, fi).?;
-                            if (emitted_bins.contains(bbyte)) continue;
-                            emitted_bins.put(self.alloc, bbyte, {}) catch {};
+                        if (isFieldPacked(&rec, fi)) continue;
+                        const f = rec.fields[fi];
+                        try self.writeIndent();
+                        try self.emitIdent(f.name);
+                        try self.w.writeAll(": ");
+                        try self.emitTy(f.ty);
+                        try self.w.writeAll(",\n");
+                    }
+                    if (pack_reg) |reg| {
+                        try self.writeIndent();
+                        try self.w.print("__aethel_pack: [{d}]u8 = std.mem.zeroes([{d}]u8),\n", .{ reg.len, reg.len });
+                        for (rec.fields, 0..) |f, fi| {
+                            if (!isFieldPacked(&rec, fi)) continue;
+                            const fp = rec.record_layout.fields[fi];
+                            const rel_bit: usize = (fp.byte_offset - reg.base) * 8 + fp.bit_offset.?;
                             try self.writeIndent();
-                            try self.w.print("__bin_{d}: packed struct(u8) {{\n", .{bbyte});
-                            self.indent += 1;
-                            var used_bits: u16 = 0;
-                            for (0..iter_len) |oj| {
-                                const fj = if (order.len == rec.fields.len) order[oj] else oj;
-                                if (fieldBinByte(&rec, fj)) |jb| {
-                                    if (jb == bbyte) {
-                                        const bf = rec.fields[fj];
-                                        const bfp = rec.record_layout.fields[fj];
-                                        try self.writeIndent();
-                                        try self.emitIdent(bf.name);
-                                        try self.w.writeAll(": ");
-                                        try self.emitTy(bf.ty);
-                                        try self.w.writeAll(",\n");
-                                        used_bits += bfp.bits;
-                                    }
-                                }
-                            }
-                            if (used_bits < 8) {
-                                try self.writeIndent();
-                                try self.w.print("__pad: u{d} = 0,\n", .{8 - used_bits});
-                            }
-                            self.indent -= 1;
-                            try self.writeIndent();
-                            try self.w.writeAll("},\n");
-                        } else {
-                            const f = rec.fields[fi];
-                            try self.writeIndent();
-                            try self.emitIdent(f.name);
-                            try self.w.writeAll(": ");
+                            try self.w.print("pub inline fn __aethel_get_{s}(self: @This()) ", .{f.name});
                             try self.emitTy(f.ty);
-                            try self.w.writeAll(",\n");
+                            try self.w.print(" {{ return aethelReadBits(", .{});
+                            try self.emitTy(f.ty);
+                            try self.w.print(", &self.__aethel_pack, {d}); }}\n", .{rel_bit});
+                            try self.writeIndent();
+                            try self.w.print("pub inline fn __aethel_set_{s}(self: *@This(), __v: ", .{f.name});
+                            try self.emitTy(f.ty);
+                            try self.w.print(") void {{ aethelWriteBits(", .{});
+                            try self.emitTy(f.ty);
+                            try self.w.print(", &self.__aethel_pack, {d}, __v); }}\n", .{rel_bit});
                         }
                     }
                     self.indent -= 1;
@@ -3025,17 +3092,91 @@ const Emitter = struct {
                         }
                     } else if (is_vec_tgt) {
                         const fname = self.sourceOf(asg.target.field.name);
-                        try self.writeIndent();
-                        try self.w.writeByte('(');
-                        try self.emitExpr(ix.target);
-                        try self.w.writeAll(").mutSlice()[");
-                        try self.emitSliceIndexExpr(ix.idx);
-                        try self.w.writeAll("].");
-                        try self.emitIdent(fname);
-                        try self.w.print(" {s} ", .{asg.op.symbol()});
-                        try self.emitAssignmentOperand(asg.value, asg.op, target_ty);
-                        try self.w.writeAll(";\n");
-                        return;
+                        const is_packed_vec_fld = blk: {
+                            if (ix_tty) |it| {
+                                const inner_v: *const sema.Ty = switch (it.*) {
+                                    .view => |v| v.target,
+                                    .path_borrow => |pb| pb.base,
+                                    else => it,
+                                };
+                                if (inner_v.* == .vec) {
+                                    if (inner_v.vec.elem_record) |ri| {
+                                        const rec = self.checked.records[ri];
+                                        if (findRecordFieldIdx(&rec, fname)) |fi| {
+                                            break :blk isFieldPacked(&rec, fi);
+                                        }
+                                    }
+                                }
+                            }
+                            break :blk false;
+                        };
+                        if (!is_packed_vec_fld) {
+                            try self.writeIndent();
+                            try self.w.writeByte('(');
+                            try self.emitExpr(ix.target);
+                            try self.w.writeAll(").mutSlice()[");
+                            try self.emitSliceIndexExpr(ix.idx);
+                            try self.w.writeAll("].");
+                            try self.emitIdent(fname);
+                            try self.w.print(" {s} ", .{asg.op.symbol()});
+                            try self.emitAssignmentOperand(asg.value, asg.op, target_ty);
+                            try self.w.writeAll(";\n");
+                            return;
+                        }
+                    }
+                }
+                if (asg.target.* == .field) {
+                    const fld = asg.target.field;
+                    const fname = self.sourceOf(fld.name);
+                    if (self.checked.exprType(fld.target)) |tty| {
+                        if (recordRecordIdxOfTy(tty)) |ridx| {
+                            const rec = self.checked.records[ridx];
+                            if (findRecordFieldIdx(&rec, fname)) |fidx| {
+                                if (isFieldPacked(&rec, fidx)) {
+                                    const is_vec_elem = fld.target.* == .index and
+                                        self.isVecTyOrViewToVec(self.checked.exprType(fld.target.index.target));
+                                    try self.writeIndent();
+                                    if (asg.op == .assign) {
+                                        if (is_vec_elem) {
+                                            try self.w.writeByte('(');
+                                            try self.emitExpr(fld.target.index.target);
+                                            try self.w.writeAll(").mutSlice()[");
+                                            try self.emitSliceIndexExpr(fld.target.index.idx);
+                                            try self.w.writeByte(']');
+                                        } else {
+                                            try self.w.writeByte('(');
+                                            try self.emitExpr(fld.target);
+                                            try self.w.writeByte(')');
+                                        }
+                                        try self.w.print(".__aethel_set_{s}(", .{fname});
+                                        try self.emitAssignmentOperand(asg.value, asg.op, target_ty);
+                                        try self.w.writeAll(");\n");
+                                    } else {
+                                        const plbl = self.nextLabel();
+                                        try self.w.print("{{ const __ptgt_{d} = &", .{plbl});
+                                        if (is_vec_elem) {
+                                            try self.w.writeByte('(');
+                                            try self.emitExpr(fld.target.index.target);
+                                            try self.w.writeAll(").mutSlice()[");
+                                            try self.emitSliceIndexExpr(fld.target.index.idx);
+                                            try self.w.writeByte(']');
+                                        } else {
+                                            try self.emitExpr(fld.target);
+                                        }
+                                        try self.w.print("; __ptgt_{d}.__aethel_set_{s}(__ptgt_{d}.__aethel_get_{s}() {s} (", .{
+                                            plbl,
+                                            fname,
+                                            plbl,
+                                            fname,
+                                            asg.op.symbol()[0..1],
+                                        });
+                                        try self.emitAssignmentOperand(asg.value, asg.op, target_ty);
+                                        try self.w.writeAll(")); }\n");
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
                 if (asg.target.* == .index) {
@@ -3077,10 +3218,40 @@ const Emitter = struct {
                     try self.w.print(" = __rasg_{d}; }}\n", .{albl});
                     return;
                 }
+                const excl_view_deref = asg.target.* == .ident and
+                    target_ty != null and
+                    target_ty.?.* == .view and
+                    target_ty.?.view.mode == .exclusive and
+                    target_ty.?.view.target.* != .slice and
+                    target_ty.?.view.target.* != .collection;
+                const write_val_ty: ?*const sema.Ty = if (excl_view_deref) target_ty.?.view.target else target_ty;
+                if (self.checked.assign_trait_resolutions.get(stmt)) |tres| {
+                    if (tres.kind == .trait_method) {
+                        const tm = tres.kind.trait_method;
+                        try self.writeIndent();
+                        if (excl_view_deref) try self.w.writeByte('(');
+                        try self.emitExpr(asg.target);
+                        if (excl_view_deref) try self.w.writeAll(").*");
+                        try self.w.writeAll(" = ");
+                        try self.emitWitnessExpr(tm.witness);
+                        try self.w.writeByte('.');
+                        try self.emitIdent(tm.method_name);
+                        try self.w.writeByte('(');
+                        if (excl_view_deref) try self.w.writeByte('(');
+                        try self.emitExpr(asg.target);
+                        if (excl_view_deref) try self.w.writeAll(").*");
+                        try self.w.writeAll(", ");
+                        try self.emitExpr(asg.value);
+                        try self.w.writeAll(");\n");
+                        return;
+                    }
+                }
                 try self.writeIndent();
+                if (excl_view_deref) try self.w.writeByte('(');
                 try self.emitExpr(asg.target);
+                if (excl_view_deref) try self.w.writeAll(").*");
                 try self.w.print(" {s} ", .{asg.op.symbol()});
-                try self.emitAssignmentOperand(asg.value, asg.op, target_ty);
+                try self.emitAssignmentOperand(asg.value, asg.op, write_val_ty);
                 try self.w.writeAll(";\n");
             },
             .return_stmt => |rs| {
@@ -3396,12 +3567,10 @@ const Emitter = struct {
     fn isUnsizedIntLit(self: *const Emitter, expr: *const ast.Expr) ?struct { negative: bool, mag: u128 } {
         if (expr.* == .int_lit) {
             const p = int_range.parseIntLiteral(self.sourceOf(expr.int_lit)) orelse return null;
-            if (p.suffix != null) return null;
             return .{ .negative = false, .mag = p.value };
         }
         if (expr.* == .unary and expr.unary.op == .neg and expr.unary.operand.* == .int_lit) {
             const p = int_range.parseIntLiteral(self.sourceOf(expr.unary.operand.int_lit)) orelse return null;
-            if (p.suffix != null) return null;
             return .{ .negative = true, .mag = p.value };
         }
         return null;
@@ -3529,6 +3698,19 @@ const Emitter = struct {
             }
             return;
         }
+        if (self.checked.numeral_trait_resolutions.get(expr)) |w| {
+            if (self.isUnsizedIntLit(expr)) |lit| {
+                try self.emitWitnessExpr(w);
+                try self.w.writeAll(".from_int(@as(i32, ");
+                if (lit.negative and lit.mag != 0) {
+                    try self.w.print("-{d}", .{lit.mag});
+                } else {
+                    try self.w.print("{d}", .{lit.mag});
+                }
+                try self.w.writeAll("))");
+                return;
+            }
+        }
         if (target.isInteger()) |target_int| {
             if (self.isUnsizedIntLit(expr)) |lit| {
                 try self.w.print("@as({c}{d}, ", .{
@@ -3559,9 +3741,35 @@ const Emitter = struct {
                 }
             }
         }
-        if ((target.* == .f32 or target.* == .f64) and expr.* == .float_lit) {
-            try self.emitFloatLitWithTarget(expr.float_lit, target.* == .f32);
-            return;
+        if ((target.* == .f32 or target.* == .f64)) {
+            if (expr.* == .float_lit) {
+                try self.emitFloatLitWithTarget(expr.float_lit, target.* == .f32);
+                return;
+            }
+            if (self.isUnsizedIntLit(expr)) |lit| {
+                try self.w.print("@as({s}, ", .{if (target.* == .f32) "f32" else "f64"});
+                if (lit.negative and lit.mag != 0) {
+                    try self.w.print("-{d}", .{lit.mag});
+                } else {
+                    try self.w.print("{d}", .{lit.mag});
+                }
+                try self.w.writeByte(')');
+                return;
+            }
+            if (self.checked.exprType(expr)) |src_ty| {
+                if (src_ty.isInteger() != null) {
+                    try self.w.print("@as({s}, @floatFromInt(", .{if (target.* == .f32) "f32" else "f64"});
+                    try self.emitExpr(expr);
+                    try self.w.writeAll("))");
+                    return;
+                }
+                if (src_ty.* == .f32 and target.* == .f64) {
+                    try self.w.writeAll("@as(f64, @floatCast(");
+                    try self.emitExpr(expr);
+                    try self.w.writeAll("))");
+                    return;
+                }
+            }
         }
         if (target.* == .option and expr.* == .upper_ident and std.mem.eql(u8, self.sourceOf(expr.upper_ident), "None")) {
             try self.w.writeAll("null");
@@ -3579,20 +3787,8 @@ const Emitter = struct {
     }
 
     fn emitFloatLitWithTarget(self: *Emitter, span: ast.Span, is_f32: bool) Io.Writer.Error!void {
-        var raw = self.sourceOf(span);
-        var f32_explicit = is_f32;
-        if (std.mem.endsWith(u8, raw, "_f32")) {
-            raw = raw[0 .. raw.len - 4];
-            f32_explicit = true;
-        } else if (std.mem.endsWith(u8, raw, "f32")) {
-            raw = raw[0 .. raw.len - 3];
-            f32_explicit = true;
-        } else if (std.mem.endsWith(u8, raw, "_f64")) {
-            raw = raw[0 .. raw.len - 4];
-        } else if (std.mem.endsWith(u8, raw, "f64")) {
-            raw = raw[0 .. raw.len - 3];
-        }
-        try self.w.print("@as({s}, {s})", .{ if (f32_explicit) "f32" else "f64", raw });
+        const raw = self.sourceOf(span);
+        try self.w.print("@as({s}, {s})", .{ if (is_f32) "f32" else "f64", raw });
     }
 
     fn emitStringLit(self: *Emitter, span: ast.Span) Io.Writer.Error!void {
@@ -3641,12 +3837,21 @@ const Emitter = struct {
     fn emitExpr(self: *Emitter, expr: *const ast.Expr) Io.Writer.Error!void {
         switch (expr.*) {
             .int_lit => |sp| {
+                if (self.checked.numeral_trait_resolutions.get(expr)) |w| {
+                    const parsed = int_range.parseIntLiteral(self.sourceOf(sp)) orelse {
+                        try self.w.writeAll(self.sourceOf(sp));
+                        return;
+                    };
+                    try self.emitWitnessExpr(w);
+                    try self.w.print(".from_int(@as(i32, {d}))", .{parsed.value});
+                    return;
+                }
                 const ty_opt = self.checked.exprType(expr);
                 const parsed = int_range.parseIntLiteral(self.sourceOf(sp)) orelse {
                     try self.w.writeAll(self.sourceOf(sp));
                     return;
                 };
-                const target_int: ?int_range.IntType = parsed.suffix orelse if (ty_opt) |t| t.isInteger() else null;
+                const target_int: ?int_range.IntType = if (ty_opt) |t| t.isInteger() else null;
                 if (target_int) |it| {
                     try self.w.print("@as({c}{d}, {d})", .{
                         if (it.signed) @as(u8, 'i') else @as(u8, 'u'),
@@ -3707,6 +3912,28 @@ const Emitter = struct {
             },
             .placeholder => try self.w.writeAll("{}"),
             .unary => |u| {
+                if (u.op == .neg) {
+                    if (self.checked.numeral_trait_resolutions.get(expr)) |w| {
+                        if (u.operand.* == .int_lit) {
+                            if (int_range.parseIntLiteral(self.sourceOf(u.operand.int_lit))) |parsed| {
+                                try self.emitWitnessExpr(w);
+                                try self.w.print(".from_int(@as(i32, -{d}))", .{parsed.value});
+                                return;
+                            }
+                        }
+                    }
+                    if (self.checked.call_trait_resolutions.get(expr)) |tres| {
+                        if (tres.kind == .trait_method) {
+                            try self.emitWitnessExpr(tres.kind.trait_method.witness);
+                            try self.w.writeByte('.');
+                            try self.emitIdent(tres.kind.trait_method.method_name);
+                            try self.w.writeByte('(');
+                            try self.emitExpr(u.operand);
+                            try self.w.writeByte(')');
+                            return;
+                        }
+                    }
+                }
                 if (u.op == .neg and u.operand.* == .int_lit) {
                     const parsed = int_range.parseIntLiteral(self.sourceOf(u.operand.int_lit)) orelse {
                         try self.w.writeAll("-(");
@@ -3715,7 +3942,7 @@ const Emitter = struct {
                         return;
                     };
                     const ty_opt = self.checked.exprType(expr);
-                    const target_int: ?int_range.IntType = parsed.suffix orelse if (ty_opt) |t| t.isInteger() else null;
+                    const target_int: ?int_range.IntType = if (ty_opt) |t| t.isInteger() else null;
                     if (target_int) |it| {
                         try self.w.print("@as({c}{d}, -{d})", .{
                             if (it.signed) @as(u8, 'i') else @as(u8, 'u'),
@@ -3763,6 +3990,14 @@ const Emitter = struct {
                 if (target_ty) |tt| {
                     if (tt.isInteger() != null and (inner_ty == null or inner_ty.?.isInteger() != null)) {
                         try self.emitCoercedExpr(c.expr, tt);
+                        return;
+                    }
+                    if ((tt.* == .f32 or tt.* == .f64) and inner_ty != null and (inner_ty.?.* == .f32 or inner_ty.?.* == .f64)) {
+                        try self.w.writeAll("@as(");
+                        try self.emitTy(tt);
+                        try self.w.writeAll(", @floatCast(");
+                        try self.emitExpr(c.expr);
+                        try self.w.writeAll("))");
                         return;
                     }
                     if ((tt.* == .f32 or tt.* == .f64) and inner_ty != null and inner_ty.?.isInteger() != null) {
@@ -3860,8 +4095,30 @@ const Emitter = struct {
                         try self.emitExpr(fld.target.index.target);
                         try self.w.writeAll(").asSlice()[");
                         try self.emitSliceIndexExpr(fld.target.index.idx);
-                        try self.w.writeAll("].");
-                        try self.emitIdent(fname);
+                        const is_packed_vec_fld = blk: {
+                            if (ix_tty) |it| {
+                                const inner_v: *const sema.Ty = switch (it.*) {
+                                    .view => |v| v.target,
+                                    .path_borrow => |pb| pb.base,
+                                    else => it,
+                                };
+                                if (inner_v.* == .vec) {
+                                    if (inner_v.vec.elem_record) |ri| {
+                                        const rec = self.checked.records[ri];
+                                        if (findRecordFieldIdx(&rec, fname)) |fi| {
+                                            break :blk isFieldPacked(&rec, fi);
+                                        }
+                                    }
+                                }
+                            }
+                            break :blk false;
+                        };
+                        if (is_packed_vec_fld) {
+                            try self.w.print("].__aethel_get_{s}()", .{fname});
+                        } else {
+                            try self.w.writeAll("].");
+                            try self.emitIdent(fname);
+                        }
                         return;
                     }
                 }
@@ -3884,18 +4141,22 @@ const Emitter = struct {
                     if (recordRecordIdxOfTy(tty)) |ridx| {
                         const rec = self.checked.records[ridx];
                         if (findRecordFieldIdx(&rec, fname)) |fidx| {
-                            if (fieldBinByte(&rec, fidx)) |bbyte| {
+                            if (isFieldPacked(&rec, fidx)) {
+                                try self.w.writeByte('(');
                                 try self.emitExpr(fld.target);
-                                try self.w.print(".__bin_{d}.", .{bbyte});
-                                try self.emitIdent(fname);
+                                try self.w.print(").__aethel_get_{s}()", .{fname});
                                 return;
                             }
                         }
                     }
                 }
                 try self.emitExpr(fld.target);
-                try self.w.writeByte('.');
-                try self.emitIdent(fname);
+                if (fname.len > 0 and std.ascii.isDigit(fname[0])) {
+                    try self.w.print(".@\"{s}\"", .{fname});
+                } else {
+                    try self.w.writeByte('.');
+                    try self.emitIdent(fname);
+                }
             },
             .index => |ix| {
                 const ix_tty = self.checked.exprType(ix.target);
@@ -3973,59 +4234,63 @@ const Emitter = struct {
                 const ridx = self.checked.resolvedRecordIdx(expr) orelse self.findCheckedRecordIndex(raw_rname);
                 const rname = if (ridx) |ri| self.checked.records[ri].name else raw_rname;
                 const lit_ty = self.checked.exprType(expr);
-                const has_bins = if (ridx) |ri| (!self.checked.records[ri].is_flat_c and recordHasAnyBin(&self.checked.records[ri])) else false;
+                const pack_reg = if (ridx) |ri| recordPackRegion(&self.checked.records[ri]) else null;
+                if (pack_reg) |reg| {
+                    const rec = self.checked.records[ridx.?];
+                    const lbl = self.nextLabel();
+                    try self.w.print("(__lit_{d}: {{ ", .{lbl});
+                    for (rl.fields, 0..) |rf, ri| {
+                        const fname = self.sourceOf(rf.name);
+                        const fidx = findRecordFieldIdx(&rec, fname);
+                        try self.w.print("const __rl_{d}_{d}", .{ lbl, ri });
+                        if (fidx) |fi| {
+                            try self.w.writeAll(": ");
+                            try self.emitTy(rec.fields[fi].ty);
+                        }
+                        try self.w.writeAll(" = ");
+                        if (rf.value) |val| {
+                            if (fidx) |fi| try self.emitCoercedExpr(val, rec.fields[fi].ty) else try self.emitExpr(val);
+                        } else {
+                            try self.emitIdent(fname);
+                        }
+                        try self.w.writeAll("; ");
+                    }
+                    try self.w.print("var __rec_{d}: ", .{lbl});
+                    if (lit_ty != null and lit_ty.?.* == .applied and lit_ty.?.applied.args.len > 0) {
+                        try self.emitTy(lit_ty.?);
+                    } else {
+                        try self.emitIdent(rname);
+                    }
+                    try self.w.writeAll(" = .{ ");
+                    var wrote_any = false;
+                    for (rl.fields, 0..) |rf, ri| {
+                        const fname = self.sourceOf(rf.name);
+                        const fidx = findRecordFieldIdx(&rec, fname);
+                        if (fidx != null and isFieldPacked(&rec, fidx.?)) continue;
+                        if (wrote_any) try self.w.writeAll(", ");
+                        wrote_any = true;
+                        try self.w.writeByte('.');
+                        try self.emitIdent(fname);
+                        try self.w.print(" = __rl_{d}_{d}", .{ lbl, ri });
+                    }
+                    if (wrote_any) try self.w.writeAll(", ");
+                    try self.w.print(".__aethel_pack = std.mem.zeroes([{d}]u8) }}; ", .{reg.len});
+                    for (rl.fields, 0..) |rf, ri| {
+                        const fname = self.sourceOf(rf.name);
+                        const fidx = findRecordFieldIdx(&rec, fname) orelse continue;
+                        if (!isFieldPacked(&rec, fidx)) continue;
+                        try self.w.print("__rec_{d}.__aethel_set_{s}(__rl_{d}_{d}); ", .{ lbl, fname, lbl, ri });
+                    }
+                    try self.w.print("break :__lit_{d} __rec_{d}; }})", .{ lbl, lbl });
+                    return;
+                }
                 if (lit_ty != null and lit_ty.?.* == .applied and lit_ty.?.applied.args.len > 0) {
                     try self.emitTy(lit_ty.?);
                 } else {
                     try self.emitIdent(rname);
                 }
                 try self.w.writeAll("{ ");
-                if (has_bins) {
-                    const rec = self.checked.records[ridx.?];
-                    var emitted_bins = std.AutoHashMapUnmanaged(usize, void).empty;
-                    var wrote_any = false;
-                    for (rl.fields) |rf| {
-                        const fname = self.sourceOf(rf.name);
-                        const fidx = findRecordFieldIdx(&rec, fname);
-                        if (fidx != null and fieldBinByte(&rec, fidx.?) != null) {
-                            const bbyte = fieldBinByte(&rec, fidx.?).?;
-                            if (emitted_bins.contains(bbyte)) continue;
-                            emitted_bins.put(self.alloc, bbyte, {}) catch {};
-                            if (wrote_any) try self.w.writeAll(", ");
-                            wrote_any = true;
-                            try self.w.print(".__bin_{d} = .{{ ", .{bbyte});
-                            var wrote_bin_fld = false;
-                            for (rl.fields) |bf| {
-                                const bfname = self.sourceOf(bf.name);
-                                const bfidx = findRecordFieldIdx(&rec, bfname) orelse continue;
-                                if ((fieldBinByte(&rec, bfidx) orelse continue) != bbyte) continue;
-                                if (wrote_bin_fld) try self.w.writeAll(", ");
-                                wrote_bin_fld = true;
-                                try self.w.writeByte('.');
-                                try self.emitIdent(bfname);
-                                try self.w.writeAll(" = ");
-                                if (bf.value) |val| {
-                                    try self.emitCoercedExpr(val, rec.fields[bfidx].ty);
-                                } else {
-                                    try self.emitIdent(bfname);
-                                }
-                            }
-                            try self.w.writeAll(" }");
-                        } else {
-                            if (wrote_any) try self.w.writeAll(", ");
-                            wrote_any = true;
-                            try self.w.writeByte('.');
-                            try self.emitIdent(fname);
-                            try self.w.writeAll(" = ");
-                            const field_ty: ?*const sema.Ty = if (fidx) |fi_val| rec.fields[fi_val].ty else null;
-                            if (rf.value) |val| {
-                                if (field_ty) |ft| try self.emitCoercedExpr(val, ft) else try self.emitExpr(val);
-                            } else {
-                                try self.emitIdent(fname);
-                            }
-                        }
-                    }
-                } else {
+                {
                     for (rl.fields, 0..) |rf, fi| {
                         if (fi > 0) try self.w.writeAll(", ");
                         const fname = self.sourceOf(rf.name);
@@ -4058,10 +4323,15 @@ const Emitter = struct {
                 if (tp.elems.len == 0) {
                     try self.w.writeAll("{}");
                 } else {
+                    const tup_ty = self.checked.exprType(expr);
                     try self.w.writeAll(".{ ");
                     for (tp.elems, 0..) |el, i| {
                         if (i > 0) try self.w.writeAll(", ");
-                        try self.emitExpr(el);
+                        if (tup_ty != null and tup_ty.?.* == .tuple and i < tup_ty.?.tuple.len) {
+                            try self.emitCoercedExpr(el, tup_ty.?.tuple[i]);
+                        } else {
+                            try self.emitExpr(el);
+                        }
                     }
                     try self.w.writeAll(" }");
                 }
@@ -4409,8 +4679,50 @@ const Emitter = struct {
                 try self.w.writeByte(')');
             },
             .eq, .ne, .lt, .le, .gt, .ge => {
-                const li = operandInteger(self.checked.exprType(b.left));
-                const ri = operandInteger(self.checked.exprType(b.right));
+                if (b.op == .eq or b.op == .ne) {
+                    if (self.checked.call_trait_resolutions.get(full_expr)) |tres| {
+                        if (tres.kind == .trait_method) {
+                            if (b.op == .ne) try self.w.writeAll("(!(");
+                            try self.emitWitnessExpr(tres.kind.trait_method.witness);
+                            try self.w.writeByte('.');
+                            try self.emitIdent(tres.kind.trait_method.method_name);
+                            try self.w.writeByte('(');
+                            try self.emitExpr(b.left);
+                            try self.w.writeAll(", ");
+                            try self.emitExpr(b.right);
+                            try self.w.writeByte(')');
+                            if (b.op == .ne) try self.w.writeAll("))");
+                            return;
+                        }
+                    }
+                }
+                const lt = self.checked.exprType(b.left);
+                const rt = self.checked.exprType(b.right);
+                if (b.op == .eq or b.op == .ne) {
+                    if (lt != null and (lt.?.* == .record or lt.?.* == .applied)) {
+                        if (b.op == .ne) try self.w.writeAll("(!(");
+                        try self.w.writeAll("std.meta.eql(");
+                        try self.emitExpr(b.left);
+                        try self.w.writeAll(", ");
+                        try self.emitExpr(b.right);
+                        try self.w.writeByte(')');
+                        if (b.op == .ne) try self.w.writeAll("))");
+                        return;
+                    }
+                }
+                if ((lt != null and (lt.?.* == .f32 or lt.?.* == .f64)) or
+                    (rt != null and (rt.?.* == .f32 or rt.?.* == .f64)))
+                {
+                    const f_target: sema.Ty = if ((lt != null and lt.?.* == .f64) or (rt != null and rt.?.* == .f64)) .f64 else .f32;
+                    try self.w.writeByte('(');
+                    try self.emitCoercedExpr(b.left, &f_target);
+                    try self.w.print(" {s} ", .{b.op.symbol()});
+                    try self.emitCoercedExpr(b.right, &f_target);
+                    try self.w.writeByte(')');
+                    return;
+                }
+                const li = operandInteger(lt);
+                const ri = operandInteger(rt);
                 const l_lit = self.isUnsizedIntLit(b.left) != null;
                 const r_lit = self.isUnsizedIntLit(b.right) != null;
                 const target: ?sema.Ty = if (li != null and ri != null) .{
@@ -4460,9 +4772,37 @@ const Emitter = struct {
                 try self.emitTypedBinOp(full_expr, b.op, b.left, b.right);
             },
             .add, .sub, .mul, .bit_or, .bit_xor, .bit_and => {
+                if (self.checked.call_trait_resolutions.get(full_expr)) |tres| {
+                    if (tres.kind == .trait_method) {
+                        try self.emitWitnessExpr(tres.kind.trait_method.witness);
+                        try self.w.writeByte('.');
+                        try self.emitIdent(tres.kind.trait_method.method_name);
+                        try self.w.writeByte('(');
+                        try self.emitExpr(b.left);
+                        try self.w.writeAll(", ");
+                        try self.emitExpr(b.right);
+                        try self.w.writeByte(')');
+                        return;
+                    }
+                }
                 try self.emitTypedBinOp(full_expr, b.op, b.left, b.right);
             },
             .div, .rem => {
+                if (b.op == .div) {
+                    if (self.checked.call_trait_resolutions.get(full_expr)) |tres| {
+                        if (tres.kind == .trait_method) {
+                            try self.emitWitnessExpr(tres.kind.trait_method.witness);
+                            try self.w.writeByte('.');
+                            try self.emitIdent(tres.kind.trait_method.method_name);
+                            try self.w.writeByte('(');
+                            try self.emitExpr(b.left);
+                            try self.w.writeAll(", ");
+                            try self.emitExpr(b.right);
+                            try self.w.writeByte(')');
+                            return;
+                        }
+                    }
+                }
                 const res_ty = self.checked.exprType(full_expr);
                 const it_opt = if (res_ty) |t| t.isInteger() else null;
                 if (it_opt) |it| {
@@ -4564,6 +4904,14 @@ const Emitter = struct {
                 try self.w.print(" {s} ", .{sym});
                 try self.emitCoercedExpr(right, res_ty.?);
             }
+            try self.w.writeByte(')');
+            return;
+        }
+        if (res_ty != null and (res_ty.?.* == .f32 or res_ty.?.* == .f64)) {
+            try self.w.writeByte('(');
+            try self.emitCoercedExpr(left, res_ty.?);
+            try self.w.print(" {s} ", .{sym});
+            try self.emitCoercedExpr(right, res_ty.?);
             try self.w.writeByte(')');
             return;
         }
@@ -5066,17 +5414,24 @@ const Emitter = struct {
                 }
             }
         }
+        const targs_opt: ?[]const *const sema.Ty = if (call_expr) |ce| self.checked.callTypeArgs(ce) else null;
         if (piped_recv) |pr| {
             if (emitted_any) try self.w.writeAll(", ");
             emitted_any = true;
-            const param_ty: ?*const sema.Ty = if (cf != null and cf.?.param_types.len > 0) cf.?.param_types[0] else null;
+            const param_ty: ?*const sema.Ty = if (cf != null and cf.?.param_types.len > 0)
+                self.substCallParamTy(cf.?, targs_opt, cf.?.param_types[0])
+            else
+                null;
             try self.emitCallArg(pr, param_ty);
         }
         for (args, 0..) |arg, ai| {
             if (emitted_any) try self.w.writeAll(", ");
             emitted_any = true;
             const pidx = ai + total_offset;
-            const param_ty: ?*const sema.Ty = if (cf != null and pidx < cf.?.param_types.len) cf.?.param_types[pidx] else null;
+            const param_ty: ?*const sema.Ty = if (cf != null and pidx < cf.?.param_types.len)
+                self.substCallParamTy(cf.?, targs_opt, cf.?.param_types[pidx])
+            else
+                null;
             try self.emitCallArg(arg.value, param_ty);
         }
         try self.w.writeByte(')');
@@ -5393,6 +5748,24 @@ const Emitter = struct {
                 try self.w.writeAll(")))");
             },
         }
+    }
+
+    fn substCallParamTy(
+        self: *const Emitter,
+        cf: *const sema.CheckedFunction,
+        targs_opt: ?[]const *const sema.Ty,
+        param_ty: *const sema.Ty,
+    ) *const sema.Ty {
+        _ = self;
+        const targs = targs_opt orelse return param_ty;
+        if (param_ty.* == .type_var) {
+            for (cf.type_params, 0..) |tp, ti| {
+                if (ti < targs.len and std.mem.eql(u8, tp, param_ty.type_var)) {
+                    return targs[ti];
+                }
+            }
+        }
+        return param_ty;
     }
 
     fn emitCallArg(self: *Emitter, val: *const ast.Expr, expected: ?*const sema.Ty) Io.Writer.Error!void {
@@ -6845,7 +7218,7 @@ const Emitter = struct {
         fname: []const u8,
     ) ?usize {
         const fidx = findRecordFieldIdx(rec, fname) orelse return null;
-        if (fieldBinByte(rec, fidx) != null) return null;
+        if (isFieldPacked(rec, fidx)) return null;
         const fty = rec.fields[fidx].ty;
         if (isSimdPrimitiveTy(fty) == null) return null;
         for (entries.items, 0..) |e, idx| {
@@ -7517,7 +7890,7 @@ const Emitter = struct {
         const ri = elem_ridx_opt orelse return null;
         if (ri >= self.checked.records.len) return null;
         const rec = &self.checked.records[ri];
-        if (recHasPackedBins(rec)) return null;
+        if (recordHasPackedFields(rec)) return null;
         const fty = fold_res_ty orelse return null;
         if (fty.isInteger() == null or isSimdPrimitiveTy(fty) == null) return null;
         const fa = pipe.fold_arg orelse return null;
@@ -7773,14 +8146,6 @@ const Emitter = struct {
         whole_escaped: bool = false,
     };
 
-    fn recHasPackedBins(rec: *const sema.CheckedRecord) bool {
-        if (rec.is_flat_c) return false;
-        for (0..rec.fields.len) |fi| {
-            if (fieldBinByte(rec, fi) != null) return true;
-        }
-        return false;
-    }
-
     fn collectBlockFieldUsage(
         self: *const Emitter,
         rec: *const sema.CheckedRecord,
@@ -7959,7 +8324,7 @@ const Emitter = struct {
             null;
         var use_selective = false;
         var usage: RecordFieldUsage = .{ .reads = &.{}, .writes = &.{}, .whole_escaped = true };
-        if ((is_phys_soa or is_phys_aosoa) and rec_opt != null and !recHasPackedBins(rec_opt.?)) {
+        if ((is_phys_soa or is_phys_aosoa) and rec_opt != null and !recordHasPackedFields(rec_opt.?)) {
             usage = self.collectBlockFieldUsage(rec_opt.?, elem_param, &lam.body);
             if (!usage.whole_escaped) {
                 use_selective = true;
@@ -8069,7 +8434,7 @@ const Emitter = struct {
             (if (ri < self.checked.records.len) &self.checked.records[ri] else null)
         else
             null;
-        if ((is_phys_soa or is_phys_aosoa) and rec_opt != null and !recHasPackedBins(rec_opt.?) and
+        if ((is_phys_soa or is_phys_aosoa) and rec_opt != null and !recordHasPackedFields(rec_opt.?) and
             pipe.fold_arg.?.* == .lambda and pipe.fold_arg.?.lambda.params.len == 2)
         {
             const rec = rec_opt.?;

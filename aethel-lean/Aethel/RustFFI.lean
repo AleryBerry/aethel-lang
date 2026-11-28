@@ -35,6 +35,21 @@ def RustSliceSpec.byteLen (sl : RustSliceSpec) : Nat :=
 def RustSliceSpec.locations (sl : RustSliceSpec) : List ByteLocation :=
   (List.range sl.byteLen).map fun i => ⟨sl.owner, sl.byteOffset + i⟩
 
+def RustSliceSpec.interval (slice : RustSliceSpec) : Interval :=
+  ⟨slice.byteOffset, slice.byteOffset + slice.byteLen⟩
+
+theorem RustSliceSpec.mem_locations (slice : RustSliceSpec) (location : ByteLocation) :
+    location ∈ slice.locations ↔ location.allocation = slice.owner ∧ slice.interval.Contains location.offset := by
+  cases location with
+  | mk owner offset =>
+    simp only [RustSliceSpec.locations, List.mem_map, List.mem_range, RustSliceSpec.interval,
+      Interval.Contains, ByteLocation.mk.injEq]
+    constructor
+    · rintro ⟨index, valid, rfl, rfl⟩
+      exact ⟨rfl, by omega, by omega⟩
+    · rintro ⟨rfl, lower, upper⟩
+      exact ⟨offset - slice.byteOffset, by omega, rfl, by omega⟩
+
 private def checkRustSliceWhere (s : Core.State) (sl : RustSliceSpec) (permitted : Unit → Bool) : Bool :=
   !sl.isSubBytePacked &&
   decide (0 < sl.elemAlign) &&
@@ -62,8 +77,28 @@ private def RustSliceContract (s : Core.State) (sl : RustSliceSpec) (permitted :
       sl.byteOffset + sl.byteLen ≤ alloc.bytes.length ∧
       permitted)
 
+private def checkCallerViews (s : Core.State) (sl : RustSliceSpec) : Bool :=
+  s.views.all fun view => decide (
+    (view.location.allocation = sl.owner ∧
+      sl.interval.lo ≤ view.location.offset ∧ view.location.offset < sl.interval.hi) →
+    sl.mode = .shared ∧ view.mode = .shared)
+
+private theorem checkCallerViews_correct (s : Core.State) (sl : RustSliceSpec) :
+    checkCallerViews s sl = true ↔ ∀ loc ∈ sl.locations, s.Available loc sl.mode none := by
+  simp only [checkCallerViews, List.all_eq_true, decide_eq_true_eq, State.Available,
+    reduceCtorEq, false_or, RustSliceSpec.mem_locations, Interval.Contains]
+  constructor
+  · intro checked loc inside view member
+    by_cases atView : loc = view.location
+    · subst loc
+      exact .inr (checked view member inside)
+    · exact .inl atView
+  · intro available view member inside
+    exact (available view.location inside view member).resolve_left (fun different => different rfl)
+
+/-- Check each live caller view against the slice's half-open bounds. -/
 def checkRustSlice (s : Core.State) (sl : RustSliceSpec) : Bool :=
-  checkRustSliceWhere s sl fun _ => sl.locations.all fun loc => decide (s.Available loc sl.mode none)
+  checkRustSliceWhere s sl fun _ => checkCallerViews s sl
 
 /-- Independent mathematical Rust C-ABI slice validity contract. -/
 def RustSliceValid (s : Core.State) (sl : RustSliceSpec) : Prop :=
@@ -74,6 +109,39 @@ def checkRustSliceAbi (s : Core.State) (sl : RustSliceSpec) : Bool :=
 
 def RustSliceAbiValid (s : Core.State) (sl : RustSliceSpec) : Prop :=
   RustSliceContract s sl True
+
+private theorem RustSliceContract.mono {s : Core.State} {sl : RustSliceSpec} {p q : Prop}
+    (valid : RustSliceContract s sl p) (imp : p → q) : RustSliceContract s sl q := by
+  obtain ⟨addressable, positive, power, aligned, stride, extent, bounds⟩ := valid
+  refine ⟨addressable, positive, power, aligned, stride, extent, bounds.imp id ?_⟩
+  rintro ⟨allocation, found, fits, permitted⟩
+  exact ⟨allocation, found, fits, imp permitted⟩
+
+theorem RustSliceValid.abi {s : Core.State} {sl : RustSliceSpec}
+    (valid : RustSliceValid s sl) : RustSliceAbiValid s sl :=
+  RustSliceContract.mono valid fun _ => trivial
+
+theorem RustSliceValid.available {s : Core.State} {sl : RustSliceSpec}
+    (valid : RustSliceValid s sl) {location : ByteLocation} (member : location ∈ sl.locations) :
+    s.Available location sl.mode none := by
+  rcases valid.2.2.2.2.2.2 with empty | ⟨_, _, _, available⟩
+  · simp [RustSliceSpec.locations, RustSliceSpec.byteLen, empty] at member
+  · exact available location member
+
+theorem RustSliceAbiValid.with_available {s : Core.State} {sl : RustSliceSpec}
+    (abi : RustSliceAbiValid s sl) (available : ∀ loc ∈ sl.locations, s.Available loc sl.mode none) :
+    RustSliceValid s sl :=
+  RustSliceContract.mono abi fun _ => available
+
+theorem RustSliceAbiValid.byte_initialized {s : Core.State} {sl : RustSliceSpec}
+    (abi : RustSliceAbiValid s sl) {location : ByteLocation} (member : location ∈ sl.locations) :
+    ∃ value, s.byte location = some value := by
+  rcases abi.2.2.2.2.2.2 with empty | ⟨allocation, found, extent, _⟩
+  · simp [RustSliceSpec.locations, RustSliceSpec.byteLen, empty] at member
+  · obtain ⟨owner, _, upper⟩ := (sl.mem_locations location).mp member
+    have inBounds := Nat.lt_of_lt_of_le upper extent
+    exact ⟨allocation.bytes[location.offset], by
+      simp [State.byte, bind, owner, found, List.getElem?_eq_getElem inBounds]⟩
 
 private theorem checkRustSliceWhere_correct (s : Core.State) (sl : RustSliceSpec)
     {test : Unit → Bool} {condition : Prop} (check : test () = true ↔ condition) :
@@ -92,7 +160,7 @@ private theorem checkRustSliceWhere_correct (s : Core.State) (sl : RustSliceSpec
 
 theorem checkRustSlice_correct (s : Core.State) (sl : RustSliceSpec) :
     checkRustSlice s sl = true ↔ RustSliceValid s sl :=
-  checkRustSliceWhere_correct s sl (by simp [List.all_eq_true])
+  checkRustSliceWhere_correct s sl (checkCallerViews_correct s sl)
 
 theorem checkRustSliceAbi_correct (s : Core.State) (sl : RustSliceSpec) :
     checkRustSliceAbi s sl = true ↔ RustSliceAbiValid s sl :=
@@ -107,25 +175,8 @@ theorem rust_empty_slice_valid (s : Core.State) (owner : OwnerId)
   dsimp [RustSliceSpec.byteLen, isizeMax64]
   omega
 
-def RustSliceSpec.interval (slice : RustSliceSpec) : Interval :=
-  ⟨slice.byteOffset, slice.byteOffset + slice.byteLen⟩
-
-theorem RustSliceSpec.mem_locations (slice : RustSliceSpec) (location : ByteLocation) :
-    location ∈ slice.locations ↔ location.allocation = slice.owner ∧ slice.interval.Contains location.offset := by
-  cases location with
-  | mk owner offset =>
-    simp only [RustSliceSpec.locations, List.mem_map, List.mem_range, RustSliceSpec.interval,
-      Interval.Contains, ByteLocation.mk.injEq]
-    constructor
-    · rintro ⟨index, valid, rfl, rfl⟩
-      exact ⟨rfl, by omega, by omega⟩
-    · rintro ⟨rfl, lower, upper⟩
-      exact ⟨offset - slice.byteOffset, by omega, rfl, by omega⟩
-
 /-- Compare allocations and interval endpoints without enumerating the bytes. -/
 def checkRustSlicePairCompatible (a b : RustSliceSpec) : Bool :=
-  letI : Decidable (AccessMode.Compatible a.mode b.mode) :=
-    inferInstanceAs (Decidable (a.mode = .shared ∧ b.mode = .shared))
   decide (a.owner ≠ b.owner) || a.interval.disjoint b.interval ||
     decide (AccessMode.Compatible a.mode b.mode)
 
@@ -134,7 +185,7 @@ def RustSlicesCompatible (a b : RustSliceSpec) : Prop :=
 
 theorem checkRustSlicePairCompatible_correct (a b : RustSliceSpec) :
     checkRustSlicePairCompatible a b = true ↔ RustSlicesCompatible a b := by
-  simp only [checkRustSlicePairCompatible, RustSlicesCompatible, Bool.or_eq_true, Bool.and_eq_true,
+  simp only [checkRustSlicePairCompatible, RustSlicesCompatible, Bool.or_eq_true,
     decide_eq_true_eq, Interval.disjoint_correct, RustSliceSpec.mem_locations]
   constructor
   · rintro ((separate | disjoint) | shared) location ⟨ownerA, inA⟩ ⟨ownerB, inB⟩
@@ -148,6 +199,27 @@ theorem checkRustSlicePairCompatible_correct (a b : RustSliceSpec) :
       · exact .inl (.inr fun index ⟨inA, inB⟩ =>
           shared (compatible ⟨a.owner, index⟩ ⟨rfl, inA⟩ ⟨same, inB⟩))
     · exact .inl (.inl same)
+
+private def checkRustSlicePairs : List RustSliceSpec → Bool
+  | [] => true
+  | head :: tail => tail.all (checkRustSlicePairCompatible head) && checkRustSlicePairs tail
+
+private theorem checkRustSlicePairs_correct (slices : List RustSliceSpec) :
+    checkRustSlicePairs slices = true ↔ slices.Pairwise RustSlicesCompatible := by
+  induction slices with
+  | nil => simp [checkRustSlicePairs]
+  | cons head tail ih =>
+    simp [checkRustSlicePairs, List.all_eq_true, checkRustSlicePairCompatible_correct, List.pairwise_cons, ih]
+
+/-- Reject incompatible ranges before creating their individual byte loans. -/
+def checkRustBorrowPlan (state : Core.State) (slices : List RustSliceSpec) : Bool :=
+  slices.all (checkRustSlice state) && checkRustSlicePairs slices
+
+theorem checkRustBorrowPlan_correct (state : Core.State) (slices : List RustSliceSpec) :
+    checkRustBorrowPlan state slices = true ↔
+      (∀ slice ∈ slices, RustSliceValid state slice) ∧ slices.Pairwise RustSlicesCompatible := by
+  simp only [checkRustBorrowPlan, Bool.and_eq_true, List.all_eq_true,
+    checkRustSlice_correct, checkRustSlicePairs_correct]
 
 theorem rust_disjoint_soa_columns_mut_compatible (owner : OwnerId) (length f1 f2 : Nat)
     (hNe : f1 ≠ f2) :

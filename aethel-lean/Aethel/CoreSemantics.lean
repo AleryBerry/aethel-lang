@@ -26,6 +26,17 @@ inductive Step : State → CoreExpr → State → CoreExpr → Prop where
   | snd_val {s : State} {a b : CoreExpr} :
       Value a → Value b →
       Step s (.snd (.pair a b)) s b
+  -- Sums
+  | inject_eval {s s' : State} (left : Bool) (variants : CoreType × CoreType) {p p' : CoreExpr} :
+      Step s p s' p' → Step s (.inject left variants p) s' (.inject left variants p')
+  | sum_eval {s s' : State} {input input' : CoreExpr} (binder : Nat) {onLeft onRight : CoreExpr} :
+      Step s input s' input' →
+      Step s (.matchSum input binder onLeft onRight) s' (.matchSum input' binder onLeft onRight)
+  | sum_select {s : State} (left : Bool) (variants : CoreType × CoreType) (binder : Nat)
+      {payload onLeft onRight : CoreExpr} :
+      Value payload →
+      Step s (.matchSum (.inject left variants payload) binder onLeft onRight) s
+        (.letBind binder payload (if left then onLeft else onRight))
   -- ADTs
   | adt_eval {s s' : State} (tag : Nat) {p p' : CoreExpr} :
       Step s p s' p' →
@@ -67,25 +78,7 @@ inductive Step : State → CoreExpr → State → CoreExpr → Prop where
 
 theorem step_val_impossible {s s' : State} {e e' : CoreExpr}
     (h : Step s e s' e') (hVal : Value e) : False := by
-  induction h with
-  | pair_left _ _ => cases hVal; rename_i ha _; contradiction
-  | pair_right _ _ _ => cases hVal; rename_i _ hb; contradiction
-  | fst_eval _ _ => cases hVal
-  | fst_val _ _ => cases hVal
-  | snd_eval _ _ => cases hVal
-  | snd_val _ _ => cases hVal
-  | adt_eval _ _ _ => cases hVal; rename_i hp; contradiction
-  | match_eval _ _ => cases hVal
-  | match_hit _ _ => cases hVal
-  | match_miss _ _ _ _ => cases hVal
-  | match_bool_true => cases hVal
-  | match_bool_false => cases hVal
-  | let_eval _ _ _ => cases hVal
-  | let_subst _ _ => cases hVal
-  | app_fn _ _ => cases hVal
-  | app_arg _ _ _ => cases hVal
-  | app_beta _ _ _ _ _ => cases hVal
-  | loop_step => cases hVal
+  induction h <;> cases hVal <;> contradiction
 
 theorem canonical_bool {v : CoreExpr} (hVal : Value v) {eff : Effect}
     (hTyped : WellTyped [] v .bool eff) :
@@ -98,6 +91,7 @@ theorem canonical_bool {v : CoreExpr} (hVal : Value v) {eff : Effect}
   | lam _ _ _ _ => cases hTyped
   | pair _ _ => cases hTyped
   | adt _ _ => cases hTyped
+  | inject _ _ _ => cases hTyped
 
 theorem canonical_nat {v : CoreExpr} (hVal : Value v) {eff : Effect}
     (hTyped : WellTyped [] v .nat eff) :
@@ -110,6 +104,7 @@ theorem canonical_nat {v : CoreExpr} (hVal : Value v) {eff : Effect}
   | lam _ _ _ _ => cases hTyped
   | pair _ _ => cases hTyped
   | adt _ _ => cases hTyped
+  | inject _ _ _ => cases hTyped
 
 theorem canonical_int {v : CoreExpr} (hVal : Value v) {s : Bool} {bits : Nat} {eff : Effect}
     (hTyped : WellTyped [] v (.int s bits) eff) :
@@ -124,6 +119,7 @@ theorem canonical_int {v : CoreExpr} (hVal : Value v) {s : Bool} {bits : Nat} {e
   | lam _ _ _ _ => cases hTyped
   | pair _ _ => cases hTyped
   | adt _ _ => cases hTyped
+  | inject _ _ _ => cases hTyped
 
 theorem canonical_prod {v : CoreExpr} (hVal : Value v) {tyA tyB : CoreType} {eff : Effect}
     (hTyped : WellTyped [] v (.prod tyA tyB) eff) :
@@ -138,6 +134,14 @@ theorem canonical_prod {v : CoreExpr} (hVal : Value v) {tyA tyB : CoreType} {eff
   | int _ _ _ => cases hTyped
   | lam _ _ _ _ => cases hTyped
   | adt _ _ => cases hTyped
+  | inject _ _ _ => cases hTyped
+
+theorem canonical_sum {v : CoreExpr} (ready : Value v) {left right : CoreType} {effect : Effect}
+    (typed : WellTyped [] v (.sum left right) effect) :
+    ∃ side variants payload, v = .inject side variants payload ∧ Value payload := by
+  cases ready with
+  | inject side variants ready => exact ⟨side, variants, _, rfl, ready⟩
+  | _ => cases typed
 
 theorem canonical_adt {v : CoreExpr} (hVal : Value v) {tag : Nat} {tyP : CoreType} {eff : Effect}
     (hTyped : WellTyped [] v (.adt tag tyP) eff) :
@@ -152,6 +156,7 @@ theorem canonical_adt {v : CoreExpr} (hVal : Value v) {tag : Nat} {tyP : CoreTyp
   | int _ _ _ => cases hTyped
   | lam _ _ _ _ => cases hTyped
   | pair _ _ => cases hTyped
+  | inject _ _ _ => cases hTyped
 
 theorem canonical_arrow {v : CoreExpr} (hVal : Value v) {dom cod : CoreType} {effBody : Effect} {eff : Effect}
     (hTyped : WellTyped [] v (.arrow dom cod effBody) eff) :
@@ -166,6 +171,7 @@ theorem canonical_arrow {v : CoreExpr} (hVal : Value v) {dom cod : CoreType} {ef
   | int _ _ _ => cases hTyped
   | pair _ _ => cases hTyped
   | adt _ _ => cases hTyped
+  | inject _ _ _ => cases hTyped
 
 theorem Step.deterministic {s s1 s2 : State} {e e1 e2 : CoreExpr}
     (h1 : Step s e s1 e1) (h2 : Step s e s2 e2) : s1 = s2 ∧ e1 = e2 := by
@@ -220,6 +226,21 @@ theorem Step.deterministic {s s1 s2 : State} {e e1 e2 : CoreExpr}
       contradiction
     | snd_val _ _ =>
       exact ⟨rfl, rfl⟩
+  | inject_eval side variants stepped ih =>
+    cases h2 with
+    | inject_eval _ _ again =>
+      obtain ⟨rfl, rfl⟩ := ih again
+      exact ⟨rfl, rfl⟩
+  | sum_eval binder stepped ih =>
+    cases h2 with
+    | sum_eval _ again =>
+      obtain ⟨rfl, rfl⟩ := ih again
+      exact ⟨rfl, rfl⟩
+    | sum_select side variants _ ready => exact (step_val_impossible stepped (.inject side variants ready)).elim
+  | sum_select side variants binder ready =>
+    cases h2 with
+    | sum_eval _ stepped => exact (step_val_impossible stepped (.inject side variants ready)).elim
+    | sum_select => exact ⟨rfl, rfl⟩
   | adt_eval tag hrec ih =>
     cases h2 with
     | adt_eval _ hrec2 =>

@@ -1,0 +1,8 @@
+import Character
+fn main() -> u8 {
+  let mut c = Character { x: 5, y: 5, };
+  view exclusive item = c.x {
+    item = 0;
+  };
+  c.y
+}

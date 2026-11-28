@@ -1,0 +1,8 @@
+type Tagged { Left(u35), Right(u35), }
+type Row { tagged: Tagged, guard: u5, }
+
+fn main() -> u35 {
+  let mut row = Row { tagged: Left(1), guard: 29, };
+  row.tagged = Right(34359738367);
+  row.tagged as Left[0]
+}

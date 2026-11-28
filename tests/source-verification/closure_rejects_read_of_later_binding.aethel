@@ -1,0 +1,5 @@
+fn main() -> u8 {
+  let load = fn(arg: u8) { later };
+  let later = 31;
+  load(0)
+}

@@ -1,0 +1,11 @@
+type Pair { first: u8, result: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { first: 12, result: 0, };
+  view exclusive parent = pair.first {
+    view shared child = parent {
+      let _ = child;
+    };
+    pair.result = child;
+  };
+  pair.result
+}

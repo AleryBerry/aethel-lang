@@ -1,0 +1,84 @@
+import std/vec
+
+type Entity {
+  f0: u1,
+  f1: u1,
+  f2: u1,
+  f3: u1,
+  f4: u1,
+  f5: u1,
+  f6: u1,
+  f7: u1,
+  team: u4,
+  role: u4,
+  hp: u16,
+  x: f32,
+  y: f32,
+}
+
+pub fn main() -> i32 {
+  let n: u64 = 2000000
+  let passes: u64 = 25
+  let mut entities: Vec(Entity) = vec.with_capacity(n)
+
+  let mut fx: f32 = 0.0
+  let mut team: u4 = 0
+  let mut role: u4 = 0
+  let mut hp_off: u16 = 0
+  for i in 0..2000000 {
+    let f0 = if (i & 1) == 0 { 1 as u1 } else { 0 as u1 }
+    let f1 = if (i & 2) != 0 { 1 as u1 } else { 0 as u1 }
+    let hp = (100 as u16) +% hp_off
+    vec.push(entities, Entity {
+      f0: f0,
+      f1: f1,
+      f2: 0,
+      f3: 1,
+      f4: 0,
+      f5: 0,
+      f6: 1,
+      f7: 0,
+      team: team,
+      role: role,
+      hp: hp,
+      x: fx,
+      y: fx + 1.0,
+    })
+    team = team +% 1
+    if team == 0 {
+      role = role +% 1
+    }
+    hp_off = hp_off +% 1
+    if hp_off == 256 {
+      hp_off = 0
+    }
+    fx = fx + 0.25
+    if fx >= 1024.0 {
+      fx = 0.0
+    }
+  }
+
+  let slice = vec.as_mut_slice(entities)
+  let mut sum: u64 = 0
+  for p in 0..25 {
+    let pu = p as u64
+    for i in 0..slice.len {
+      let mut e = slice[i]
+      let next_f0 = if e.f0 == 1 { 0 as u1 } else { 1 as u1 }
+      e.f0 = next_f0
+      if next_f0 == 1 {
+        e.hp = e.hp +% 1
+        let h64 = e.hp as u64
+        let t64 = e.team as u64
+        sum = sum +% (h64 +% t64 +% pu)
+      } else {
+        let r64 = e.role as u64
+        sum = sum +% r64
+      }
+      slice[i] = e
+    }
+  }
+
+  println("w1_aethel checksum=", sum)
+  0
+}

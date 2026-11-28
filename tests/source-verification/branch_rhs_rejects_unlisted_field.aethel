@@ -1,0 +1,9 @@
+type Pair { left: u8, right: u8, }
+fn gate(pair: Pair ~>.{left}) {
+  if pair.left < pair.right { pair.left = 9; } else { };
+}
+fn main() -> u8 {
+  let mut pair = Pair { left: 33, right: 41, };
+  gate(pair);
+  pair.left
+}

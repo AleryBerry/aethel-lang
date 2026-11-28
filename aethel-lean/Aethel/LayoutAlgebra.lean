@@ -62,6 +62,22 @@ def padding (offset alignment : Nat) : Nat :=
 
 def alignUp (offset alignment : Nat) : Nat := offset + padding offset alignment
 
+/-- Concatenating two bounded codes, with the low code first, fits their combined width. -/
+theorem concatCode_fits {low high lowWidth highWidth : Nat}
+    (lowFits : low < 2 ^ lowWidth) (highFits : high < 2 ^ highWidth) :
+    low + high * 2 ^ lowWidth < 2 ^ (lowWidth + highWidth) := by
+  have bound := Nat.mul_le_mul_right (2 ^ lowWidth) (Nat.succ_le_of_lt highFits)
+  rw [Nat.succ_mul] at bound
+  rw [Nat.pow_add, Nat.mul_comm (2 ^ lowWidth)]
+  omega
+
+theorem concatCode_split {low high lowWidth : Nat} (lowFits : low < 2 ^ lowWidth) :
+    (low + high * 2 ^ lowWidth) % 2 ^ lowWidth = low ∧
+      (low + high * 2 ^ lowWidth) / 2 ^ lowWidth = high := by
+  constructor
+  · rw [Nat.add_mul_mod_self_right, Nat.mod_eq_of_lt lowFits]
+  · rw [Nat.add_mul_div_right _ _ (Nat.two_pow_pos _), Nat.div_eq_of_lt lowFits, Nat.zero_add]
+
 theorem padding_lt (offset : Nat) {alignment : Nat} (h : 0 < alignment) :
     padding offset alignment < alignment := by
   exact Nat.mod_lt _ h

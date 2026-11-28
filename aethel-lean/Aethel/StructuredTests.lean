@@ -93,6 +93,52 @@ private def observeWord (expected : UInt16) : RawCode :=
   .branch (.uint16Eq (.var 0) (.uint16 expected))
     (writeAndRead 1 (.byte 8)) (writeAndRead 1 (.byte 9))
 
+private def borrowIndexedBytes (left right : Functional.Term ctx .byte) : Code ctx :=
+  .selectByte left fun first =>
+    .instruction (.reserve 0 first.val .exclusive) (.selectByte right fun second =>
+      .instruction (.reserve 1 second.val .exclusive)
+        (.instruction (.readView 0) (.instruction (.readView 1)
+          (.instruction (.release 1) (.instruction (.release 0) .finish)))))
+
+private def withIndexBounds (left right : Functional.Term ctx .byte) (body : Code ctx) : Code ctx :=
+  .branch (.byteLt left (.byte 2)) (.branch (.byteLt right (.byte 2)) body .finish) .finish
+
+private def runIndexedFacts : IO Unit := do
+  let some initial := Core.run {} [.alloc 0 [10, 20], .alias 0 0 0 .exclusive, .alias 1 0 1 .exclusive] |
+    throw (IO.userError "cannot set up indexed byte reservations")
+  let left : Functional.Term [.byte, .byte] .byte := .var (.there .here)
+  let right : Functional.Term [.byte, .byte] .byte := .var .here
+  let unknown : BranchFacts [.byte, .byte] := []
+  let limited := (unknown.learn (.byteLt left (.byte 3)) true).learn (.byteLt left (.byte 1)) false
+  unless (limited.byteCandidates left).map Fin.val == [1, 2] do
+    throw (IO.userError "byte dispatch should enumerate the intersection of captured bounds")
+  let maximum := unknown.learn (.byteEq left (.byte 255)) true
+  unless (maximum.byteCandidates left).map Fin.val == [255] do
+    throw (IO.userError "the upper bound on an exact byte must admit 255")
+  unless (limited.learn (.byteEq left (.byte 4)) true |>.byteCandidates left).isEmpty do
+    throw (IO.userError "contradictory captured bounds should admit no byte candidates")
+  let different := Code.branch (.byteEq right left) .finish (borrowIndexedBytes left right)
+  let guarded := withIndexBounds left right different
+  unless check initial.resources guarded do
+    throw (IO.userError "in-bounds unequal indices should permit both exclusive reservations")
+  if check initial.resources (withIndexBounds left right (borrowIndexedBytes left right)) then
+    throw (IO.userError "in-bounds indices can still overlap without a disequality")
+  if check initial.resources different then
+    throw (IO.userError "unequal byte indices can still be out of bounds")
+  let outer : Functional.Term [.byte, .byte, .byte] .byte := .var (.there (.there .here))
+  let fresh : Functional.Term [.byte, .byte, .byte] .byte := .var .here
+  let stale := withIndexBounds left right (.branch (.byteEq right left) .finish
+    (.letValue left (withIndexBounds outer fresh (borrowIndexedBytes outer fresh))))
+  if check initial.resources stale then
+    throw (IO.userError "index disequality must not apply to a newly captured index")
+  for (a, b, expected) in ([(0, 1, [10, 20]), (1, 0, [20, 10]), (1, 1, []), (0, 2, [])] :
+      List (UInt8 × UInt8 × List UInt8)) do
+    let env := (Functional.Env.empty.extend (ty := .byte) a).extend (ty := .byte) b
+    let some (_, final) := runCode env initial guarded |
+      throw (IO.userError "checked indexed reservations did not execute")
+    if final.observations.reverse != expected || !final.views.isEmpty then
+      throw (IO.userError "the guarded indexed path selected the wrong bytes or leaked a view")
+
 def runWideAndFacts : IO Unit := do
   expectObservations "UInt16 load uses little-endian byte order"
     (twoBytes (.readUInt16LE (.handle 0) (.handle 1) (observeWord 513))) [1, 2, 1, 8]
@@ -170,6 +216,7 @@ def runWideAndFacts : IO Unit := do
       (.branch (.uint16Lt (.var 0) (.uint16 500))
         .finish
         (.branch (.uint16Lt (.var 0) (.uint16 300)) invalid (writeAndRead 1 (.byte 88)))))) [1, 2, 1, 88]
-  IO.println "20 wide-load and branch-fact regressions passed"
+  runIndexedFacts
+  IO.println "20 wide-load and branch-fact regressions plus guarded index regressions passed"
 
 end Aethel.Structured.Tests

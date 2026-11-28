@@ -1,0 +1,13 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 2, right: 20, };
+  for _ in 0..pair.left {
+    pair.left = 0;
+    if pair.right == 20 {
+      pair.right = 21;
+    } else {
+      pair.right = 22;
+    };
+  };
+  pair.right
+}

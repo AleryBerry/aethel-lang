@@ -1,0 +1,6 @@
+fn main() -> u8 {
+  case Ok(61): Result(u8, bool) {
+    Ok(value) -> value
+    Err(flag) -> flag
+  }
+}

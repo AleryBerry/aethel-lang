@@ -96,6 +96,7 @@ theorem AccessTarget.check_value (target : AccessTarget) (state : ResourceState)
 can reach a different final heap, but all terminal paths must close views. -/
 inductive Code : List Ty → Type where
   | finish : Code ctx
+  | unreachable : Code ctx
   | instruction : Instruction → Code ctx → Code ctx
   | read : AccessTarget → Code (.byte :: ctx) → Code ctx
   | readUInt16LE : AccessTarget → AccessTarget → Code (.uint16 :: ctx) → Code ctx
@@ -105,6 +106,9 @@ inductive Code : List Ty → Type where
   | letValue : Term ctx ty → Code (ty :: ctx) → Code ctx
   | branch : Term ctx .bool → Code ctx → Code ctx → Code ctx
   | selectByte : Term ctx .byte → (Fin 256 → Code ctx) → Code ctx
+
+def Code.prepend (steps : Program) (rest : Code ctx) : Code ctx :=
+  steps.foldr .instruction rest
 
 inductive RawCode where
   | finish
@@ -144,6 +148,7 @@ def elaborate (ctx : List Ty) : RawCode → Except TypeError (Code ctx)
 infeasible arm. Heap contents are never available to this checker. -/
 def checkWithFacts (state : ResourceState) (facts : BranchFacts ctx) : Code ctx → Bool
   | .finish => state.views.isEmpty
+  | .unreachable => false
   | .instruction instruction next =>
     (checkInstruction state instruction).any fun s => checkWithFacts s facts next
   | .read target body =>
@@ -166,8 +171,25 @@ def checkWithFacts (state : ResourceState) (facts : BranchFacts ctx) : Code ctx 
   | .branch condition yes no =>
     facts.checkArms condition (fun known => checkWithFacts state known yes)
       (fun known => checkWithFacts state known no)
-  | .selectByte _ arms =>
-    (List.finRange 256).all fun i => checkWithFacts state facts (arms i)
+  | .selectByte term arms =>
+    (facts.byteCandidates term).all fun index =>
+      match facts.byteCase term index with
+      | none => true
+      | some chosen => checkWithFacts state chosen (arms index)
+
+theorem check_selectByte {state : ResourceState} {facts : BranchFacts ctx} {term : Term ctx .byte}
+    {arms : Fin 256 → Code ctx} :
+    checkWithFacts state facts (.selectByte term arms) = true ↔
+      ∀ index ∈ facts.byteCandidates term, ∀ chosen, facts.byteCase term index = some chosen →
+        checkWithFacts state chosen (arms index) = true := by
+  simp only [checkWithFacts, List.all_eq_true]
+  constructor
+  · intro checked index candidate chosen found
+    simpa only [found] using checked index candidate
+  · intro checked index candidate
+    cases found : facts.byteCase term index with
+    | none => rfl
+    | some chosen => exact checked index candidate chosen found
 
 def check (state : ResourceState) (code : Code ctx) : Bool :=
   checkWithFacts state [] code
@@ -176,6 +198,7 @@ def check (state : ResourceState) (code : Code ctx) : Bool :=
 operations selected by values computed during execution. -/
 def runCode (env : Env ctx) (state : State) : Code ctx → Option (Program × State)
   | .finish => some ([], state)
+  | .unreachable => none
   | .instruction instruction next => do
     let middle ← execute state instruction
     let (steps, final) ← runCode env middle next
@@ -247,6 +270,45 @@ inductive Executes : Env ctx → State → Code ctx → Program → State → Pr
   | selectByte : Evaluates env term value → Executes env state (arms value.toFin) steps final →
       Executes env state (.selectByte term arms) steps final
 
+theorem Executes.branch_selected {env : Env ctx} {state final : State} {trace : Program}
+    {test : Term ctx .bool} {yes no : Code ctx}
+    (ran : Executes env state (.branch test yes no) trace final) :
+    Executes env state (if test.eval env then yes else no) trace final := by
+  cases ran with
+  | branchTrue observed ran => simpa only [observed.agrees, ite_true] using ran
+  | branchFalse observed ran => simpa only [observed.agrees, Bool.false_eq_true, ite_false] using ran
+
+/-- A literal selector needs only its selected arm in the lowered code. -/
+def Code.dispatchByte (selector : Term ctx .byte) (arms : Fin 256 → Code ctx) : Code ctx :=
+  match selector with
+  | .byte value => arms value.toFin
+  | _ => .selectByte selector arms
+
+theorem Code.dispatchByte_correct {selector : Term ctx .byte} {arms : Fin 256 → Code ctx}
+    {env : Env ctx} {state final : State} {trace : Program} :
+    Executes env state (Code.dispatchByte selector arms) trace final ↔
+      Executes env state (arms (selector.eval env : UInt8).toFin) trace final := by
+  unfold dispatchByte
+  split
+  · rfl
+  · constructor
+    · intro ran
+      cases ran with
+      | selectByte observed rest => exact observed.agrees ▸ rest
+    · intro ran
+      exact .selectByte (selector.evaluates env) ran
+
+theorem Executes.prepend_split {env : Env ctx} {state final : State} {rest : Code ctx} {trace : Program}
+    (entry : Program) (ran : Executes env state (Code.prepend entry rest) trace final) :
+    ∃ entered suffix, trace = entry ++ suffix ∧ Runs state entry entered ∧ Executes env entered rest suffix final := by
+  induction entry generalizing state trace with
+  | nil => exact ⟨state, trace, rfl, .nil, ran⟩
+  | cons instruction pending ih =>
+    cases ran with
+    | instruction stepped continued =>
+      obtain ⟨entered, suffix, rfl, kernel, tail⟩ := ih continued
+      exact ⟨entered, suffix, rfl, .cons stepped kernel, tail⟩
+
 inductive CheckError where
   | illTyped (error : TypeError)
   | invalidResources
@@ -308,6 +370,7 @@ theorem runCode_sound {env : Env ctx} {state final : State} {code : Code ctx} {s
   | finish =>
     cases ran
     exact .finish
+  | unreachable => contradiction
   | instruction instruction next ih =>
     simp only [runCode, bind, pure, Option.bind_eq_some_iff, Prod.exists, Option.some.injEq,
       Prod.mk.injEq] at ran
@@ -375,6 +438,7 @@ theorem checkWithFacts_executes (code : Code ctx) (env : Env ctx) (state : State
     ∃ steps final, Executes env state code steps final ∧ final.views = [] := by
   induction code generalizing state with
   | finish => exact ⟨[], state, .finish, List.isEmpty_iff.mp checked⟩
+  | unreachable => contradiction
   | instruction _ _ ih =>
     obtain ⟨middle, first, rest⟩ := checked_step checked
     obtain ⟨steps, final, remaining, closed⟩ := ih env middle facts validFacts rest
@@ -443,10 +507,9 @@ theorem checkWithFacts_executes (code : Code ctx) (env : Env ctx) (state : State
       exact ⟨steps, final, .branchTrue (h ▸ condition.evaluates env) remaining, closed⟩
   | selectByte term arms ih =>
     let value : UInt8 := term.eval env
-    have valid : (List.finRange 256).all (fun i => checkWithFacts state.resources facts (arms i)) = true :=
-      checked
-    obtain ⟨steps, final, remaining, closed⟩ := ih value.toFin env state facts validFacts
-      (List.all_eq_true.mp valid _ (List.mem_finRange _))
+    obtain ⟨chosen, found, valid⟩ := BranchFacts.byteCase_reachable validFacts term
+    obtain ⟨steps, final, remaining, closed⟩ := ih value.toFin env state chosen valid
+      (check_selectByte.mp checked value.toFin (BranchFacts.byteCandidates_contains validFacts term) chosen found)
     exact ⟨steps, final, .selectByte (term.evaluates env) remaining, closed⟩
 
 theorem check_executes (code : Code ctx) (env : Env ctx) (state : State)
@@ -454,21 +517,28 @@ theorem check_executes (code : Code ctx) (env : Env ctx) (state : State)
     ∃ steps final, Executes env state code steps final ∧ final.views = [] :=
   checkWithFacts_executes code env state [] (by intro fact member; cases member) checked
 
+theorem Executes.prefix_safe {code : Code []} {first rest : Program} {final : State}
+    (execution : Executes Env.empty {} code (first ++ rest) final) (closed : final.views = []) :
+    ∃ middle, Runs {} first middle ∧ Runs middle rest final ∧ final.views = [] ∧
+      middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible := by
+  obtain ⟨middle, initial, remaining, owners, live, views⟩ := execution.trace.prefix_safe
+  exact ⟨middle, initial, remaining, closed, owners, live, views⟩
+
+theorem checked_prefix_safe {code : Code []} {first rest : Program}
+    {final : State} (accepted : check {} code = true)
+    (execution : Executes Env.empty {} code (first ++ rest) final) :
+    ∃ middle, Runs {} first middle ∧ Runs middle rest final ∧ final.views = [] ∧
+      middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible := by
+  obtain ⟨_, checkedFinal, verified, closed⟩ := check_executes code Env.empty {} accepted
+  have same : final = checkedFinal := congrArg Prod.snd (Option.some.inj (execution.agrees.symm.trans verified.agrees))
+  exact execution.prefix_safe (same ▸ closed)
+
 theorem verified_prefix_safe {source : RawCode} {code : Code []} {first rest : Program}
     {final : State} (accepted : verify source = .ok code)
     (execution : Executes Env.empty {} code (first ++ rest) final) :
     ∃ middle, Runs {} first middle ∧ Runs middle rest final ∧ final.views = [] ∧
-      middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible := by
-  obtain ⟨steps, verifiedFinal, verified, closed⟩ :=
-    check_executes code Env.empty {} (verify_checked accepted)
-  have same := Option.some.inj (verified.agrees.symm.trans execution.agrees)
-  have sameFinal : verifiedFinal = final := congrArg Prod.snd same
-  have finalClosed : final.views = [] := sameFinal ▸ closed
-  have traceVerified := (verifyResources_correct _).mpr ⟨final, execution.trace, finalClosed⟩
-  obtain ⟨middle, _, initial, _, _, owners, live, views⟩ := Core.verified_prefix_safe traceVerified
-  have executed := run_complete execution.trace
-  rw [run_append, run_complete initial] at executed
-  exact ⟨middle, initial, run_sound executed, finalClosed, owners, live, views⟩
+      middle.OwnersValid ∧ middle.ReferencesLive ∧ middle.ViewsCompatible :=
+  checked_prefix_safe (verify_checked accepted) execution
 
 theorem executeClosed_total {source : RawCode} {code : Code []}
     (accepted : verify source = .ok code) :

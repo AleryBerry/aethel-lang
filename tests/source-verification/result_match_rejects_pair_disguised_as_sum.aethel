@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let tagged = (true, 48);
+  case tagged {
+    Ok(value) -> value
+    Err(reason) -> 0
+  }
+}

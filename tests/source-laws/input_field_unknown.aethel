@@ -1,0 +1,3 @@
+law bounds_result(row: Pair) {
+  always limit(row) <= row.absent
+}

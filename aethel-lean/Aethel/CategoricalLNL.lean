@@ -384,7 +384,7 @@ theorem recordLeafLens_get_put {size : Nat} (field : IntegerField size) (img : I
     field.set img (field.get img) = img := by
   apply image_ext_bits
   intro idx hIdx
-  dsimp [IntegerField.set, IntegerField.get]
+  simp only [IntegerField.set, IntegerField.get, Image.writeBytes_refines]
   rw [Image.bit_write _ _ _ idx hIdx]
   split
   · rename_i hRange
@@ -397,7 +397,7 @@ theorem recordLeafLens_put_put {size : Nat} (field : IntegerField size) (img : I
     field.set (field.set img v1) v2 = field.set img v2 := by
   apply image_ext_bits
   intro idx hIdx
-  dsimp [IntegerField.set]
+  simp only [IntegerField.set, Image.writeBytes_refines]
   rw [Image.bit_write _ _ _ idx hIdx, Image.bit_write _ _ _ idx hIdx,
     Image.bit_write _ _ _ idx hIdx]
   split
@@ -415,7 +415,7 @@ theorem recordLeafLens_disjoint_commute {abi : TargetIntegerABI} {schema : Schem
   have hSep := leaf_paths_separate planned h1 h2 hDiff
   apply image_ext_bits
   intro idx hIdx
-  dsimp [IntegerField.set]
+  simp only [IntegerField.set, Image.writeBytes_refines]
   rw [Image.bit_write _ _ _ idx hIdx, Image.bit_write _ _ _ idx hIdx,
     Image.bit_write _ _ _ idx hIdx, Image.bit_write _ _ _ idx hIdx]
   by_cases hIn1 : f1.offset ≤ idx ∧ idx < f1.offset + f1.kind.bits <;>

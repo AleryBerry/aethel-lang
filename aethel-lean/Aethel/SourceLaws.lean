@@ -397,6 +397,9 @@ structure CheckedReturnLaw (mir : SourceMIR) (law : ReturnLaw) where
   declaration : bound.law = law
   verdict : ReturnLawVerdict bound
 
+def CheckedReturnLaw.emptyPremise (result : CheckedReturnLaw mir law) : Bool :=
+  result.bound.guard.domains.any List.isEmpty
+
 private def checkReturnLaw {input : String} (accepted : Verified input) (budget : Nat) (law : ReturnLaw) :
     Except ReturnLawError (CheckedReturnLaw accepted.mir law) := do
   let bound ← bindReturnLaw accepted law

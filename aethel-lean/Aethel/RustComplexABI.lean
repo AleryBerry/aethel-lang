@@ -1,6 +1,7 @@
 import Aethel.LayoutAlgebra
 import Aethel.CacheLayout
 import Aethel.RustFFI
+import Aethel.AutomaticLayout
 
 namespace Aethel.RustComplexABI
 
@@ -50,6 +51,52 @@ def planFlatStruct (fields : List FlatFieldSpec) : RecordLayout :=
   let structAlign := maxFieldAlign fields
   let totalSize := alignUp rawEnd structAlign
   { size := totalSize, alignment := structAlign, fields := placed }
+
+private def flatPlacement (field : AutomaticLayout.Field) : FieldPlacement :=
+  ⟨field.1.byteOffset, field.2.size, field.2.alignment⟩
+
+private theorem placeFlatFields_of_declaration {cursor ending : Nat}
+    {placed : List AutomaticLayout.Field} {fields : List FlatFieldSpec}
+    (ordered : AutomaticLayout.DeclarationSlots cursor placed ending)
+    (same : fields.map (fun f => (f.size, f.alignment)) = placed.map (fun f => (f.2.size, f.2.alignment))) :
+    placeFlatFields cursor fields = (placed.map flatPlacement, ending) := by
+  induction ordered generalizing fields with
+  | nil =>
+    have empty := List.map_eq_nil_iff.mp same
+    subst fields
+    rfl
+  | cons ordered ih =>
+    cases fields with
+    | nil => simp at same
+    | cons first rest =>
+      simp only [List.map_cons, List.cons.injEq, Prod.mk.injEq] at same
+      obtain ⟨⟨size, alignment⟩, children⟩ := same
+      simp only [placeFlatFields, size, alignment, ih children, flatPlacement, List.map_cons]
+
+private theorem foldl_flatFieldAlign (fields : List FlatFieldSpec) (initial : Nat)
+    (positive : 1 ≤ initial) :
+    fields.foldl (fun align f => max align f.alignment) initial = max initial (maxFieldAlign fields) := by
+  induction fields generalizing initial with
+  | nil => simp [maxFieldAlign, Nat.max_eq_left positive]
+  | cons field _ ih =>
+    rw [List.foldl_cons, maxFieldAlign, ih _ (Nat.le_trans positive (Nat.le_max_left _ _)),
+      Nat.max_assoc]
+
+theorem planFlatStruct_matches {size align : Nat} {placed : List AutomaticLayout.Field}
+    (fields : List FlatFieldSpec) (flat : (AutomaticLayout.Layout.record size align placed).FlatTree)
+    (same : fields.map (fun f => (f.size, f.alignment)) = placed.map (fun f => (f.2.size, f.2.alignment))) :
+    planFlatStruct fields = ⟨size, align, placed.map (fun f => ⟨f.1.byteOffset, f.2.size, f.2.alignment⟩)⟩ := by
+  cases flat with
+  | record ordered alignment stride _ =>
+    have sameAlign := congrArg (List.foldl (fun a (f : Nat × Nat) => max a f.2) 1) same
+    simp only [List.foldl_map, foldl_flatFieldAlign fields 1 (by decide)] at sameAlign
+    have positive : 1 ≤ maxFieldAlign fields := by
+      clear same sameAlign
+      induction fields with
+      | nil => decide
+      | cons _ _ ih => exact Nat.le_trans ih (Nat.le_max_right _ _)
+    rw [Nat.max_eq_right positive, ← alignment] at sameAlign
+    simp [planFlatStruct, placeFlatFields_of_declaration ordered same, sameAlign, stride, flatPlacement]
 
 private theorem placeFlatFields_mono (curOffset : Nat) (fields : List FlatFieldSpec) :
     curOffset ≤ (placeFlatFields curOffset fields).2 := by

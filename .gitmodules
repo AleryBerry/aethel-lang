@@ -1,3 +1,6 @@
 [submodule "tree-sitter-aethel"]
 	path = tree-sitter-aethel
 	url = https://github.com/AleryBerry/tree-sitter-aethel.git
+[submodule "aethel-website"]
+	path = aethel-website
+	url = https://github.com/AleryBerry/aethel-website.git

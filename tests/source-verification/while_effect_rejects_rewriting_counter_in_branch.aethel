@@ -1,0 +1,9 @@
+type Meter { remaining: u8, active: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { remaining: 25, active: 1, };
+  while meter.remaining > 0 decreases meter.remaining {
+    meter.remaining = meter.remaining -| 8;
+    if meter.active == 1 { meter.remaining = 25; } else { let _ = meter.remaining; };
+  };
+  meter.remaining
+}

@@ -4,9 +4,9 @@ type Pair {
 }
 
 fn main() -> u8 {
-  let mut pair = Pair { left: 17u8, right: 23u8, };
+  let mut pair = Pair { left: 17, right: 23, };
   view shared held = pair.left {
-    pair.left = 29u8;
+    pair.left = 29;
     let _ = held;
   };
   pair.left

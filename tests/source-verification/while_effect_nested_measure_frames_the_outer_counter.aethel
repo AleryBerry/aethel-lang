@@ -1,0 +1,13 @@
+type Meter { outer: u8, inner: u8, work: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { outer: 10, inner: 0, work: 20, };
+  while meter.outer > 0 decreases meter.outer {
+    meter.outer = meter.outer -| 3;
+    meter.inner = 5;
+    while meter.inner > 0 decreases meter.inner {
+      meter.inner = meter.inner -| 2;
+      meter.work = meter.work -| 1;
+    };
+  };
+  meter.work
+}

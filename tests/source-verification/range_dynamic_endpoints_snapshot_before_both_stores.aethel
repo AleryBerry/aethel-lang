@@ -1,0 +1,10 @@
+type Meter { first: u8, last: u8, total: u8, }
+fn main() -> u8 {
+  let mut meter = Meter { first: 2, last: 5, total: 26, };
+  for _ in meter.first..meter.last {
+    meter.first = 99;
+    meter.last = 0;
+    meter.total = meter.total -| 3;
+  };
+  meter.total
+}

@@ -166,9 +166,9 @@ test "comments, CRLF doc comments, and comment at EOF" {
     try expectTokens("////", &.{.{ .module_doc_comment, "////" }});
 }
 
-test "numbers, ranges, method calls, hex exponent trap, and arbitrary-width typed suffixes" {
+test "numbers, ranges, method calls, hex exponent trap, and suffix-free literals" {
     try expectTokens(
-        "0..10 1..=5 10.to_u8 0x10e2 0b1010_0101u8 0o755_u16 0xff_u12 1_000_000i64 42i7 7_u3 1_u9 1_u65535 3.14 2.5e-3 1e+10f64 0.0f32 1e2+3",
+        "0..10 1..=5 10.to_u8 0x10e2 0b1010_0101 0o755 0xff 1_000_000 42 as i7 3.14 2.5e-3 1e+10 0.0 1e2+3",
         &.{
             .{ .int_literal, "0" },
             .{ .dot_dot, ".." },
@@ -180,18 +180,17 @@ test "numbers, ranges, method calls, hex exponent trap, and arbitrary-width type
             .{ .dot, "." },
             .{ .ident, "to_u8" },
             .{ .int_literal, "0x10e2" },
-            .{ .int_literal, "0b1010_0101u8" },
-            .{ .int_literal, "0o755_u16" },
-            .{ .int_literal, "0xff_u12" },
-            .{ .int_literal, "1_000_000i64" },
-            .{ .int_literal, "42i7" },
-            .{ .int_literal, "7_u3" },
-            .{ .int_literal, "1_u9" },
-            .{ .int_literal, "1_u65535" },
+            .{ .int_literal, "0b1010_0101" },
+            .{ .int_literal, "0o755" },
+            .{ .int_literal, "0xff" },
+            .{ .int_literal, "1_000_000" },
+            .{ .int_literal, "42" },
+            .{ .kw_as, "as" },
+            .{ .ident, "i7" },
             .{ .float_literal, "3.14" },
             .{ .float_literal, "2.5e-3" },
-            .{ .float_literal, "1e+10f64" },
-            .{ .float_literal, "0.0f32" },
+            .{ .float_literal, "1e+10" },
+            .{ .float_literal, "0.0" },
             .{ .float_literal, "1e2" },
             .{ .plus, "+" },
             .{ .int_literal, "3" },
@@ -199,9 +198,9 @@ test "numbers, ranges, method calls, hex exponent trap, and arbitrary-width type
     );
 }
 
-test "malformed numbers produce invalid_number and keep scanning aligned" {
+test "malformed numbers and glued suffixes produce invalid_number and keep scanning aligned" {
     try expectTokens(
-        "0x 0b102 0o78 1__0 1_ 1.5_ 1_.5 1e+ 123abc 1.5u8 42u0 42u08 42u65536 42i07 1_u7x next_tok",
+        "0x 0b102 0o78 1__0 1_ 1.5_ 1_.5 1e+ 123abc 1.5u8 42u0 42u08 42u65536 42i7 0b1010_0101u8 3.14f32 1_u65535 next_tok",
         &.{
             .{ .invalid_number, "0x" },
             .{ .invalid_number, "0b102" },
@@ -216,8 +215,10 @@ test "malformed numbers produce invalid_number and keep scanning aligned" {
             .{ .invalid_number, "42u0" },
             .{ .invalid_number, "42u08" },
             .{ .invalid_number, "42u65536" },
-            .{ .invalid_number, "42i07" },
-            .{ .invalid_number, "1_u7x" },
+            .{ .invalid_number, "42i7" },
+            .{ .invalid_number, "0b1010_0101u8" },
+            .{ .invalid_number, "3.14f32" },
+            .{ .invalid_number, "1_u65535" },
             .{ .ident, "next_tok" },
         },
     );

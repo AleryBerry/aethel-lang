@@ -1,0 +1,4 @@
+law missing_guard_field(triple: Triple) {
+  when triple.missing == 7
+  always stage(triple) <= 255
+}

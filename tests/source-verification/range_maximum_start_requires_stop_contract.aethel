@@ -1,0 +1,10 @@
+type Meter { bound: u8, result: u8, }
+fn read(meter: Meter ~>.{result}) -> u8 {
+  for _ in 255..meter.bound { };
+  meter.result
+}
+fn main() -> u8 {
+  let mut meter = Meter { bound: 93, result: 4, };
+  meter.result = read(meter);
+  meter.result
+}

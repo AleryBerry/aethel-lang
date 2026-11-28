@@ -1,0 +1,3 @@
+law never_in_byte_range(row: Triple) {
+  never stage(row) <= 255
+}

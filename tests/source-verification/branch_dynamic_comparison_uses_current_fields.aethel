@@ -1,0 +1,8 @@
+type Pair { left: u8, right: u8, out: u8, }
+fn lower(pair: Pair ~>.{right}) { pair.right = 27; }
+fn main() -> u8 {
+  let mut pair = Pair { left: 33, right: 41, out: 0, };
+  lower(pair);
+  if pair.left > pair.right { pair.out = 84; } else { pair.out = 11; };
+  pair.out
+}

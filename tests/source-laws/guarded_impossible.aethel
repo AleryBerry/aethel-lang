@@ -1,0 +1,4 @@
+law impossible_input(triple: Triple) {
+  when triple.third > 255
+  always stage(triple) > 255
+}

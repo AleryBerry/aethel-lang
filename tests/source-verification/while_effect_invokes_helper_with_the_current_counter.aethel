@@ -1,0 +1,16 @@
+type Meter { remaining: u8, status: u8, }
+fn record_step(meter: Meter ~>.{remaining, status}) {
+  if meter.remaining == 0 {
+    meter.status = 67;
+  } else {
+    meter.status = meter.remaining;
+  };
+}
+fn main() -> u8 {
+  let mut meter = Meter { remaining: 17, status: 0, };
+  while meter.remaining > 0 decreases meter.remaining {
+    meter.remaining = meter.remaining -| 9;
+    record_step(meter);
+  };
+  meter.status
+}

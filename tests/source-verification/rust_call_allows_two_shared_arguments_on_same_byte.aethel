@@ -1,0 +1,9 @@
+@external(rust, "batch", "compare")
+pub fn compare(a: [u8], b: [u8], total: [mut u8]) -> ()
+
+type Pair { value: u8, total: u8, }
+fn main() -> u8 {
+  let mut row = Pair { value: 52, total: 8, };
+  compare(row.value, row.value, row.total);
+  row.value
+}

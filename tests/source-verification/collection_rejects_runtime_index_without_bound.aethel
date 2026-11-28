@@ -1,0 +1,10 @@
+@layout(soa)
+type Cell { value: u8, next: u8, }
+fn main() -> u8 {
+  let mut cells: Collection(Cell) = [
+    Cell { value: 44, next: 0, },
+    Cell { value: 94, next: 0, },
+  ];
+  let index = cells[0].next;
+  cells[index].value
+}

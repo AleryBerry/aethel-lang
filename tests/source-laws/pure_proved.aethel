@@ -1,0 +1,11 @@
+law both_variants(value: Result(u8, bool)) {
+  always handles(value)
+}
+
+law exclusive_flags(value: ((), (bool, bool))) {
+  never impossible(value)
+}
+
+law exact_budget(value: (u8, u8)) {
+  always admit_pair(value)
+}

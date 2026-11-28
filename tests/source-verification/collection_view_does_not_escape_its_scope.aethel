@@ -1,0 +1,12 @@
+@layout(aos)
+type Cell { value: u8, other: u8, }
+fn main() -> u8 {
+  let mut cells: Collection(Cell) = [
+    Cell { value: 44, other: 15, },
+  ];
+  view exclusive held = cells[0].value {
+    held = 72;
+  };
+  cells[0].other = held;
+  cells[0].other
+}

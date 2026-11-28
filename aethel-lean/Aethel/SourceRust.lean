@@ -61,6 +61,29 @@ def SourceMIR.rustFieldArguments (mir : SourceMIR) (fields : List (Fin mir.field
     List RustSliceSpec :=
   fields.map fun (index, mode) => mir.rustFieldSpec index mode
 
+/-- Two arguments can borrow the same field only when both are shared. -/
+def RustFieldsCompatible {n : Nat} (left right : Fin n × AccessMode) : Prop :=
+  left.1 ≠ right.1 ∨ left.2.Compatible right.2
+
+theorem SourceMIR.rustFieldArguments_compatible (mir : SourceMIR)
+    (fields : List (Fin mir.fields.length × AccessMode)) :
+    (mir.rustFieldArguments fields).Pairwise RustSlicesCompatible ↔ fields.Pairwise RustFieldsCompatible := by
+  rw [SourceMIR.rustFieldArguments, List.pairwise_map]
+  apply List.Pairwise.iff
+  rintro ⟨left, modeLeft⟩ ⟨right, modeRight⟩
+  simp only [RustFieldsCompatible, RustSlicesCompatible, SourceMIR.rustFieldSpec, RustSliceSpec.locations,
+    RustSliceSpec.byteLen, Nat.mul_one, List.range_one, List.map_cons, List.map_nil, Nat.add_zero,
+    List.mem_singleton]
+  constructor
+  · intro compatible
+    by_cases same : left = right
+    · subst right
+      exact .inr (compatible _ rfl rfl)
+    · exact .inl same
+  · rintro (distinct | shared) _ rfl atRight
+    · exact False.elim (distinct (Fin.ext (congrArg ByteLocation.offset atRight)))
+    · exact shared
+
 private theorem rustFieldArguments_write {mir : SourceMIR} {fields : List (Fin mir.fields.length × AccessMode)}
     {field : Fin mir.fields.length}
     (written : RustCallWrites (mir.rustFieldArguments fields) ⟨0, field.val⟩) :
@@ -99,6 +122,32 @@ theorem Verified.rustCall_preserves_field {input : String} (accepted : Verified 
   obtain ⟨restored, frame⟩ := accepted.mir.rustCall_frames_field compatible outside finished
   exact ⟨restored, frame.trans (accepted.rustField_initialized field .shared declared entered).2.2⟩
 
+theorem SourceMIR.rust_arguments_at_restored_resources (mir : SourceMIR)
+    {fields : List (Fin mir.fields.length × AccessMode)} {entry current : State}
+    (entered : Core.run {} mir.entry = some entry) (restored : current.resources = entry.resources) :
+    current.views = [] ∧
+      ∀ slice ∈ mir.rustFieldArguments fields, RustSliceAbiValid current slice := by
+  refine ⟨(congrArg ResourceState.views restored).trans (mir.entry_views entered), ?_⟩
+  intro slice member
+  obtain ⟨⟨index, mode⟩, _, rfl⟩ := List.mem_map.mp member
+  obtain ⟨_, valid, _, _⟩ := mir.rustField_at_restored_resources index mode entered restored
+  exact valid
+
+theorem CheckedRecord.body_restored (accepted : CheckedRecord) {entry current : State}
+    (entered : Core.run {} accepted.mir.entry = some entry)
+    (bodyRan : accepted.mir.body.run 0 entry = some current) : current.resources = entry.resources := by
+  have bodyOK := SourceMIR.body_checked accepted.checked entered
+  obtain ⟨_, computed, restored⟩ := Operations.run_preserves_resources bodyOK
+  exact Option.some.inj (computed.symm.trans bodyRan) ▸ restored
+
+private theorem Verified.rust_arguments_after_body {input : String} (accepted : Verified input)
+    {fields : List (Fin accepted.mir.fields.length × AccessMode)} {entry current : State}
+    (entered : Core.run {} accepted.mir.entry = some entry)
+    (bodyRan : accepted.mir.body.run 0 entry = some current) :
+    current.views = [] ∧
+      ∀ slice ∈ accepted.mir.rustFieldArguments fields, RustSliceAbiValid current slice :=
+  accepted.mir.rust_arguments_at_restored_resources entered (accepted.toCheckedRecord.body_restored entered bodyRan)
+
 theorem Verified.rustCall_after_body {input : String} (accepted : Verified input)
     {fields : List (Fin accepted.mir.fields.length × AccessMode)} {field : Fin accepted.mir.fields.length}
     {entry current returned : State} {trace : Program}
@@ -108,17 +157,43 @@ theorem Verified.rustCall_after_body {input : String} (accepted : Verified input
     (finished : runRustBorrowedCall current (accepted.mir.rustFieldArguments fields) trace = some returned) :
     (∀ slice ∈ accepted.mir.rustFieldArguments fields, RustSliceAbiValid current slice) ∧
       returned.resources = current.resources ∧ returned.byte ⟨0, field.val⟩ = current.byte ⟨0, field.val⟩ := by
-  have bodyOK := SourceMIR.body_checked accepted.checked entered
-  obtain ⟨after, computed, restored⟩ := Operations.run_preserves_resources bodyOK
-  obtain rfl := Option.some.inj (computed.symm.trans bodyRan)
-  have entryCompatible := (Core.run_sound entered).views_compatible State.empty_views_compatible
-  have sameViews : after.views = entry.views := congrArg ResourceState.views restored
-  have compatible : after.ViewsCompatible := by
-    simpa only [State.ViewsCompatible, sameViews] using entryCompatible
-  refine ⟨?_, accepted.mir.rustCall_frames_field compatible outside finished⟩
-  intro slice member
-  obtain ⟨⟨index, mode⟩, _, rfl⟩ := List.mem_map.mp member
-  obtain ⟨_, valid, _, _⟩ := accepted.mir.rustField_at_restored_resources index mode entered restored
-  exact valid
+  obtain ⟨closed, abi⟩ := accepted.rust_arguments_after_body (fields := fields) entered bodyRan
+  have compatible : current.ViewsCompatible := by simp [State.ViewsCompatible, closed]
+  exact ⟨abi, accepted.mir.rustCall_frames_field compatible outside finished⟩
+
+theorem SourceMIR.rustBorrowPlan_at_restored_resources (mir : SourceMIR)
+    (fields : List (Fin mir.fields.length × AccessMode)) {entry current : State}
+    (entered : Core.run {} mir.entry = some entry) (restored : current.resources = entry.resources) :
+    checkRustBorrowPlan current (mir.rustFieldArguments fields) = true ↔
+      fields.Pairwise RustFieldsCompatible := by
+  obtain ⟨closed, abi⟩ := mir.rust_arguments_at_restored_resources (fields := fields) entered restored
+  rw [checkRustBorrowPlan_correct, mir.rustFieldArguments_compatible, and_iff_right_iff_imp]
+  intro _ slice supplied
+  exact (abi slice supplied).with_available (by simp [State.Available, closed])
+
+theorem Verified.rustBorrowPlan_after_body {input : String} (accepted : Verified input)
+    (fields : List (Fin accepted.mir.fields.length × AccessMode)) {entry current : State}
+    (entered : Core.run {} accepted.mir.entry = some entry)
+    (bodyRan : accepted.mir.body.run 0 entry = some current) :
+    checkRustBorrowPlan current (accepted.mir.rustFieldArguments fields) = true ↔
+      fields.Pairwise RustFieldsCompatible :=
+  accepted.mir.rustBorrowPlan_at_restored_resources fields entered (accepted.toCheckedRecord.body_restored entered bodyRan)
+
+/-- A finite foreign trace over the declared fields can run after the checked
+body. Its return preserves all caller resources and frames every other field. -/
+theorem Verified.rustTrace_after_body {input : String} (accepted : Verified input)
+    {fields : List (Fin accepted.mir.fields.length × AccessMode)} {entry current : State} {trace : Program}
+    (entered : Core.run {} accepted.mir.entry = some entry)
+    (bodyRan : accepted.mir.body.run 0 entry = some current)
+    (apart : fields.Pairwise RustFieldsCompatible)
+    (permitted : AuthorizedRustTrace current (accepted.mir.rustFieldArguments fields) trace) :
+    ∃ returned, runRustBorrowedCall current (accepted.mir.rustFieldArguments fields) trace = some returned ∧
+      returned.resources = current.resources ∧ ∀ field : Fin accepted.mir.fields.length,
+        (field, .exclusive) ∉ fields → returned.byte ⟨0, field.val⟩ = current.byte ⟨0, field.val⟩ := by
+  obtain ⟨closed, _⟩ := accepted.rust_arguments_after_body (fields := fields) entered bodyRan
+  have compatible : current.ViewsCompatible := by simp [State.ViewsCompatible, closed]
+  have checked := (accepted.rustBorrowPlan_after_body fields entered bodyRan).mpr apart
+  obtain ⟨returned, ran, restored, frame⟩ := runRustBorrowedCall_total checked compatible permitted
+  exact ⟨returned, ran, restored, fun _ outside => frame _ (fun wrote => outside (rustFieldArguments_write wrote))⟩
 
 end Aethel.SourceVerification

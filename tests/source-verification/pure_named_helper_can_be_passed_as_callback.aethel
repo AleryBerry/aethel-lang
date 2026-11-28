@@ -1,0 +1,5 @@
+fn identity(value: u8) -> u8 { value }
+
+fn apply(transform: fn(u8) -> u8) -> u8 { transform(73) }
+
+fn main() -> u8 { apply(identity) }

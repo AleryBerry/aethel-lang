@@ -228,12 +228,87 @@ theorem collectionSlot_eq_iff {layout : CollectionLayout} (hValid : layout.Valid
   | soa => exact soaSlot_eq_iff length i j f g hi hj
   | aosoa w => exact aosoaSlot_eq_iff w fieldCount i j f g hValid hf hg
 
+def CollectionLayout.byteExtent (layout : CollectionLayout) (length fieldCount : Nat) : Nat :=
+  (match layout with
+    | .aosoa width => alignUp length width
+    | _ => length) * fieldCount
+
+theorem collectionSlot_fits {layout : CollectionLayout} (valid : layout.Valid)
+    {length fieldCount element field : Nat} (row : element < length) (column : field < fieldCount) :
+    collectionSlot layout length fieldCount element field < layout.byteExtent length fieldCount := by
+  cases layout with
+  | aos =>
+    have within := Nat.mul_le_mul_right fieldCount (Nat.succ_le_of_lt row)
+    rw [Nat.succ_mul] at within
+    simp only [collectionSlot, aosSlot, CollectionLayout.byteExtent]
+    omega
+  | soa =>
+    have within := Nat.mul_le_mul_right length (Nat.succ_le_of_lt column)
+    rw [Nat.succ_mul, Nat.mul_comm fieldCount length] at within
+    simp only [collectionSlot, soaSlot, CollectionLayout.byteExtent]
+    omega
+  | aosoa width =>
+    have covered : length ≤ alignUp length width := by simp [alignUp]
+    obtain ⟨tiles, padded⟩ := Nat.dvd_of_mod_eq_zero (alignUp_aligned length valid)
+    have rowInTile : element / width < tiles := (Nat.div_lt_iff_lt_mul valid).mpr (by
+      rw [Nat.mul_comm, ← padded]
+      exact Nat.lt_of_lt_of_le row covered)
+    have lane := inner_offset_lt column (Nat.mod_lt element valid)
+    have within := Nat.mul_le_mul_right (fieldCount * width) (Nat.succ_le_of_lt rowInTile)
+    rw [Nat.succ_mul] at within
+    have total : tiles * (fieldCount * width) = alignUp length width * fieldCount := by
+      rw [padded]
+      ac_rfl
+    rw [total] at within
+    simp only [collectionSlot, aosoaSlot, CollectionLayout.byteExtent]
+    omega
+
 /-- Byte-level physical collection representation in `Core.State` unified across
 AoS, SoA, and Tiled AoSoA layouts. -/
 def ByteCollectionRep (s : Core.State) (owner : Core.OwnerId) (layout : CollectionLayout)
     (length fieldCount : Nat) (table : Nat → Nat → UInt8) : Prop :=
   ∀ i, i < length → ∀ f, f < fieldCount →
     s.byte ⟨owner, collectionSlot layout length fieldCount i f⟩ = some (table i f)
+
+/-- Materialize the selected physical layout, zeroing padded tile lanes. -/
+def CollectionLayout.encodeBytes (layout : CollectionLayout) (length fieldCount : Nat)
+    (table : Nat → Nat → UInt8) : List UInt8 :=
+  let bounded (row field : Nat) : Nat :=
+    if row < length ∧ field < fieldCount then (table row field).toNat else 0
+  let physical := match layout with
+    | .aos => encodeAoS bounded fieldCount
+    | .soa => encodeSoA bounded length
+    | .aosoa width => encodeAoSoA bounded width fieldCount
+  List.ofFn fun offset : Fin (layout.byteExtent length fieldCount) => UInt8.ofNat (physical offset.val)
+
+theorem CollectionLayout.encodeBytes_length (layout : CollectionLayout) (length fieldCount : Nat)
+    (table : Nat → Nat → UInt8) : (layout.encodeBytes length fieldCount table).length =
+      layout.byteExtent length fieldCount := by
+  simp [encodeBytes]
+
+theorem CollectionLayout.encodeBytes_cell {layout : CollectionLayout} (valid : layout.Valid)
+    {length fieldCount element field : Nat} (table : Nat → Nat → UInt8)
+    (row : element < length) (column : field < fieldCount) :
+    (layout.encodeBytes length fieldCount table)[collectionSlot layout length fieldCount element field]? =
+      some (table element field) := by
+  have within := collectionSlot_fits valid row column
+  simp only [encodeBytes, List.getElem?_ofFn, dite_eq_left within]
+  cases layout with
+  | aos => simp [collectionSlot, aos_read, row, column]
+  | soa => simp [collectionSlot, soa_read, row, column]
+  | aosoa width =>
+    have positive : 0 < width := valid
+    simp [collectionSlot, aosoa_read _ width fieldCount element field positive column, row, column]
+
+theorem byteCollection_alloc_rep {layout : CollectionLayout} (valid : layout.Valid)
+    {state final : Core.State} {owner : Core.OwnerId} {length fieldCount : Nat}
+    {table : Nat → Nat → UInt8}
+    (allocated : Core.Step state (.alloc owner (layout.encodeBytes length fieldCount table)) final) :
+    ByteCollectionRep final owner layout length fieldCount table := by
+  cases allocated
+  intro element row field column
+  simpa only [Core.State.byte, Core.State.allocation, Core.State.addAllocation, List.find?_cons,
+    beq_self_eq_true, ite_true, bind, Option.bind_some] using layout.encodeBytes_cell valid table row column
 
 def writeByteTable (table : Nat → Nat → UInt8) (element field : Nat) (val : UInt8) :
     Nat → Nat → UInt8 :=
@@ -640,12 +715,12 @@ theorem simd_tiled_sum_eq_sequential_fold (vals : Nat → Nat) (w length : Nat) 
     exact Nat.div_add_mod length w
   rw [hDivMod]
 
-/-- Default x86-64 L1 data cache capacity (32 KiB) for `@layout(auto)` sub-byte packing decisions. -/
-def l1DataCacheBytes : Nat := 32768
+/-- Default x86-64 L1 data cache capacity (32 KiB) for `@layout(auto)` packing decisions. -/
+abbrev l1DataCacheBytes : Nat := AutomaticLayout.l1DataCacheBytes
 
 def selectSubBytePolicy (hasConflict isHot : Bool) (workingSetBytes : Nat) :
     AutomaticLayout.StoragePolicy :=
-  if hasConflict || (isHot && decide (workingSetBytes ≤ l1DataCacheBytes)) then .addressable
+  if hasConflict || AutomaticLayout.shouldUnpackHotInL1 isHot (some workingSetBytes) then .addressable
   else .mayShareByte
 
 theorem selectSubBytePolicy_conflict_addressable (isHot : Bool) (workingSetBytes : Nat) :
@@ -655,14 +730,16 @@ theorem selectSubBytePolicy_conflict_addressable (isHot : Bool) (workingSetBytes
 theorem selectSubBytePolicy_hot_l1_addressable (hasConflict : Bool) {workingSetBytes : Nat}
     (hL1 : workingSetBytes ≤ l1DataCacheBytes) :
     selectSubBytePolicy hasConflict true workingSetBytes = .addressable := by
-  simp [selectSubBytePolicy, decide_eq_true hL1]
+  simp [selectSubBytePolicy, AutomaticLayout.shouldUnpackHotInL1, decide_eq_true hL1]
 
 theorem selectSubBytePolicy_cold_or_streaming_packs
     (hNoConflict : hasConflict = false)
     (hNotHotInL1 : isHot = false ∨ l1DataCacheBytes < workingSetBytes) :
     selectSubBytePolicy hasConflict isHot workingSetBytes = .mayShareByte := by
   rcases hNotHotInL1 with rfl | hGt
-  · simp [selectSubBytePolicy, hNoConflict]
-  · simp [selectSubBytePolicy, hNoConflict, Nat.not_le_of_gt hGt]
+  · simp [selectSubBytePolicy, AutomaticLayout.shouldUnpackHotInL1, hNoConflict]
+  · simp [selectSubBytePolicy, AutomaticLayout.shouldUnpackHotInL1, hNoConflict]
+    intro _
+    exact hGt
 
 end Aethel.CacheLayout

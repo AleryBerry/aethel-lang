@@ -19,7 +19,7 @@ test "1. Stage D Tier 1 exhaustive proof and minimal counterexample falsificatio
             \\fn sat_sub(hp: u8, dmg: u8) -> u8 { hp -| dmg }
             \\law bounded_damage_u8(hp: u8, dmg: u8) {
             \\  always sat_sub(hp, dmg) <= hp
-            \\  always hp -| hp == 0u8
+            \\  always hp -| hp == 0
             \\}
         );
         defer res.tree.deinit();
@@ -102,18 +102,18 @@ test "3. Stage D termination decreases verification on while loops and recursive
     {
         const src =
             \\fn sum_down(mut n: u32) -> u32 {
-            \\  let mut acc: u32 = 0u32
-            \\  while n > 0u32 decreases n {
+            \\  let mut acc: u32 = 0
+            \\  while n > 0 decreases n {
             \\    acc = acc +% n
-            \\    n = n - 1u32
+            \\    n = n - 1
             \\  }
             \\  acc
             \\}
             \\fn rec_countdown(n: u32) -> u32 decreases n {
-            \\  if n == 0u32 {
-            \\    0u32
+            \\  if n == 0 {
+            \\    0
             \\  } else {
-            \\    1u32 +% rec_countdown(n - 1u32)
+            \\    1 +% rec_countdown(n - 1)
             \\  }
             \\}
         ;
@@ -136,8 +136,8 @@ test "3. Stage D termination decreases verification on while loops and recursive
     {
         var res = try analyzeSource(
             \\fn bad_loop(mut n: u32) {
-            \\  while n < 10u32 decreases n {
-            \\    n = n + 1u32
+            \\  while n < 10 decreases n {
+            \\    n = n + 1
             \\  }
             \\}
         );
@@ -151,10 +151,10 @@ test "3. Stage D termination decreases verification on while loops and recursive
     {
         var res = try analyzeSource(
             \\fn bad_rec(n: u32) -> u32 decreases n {
-            \\  if n > 0u32 {
+            \\  if n > 0 {
             \\    bad_rec(n)
             \\  } else {
-            \\    0u32
+            \\    0
             \\  }
             \\}
         );
@@ -169,8 +169,8 @@ test "field countdown certificate describes the saturated update" {
     var good = try analyzeSource(
         \\type Counter { value: u8, spare: u8 }
         \\fn count(mut counter: Counter) -> u8 {
-        \\  while counter.value > 0u8 decreases counter.value {
-        \\    counter.value = counter.value -| 1u8;
+        \\  while counter.value > 0 decreases counter.value {
+        \\    counter.value = counter.value -| 1;
         \\  }
         \\  counter.value
         \\}
@@ -188,8 +188,8 @@ test "field countdown certificate describes the saturated update" {
     var bad = try analyzeSource(
         \\type Counter { value: u8, spare: u8 }
         \\fn count(mut counter: Counter) -> u8 {
-        \\  while counter.value > 0u8 decreases counter.value {
-        \\    counter.value = counter.spare -| 1u8;
+        \\  while counter.value > 0 decreases counter.value {
+        \\    counter.value = counter.spare -| 1;
         \\  }
         \\  counter.value
         \\}
@@ -198,4 +198,54 @@ test "field countdown certificate describes the saturated update" {
     defer bad.checked.deinit();
     try std.testing.expect(bad.checked.hasErrors());
     try std.testing.expectEqual(sema.SemaDiagnostic.Kind.termination_error, bad.checked.diagnostics[0].kind);
+}
+
+test "preserves resolves each complete path and records independent clause evidence" {
+    inline for (.{ "missing.id", "n.id", "r", "r.id.extra", "r.unknown" }) |path| {
+        var res = try analyzeSource("type R { id: u8 }\nlaw frame(r: R, n: u8) {\n preserves " ++ path ++ "\n always n == n\n}");
+        defer res.tree.deinit();
+        defer res.checked.deinit();
+        try std.testing.expect(res.checked.hasErrors());
+        const law = res.checked.laws[0];
+        try std.testing.expectEqual(sema.LawVerdict.violated, law.verdict);
+        try std.testing.expectEqual(sema.LawVerdict.violated, law.clauses[0].verdict.?);
+        try std.testing.expect(law.clauses[1].verdict.? != .violated);
+    }
+}
+
+test "saturating byte addition stops increasing at 255" {
+    var res = try analyzeSource(
+        \\law byte_successor(x: u8) { always x < x +| 1 }
+    );
+    defer res.tree.deinit();
+    defer res.checked.deinit();
+    try std.testing.expectEqual(sema.LawVerdict.falsified, res.checked.laws[0].verdict);
+    try std.testing.expectEqualStrings("x = 255", res.checked.laws[0].counterexample.?);
+}
+
+test "option byte enumeration includes every payload" {
+    var res = try analyzeSource(
+        \\law missing_payload(x: Option(u8)) { always x != Some(42) }
+    );
+    defer res.tree.deinit();
+    defer res.checked.deinit();
+    try std.testing.expectEqual(sema.LawVerdict.falsified, res.checked.laws[0].verdict);
+}
+
+test "unsupported trait preserves leaves a mixed instance law unproved" {
+    var res = try analyzeSource(
+        \\trait Framed(a) {
+        \\  fn same(x: a) -> a
+        \\  law stable(x: a) {
+        \\    always same(x) == x
+        \\    preserves x.field
+        \\  }
+        \\}
+        \\instance identity: Framed(u8) { fn same(x: u8) -> u8 { x } }
+    );
+    defer res.tree.deinit();
+    defer res.checked.deinit();
+    const law = res.checked.laws[0];
+    try std.testing.expectEqual(sema.LawVerdict.unverified_symbolic, law.verdict);
+    try std.testing.expectEqual(sema.LawVerdict.unverified_symbolic, law.clauses[1].verdict.?);
 }

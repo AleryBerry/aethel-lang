@@ -14,6 +14,11 @@ inductive IsSequentialCore : CoreExpr → Prop where
   | pair {a b} : IsSequentialCore a → IsSequentialCore b → IsSequentialCore (.pair a b)
   | fst {p} : IsSequentialCore p → IsSequentialCore (.fst p)
   | snd {p} : IsSequentialCore p → IsSequentialCore (.snd p)
+  | inject (side : Bool) (variants : CoreType × CoreType) {payload} :
+      IsSequentialCore payload → IsSequentialCore (.inject side variants payload)
+  | matchSum (binder : Nat) {input onLeft onRight} :
+      IsSequentialCore input → IsSequentialCore onLeft → IsSequentialCore onRight →
+      IsSequentialCore (.matchSum input binder onLeft onRight)
   | adt (tag : Nat) {p} : IsSequentialCore p → IsSequentialCore (.adt tag p)
   | matchTag {s} (tag : Nat) {onM onE} :
       IsSequentialCore s → IsSequentialCore onM → IsSequentialCore onE →
@@ -58,6 +63,19 @@ theorem progress (e : CoreExpr) (hSeq : IsSequentialCore e) (ty : CoreType) (eff
       · obtain ⟨a, b, rfl, hValA, hValB⟩ := canonical_prod hValP hP
         exact Or.inr ⟨s, b, Step.snd_val hValA hValB⟩
       · exact Or.inr ⟨s', .snd p', Step.snd_eval hStepP⟩
+  | inject side variants _ ih =>
+    cases hTyped with
+    | inject _ _ payload =>
+      rcases ih _ _ payload with ready | ⟨next, result, stepped⟩
+      · exact .inl (.inject side variants ready)
+      · exact .inr ⟨next, _, .inject_eval side variants stepped⟩
+  | matchSum binder _ _ _ ih _ _ =>
+    cases hTyped with
+    | matchSum _ input _ _ =>
+      rcases ih _ _ input with ready | ⟨next, result, stepped⟩
+      · obtain ⟨side, variants, payload, rfl, readyPayload⟩ := canonical_sum ready input
+        exact .inr ⟨s, _, .sum_select side variants binder readyPayload⟩
+      · exact .inr ⟨next, _, .sum_eval binder stepped⟩
   | adt tag hp ih =>
     cases hTyped with
     | adt _ hP =>
@@ -128,6 +146,9 @@ theorem value_effect_empty {v : CoreExpr} (hVal : Value v) {ty : CoreType} {eff 
     cases hTyped with
     | adt _ hP =>
       exact ih hP
+  | inject _ _ _ ih =>
+    cases hTyped with
+    | inject _ _ payload => exact ih payload
 
 theorem lookup_head (x : Nat) (tyX : CoreType) (ctx : Ctx) :
     Ctx.lookup ((x, tyX) :: ctx) x = some tyX := by
@@ -190,6 +211,10 @@ theorem wellTyped_weaken {ctx1 ctx2 : Ctx} {e : CoreExpr} {ty : CoreType} {eff :
     exact .fst (ih hsub)
   | snd hp ih =>
     exact .snd (ih hsub)
+  | inject side variants _ ih =>
+    exact .inject side variants (ih hsub)
+  | matchSum binder _ _ _ input left right =>
+    exact .matchSum binder (input hsub) (left (ctxSub_cons hsub binder _)) (right (ctxSub_cons hsub binder _))
   | adt tag hp ih =>
     exact .adt tag (ih hsub)
   | matchTag tag hs hm he ihs ihm ihe =>
@@ -286,6 +311,21 @@ theorem substitution_value {val : CoreExpr} {tyV : CoreType}
     cases hBody with
     | snd hp =>
       exact .snd (ih hp)
+  | inject side variants _ ih =>
+    intro ctx name result effect typed
+    cases typed with
+    | inject _ _ payload => exact .inject side variants (ih payload)
+  | matchSum input binder onLeft onRight ihInput ihLeft ihRight =>
+    intro ctx name result effect typed
+    cases typed with
+    | matchSum _ input left right =>
+      by_cases same : binder = name
+      · subst name
+        simpa only [subst, ite_true] using
+          WellTyped.matchSum binder (ihInput input) (wellTyped_shadow left) (wellTyped_shadow right)
+      · simpa only [subst, ite_eq_right same] using
+          WellTyped.matchSum binder (ihInput input) (ihLeft (wellTyped_exchange same left))
+            (ihRight (wellTyped_exchange same right))
   | adt tag p ih =>
     intro ctx varId tyBody effBody hBody
     cases hBody with
@@ -439,6 +479,24 @@ theorem preservation {s s' : State} {e e' : CoreExpr} {ty : CoreType} {eff : Eff
       cases hp with
       | pair _ hb =>
         exact ⟨_, hb⟩
+  | inject_eval side variants _ ih =>
+    cases hTyped with
+    | inject _ _ payload =>
+      obtain ⟨_, next⟩ := ih payload
+      exact ⟨_, .inject side variants next⟩
+  | sum_eval binder _ ih =>
+    cases hTyped with
+    | matchSum _ input left right =>
+      obtain ⟨_, next⟩ := ih input
+      exact ⟨_, .matchSum binder next left right⟩
+  | sum_select side variants binder ready =>
+    cases hTyped with
+    | matchSum _ input left right =>
+      cases side
+      · cases input with
+        | inject _ _ payload => exact ⟨_, .letBind binder payload right⟩
+      · cases input with
+        | inject _ _ payload => exact ⟨_, .letBind binder payload left⟩
   | adt_eval tag h ih =>
     cases hTyped with
     | adt _ hp =>
@@ -522,6 +580,8 @@ inductive ErasedExpr where
   | pair (fst snd : ErasedExpr) : ErasedExpr
   | fst (p : ErasedExpr) : ErasedExpr
   | snd (p : ErasedExpr) : ErasedExpr
+  | inject (left : Bool) (payload : ErasedExpr) : ErasedExpr
+  | matchSum (input : ErasedExpr) (binder : Nat) (onLeft onRight : ErasedExpr) : ErasedExpr
   | adt (tag : Nat) (payload : ErasedExpr) : ErasedExpr
   | matchTag (scrutinee : ErasedExpr) (tag : Nat) (onMatch onElse : ErasedExpr) : ErasedExpr
   | var (id : Nat) : ErasedExpr
@@ -540,6 +600,8 @@ def erase : CoreExpr → ErasedExpr
   | .pair a b => .pair (erase a) (erase b)
   | .fst p => .fst (erase p)
   | .snd p => .snd (erase p)
+  | .inject side _ payload => .inject side (erase payload)
+  | .matchSum input binder onLeft onRight => .matchSum (erase input) binder (erase onLeft) (erase onRight)
   | .adt tag p => .adt tag (erase p)
   | .matchTag s tag onM onE => .matchTag (erase s) tag (erase onM) (erase onE)
   | .var id => .var id
@@ -557,6 +619,11 @@ def erasedSubst (varId : Nat) (val : ErasedExpr) : ErasedExpr → ErasedExpr
   | .pair a b => .pair (erasedSubst varId val a) (erasedSubst varId val b)
   | .fst p => .fst (erasedSubst varId val p)
   | .snd p => .snd (erasedSubst varId val p)
+  | .inject side payload => .inject side (erasedSubst varId val payload)
+  | .matchSum input binder onLeft onRight =>
+    .matchSum (erasedSubst varId val input) binder
+      (if binder = varId then onLeft else erasedSubst varId val onLeft)
+      (if binder = varId then onRight else erasedSubst varId val onRight)
   | .adt tag p => .adt tag (erasedSubst varId val p)
   | .matchTag s tag onMatch onElse =>
     .matchTag (erasedSubst varId val s) tag (erasedSubst varId val onMatch) (erasedSubst varId val onElse)
@@ -584,6 +651,9 @@ theorem erase_subst (varId : Nat) (val : CoreExpr) (body : CoreExpr) :
     simp only [subst, erase, ih, erasedSubst]
   | snd p ih =>
     simp only [subst, erase, ih, erasedSubst]
+  | inject _ _ _ ih => simp only [subst, erase, erasedSubst, ih]
+  | matchSum input binder onLeft onRight ihInput ihLeft ihRight =>
+    by_cases same : binder = varId <;> simp [subst, erase, erasedSubst, ihInput, ihLeft, ihRight, same]
   | adt tag p ih =>
     simp only [subst, erase, ih, erasedSubst]
   | matchTag s tag onM onE ihs ihm ihe =>
@@ -611,6 +681,7 @@ inductive ErasedValue : ErasedExpr → Prop where
   | int (s : Bool) (bits : Nat) (v : Int) : ErasedValue (.int s bits v)
   | lam (p : Nat) (body : ErasedExpr) : ErasedValue (.lam p body)
   | pair {a b : ErasedExpr} : ErasedValue a → ErasedValue b → ErasedValue (.pair a b)
+  | inject (side : Bool) {payload : ErasedExpr} : ErasedValue payload → ErasedValue (.inject side payload)
   | adt (tag : Nat) {p : ErasedExpr} : ErasedValue p → ErasedValue (.adt tag p)
 
 theorem value_erase {e : CoreExpr} (h : Value e) : ErasedValue (erase e) := by
@@ -621,6 +692,7 @@ theorem value_erase {e : CoreExpr} (h : Value e) : ErasedValue (erase e) := by
   | int s bits v => exact .int s bits v
   | lam p ty body eff => exact .lam p (erase body)
   | pair ha hb iha ihb => exact .pair iha ihb
+  | inject side _ _ ih => exact .inject side ih
   | adt tag hp ih => exact .adt tag ih
 
 inductive ErasedStep : State → ErasedExpr → State → ErasedExpr → Prop where
@@ -642,6 +714,15 @@ inductive ErasedStep : State → ErasedExpr → State → ErasedExpr → Prop wh
   | snd_val {s : State} {a b : ErasedExpr} :
       ErasedValue a → ErasedValue b →
       ErasedStep s (.snd (.pair a b)) s b
+  | inject_eval {s s' : State} (side : Bool) {payload next : ErasedExpr} :
+      ErasedStep s payload s' next → ErasedStep s (.inject side payload) s' (.inject side next)
+  | sum_eval {s s' : State} {input next : ErasedExpr} (binder : Nat) {onLeft onRight : ErasedExpr} :
+      ErasedStep s input s' next →
+      ErasedStep s (.matchSum input binder onLeft onRight) s' (.matchSum next binder onLeft onRight)
+  | sum_select {s : State} (side : Bool) (binder : Nat) {payload onLeft onRight : ErasedExpr} :
+      ErasedValue payload →
+      ErasedStep s (.matchSum (.inject side payload) binder onLeft onRight) s
+        (.letBind binder payload (if side then onLeft else onRight))
   | adt_eval {s s' : State} (tag : Nat) {p p' : ErasedExpr} :
       ErasedStep s p s' p' →
       ErasedStep s (.adt tag p) s' (.adt tag p')
@@ -694,6 +775,9 @@ theorem proof_erasure_simulation {s s' : State} {e e' : CoreExpr}
     exact .snd_eval ih
   | snd_val ha hb =>
     exact .snd_val (value_erase ha) (value_erase hb)
+  | inject_eval side _ _ ih => exact .inject_eval side ih
+  | sum_eval binder _ ih => exact .sum_eval binder ih
+  | sum_select side _ binder ready => cases side <;> exact .sum_select _ binder (value_erase ready)
   | adt_eval tag h ih =>
     exact .adt_eval tag ih
   | match_eval tag h ih =>

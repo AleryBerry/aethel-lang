@@ -44,8 +44,8 @@ test "1. arbitrary-width literal checks (i7, u3, u65535)" {
         \\  let a: i7 = -64
         \\  let b: i7 = 63
         \\  let c: u3 = 7
-        \\  let d = 42_i7
-        \\  let e: u65535 = 1_u65535
+        \\  let d = (42 as i7)
+        \\  let e: u65535 = 1
         \\  a
         \\}
     );
@@ -54,7 +54,7 @@ test "1. arbitrary-width literal checks (i7, u3, u65535)" {
     try expectSemaError("fn bad() { let x: i7 = -65 }", .literal_out_of_range);
     try expectSemaError("fn bad() { let x: i7 = 64 }", .literal_out_of_range);
     try expectSemaError("fn bad() { let x: u3 = 8 }", .literal_out_of_range);
-    try expectSemaError("fn bad() { let x = 64i7 }", .literal_out_of_range);
+    try expectSemaError("fn bad() { let x = (64 as i7) }", .literal_out_of_range);
 }
 
 test "2. automatic minimum bit-width synthesis (IntRange + IntInference)" {
@@ -145,7 +145,7 @@ test "4. layout synthesis: FFD packing ([i7, u5, u3, u1]=2B), i24 ABI, and co-bo
         \\fn touch_both(mut fl: Flags) {
         \\  view exclusive va = fl.flag_a {
         \\    view exclusive vb = fl.flag_b {
-        \\      fl.flag_b = 1u1
+        \\      fl.flag_b = 1
         \\    }
         \\  }
         \\}
@@ -293,7 +293,7 @@ test "10. Lean-compatible .mir v1 emission format" {
         \\fn step(players: Collection(Player) ~>.{pos, delta}) {
         \\  @layout(aosoa(8))
         \\  players |> map_in_place(fn(p) {
-        \\    p.pos = p.pos +% 1u32
+        \\    p.pos = p.pos +% 1
         \\  })
         \\}
         \\law keep_health(p: View(Player, Exclusive)) {
@@ -400,23 +400,23 @@ test "13. affine index and half-open slice disjointness (AffineIndex.lean)" {
         \\fn parallel_indexed(mut arr: [mut u32], i: u32, j: u32, mid: u32) {
         \\  if i != j {
         \\    fork {
-        \\      { arr[i] = 1u32 }
-        \\      { arr[j] = 2u32 }
+        \\      { arr[i] = 1 }
+        \\      { arr[j] = 2 }
         \\    } join
         \\  }
         \\  fork {
-        \\    { arr[0] = 3u32 }
-        \\    { arr[1] = 4u32 }
+        \\    { arr[0] = 3 }
+        \\    { arr[1] = 4 }
         \\  } join
         \\  fork {
-        \\    { arr[i] = 5u32 }
-        \\    { arr[i + 1] = 6u32 }
+        \\    { arr[i] = 5 }
+        \\    { arr[i + 1] = 6 }
         \\  } join
         \\  view exclusive left = arr[0..mid] {
         \\    view exclusive right = arr[mid..arr.len] {
         \\      fork {
-        \\        { left[0] = 10u32 }
-        \\        { right[0] = 20u32 }
+        \\        { left[0] = 10 }
+        \\        { right[0] = 20 }
         \\      } join
         \\    }
         \\  }
@@ -428,8 +428,8 @@ test "13. affine index and half-open slice disjointness (AffineIndex.lean)" {
     try expectSemaError(
         \\fn bad_unguarded(mut arr: [mut u32], i: u32, j: u32) {
         \\  fork {
-        \\    { arr[i] = 1u32 }
-        \\    { arr[j] = 2u32 }
+        \\    { arr[i] = 1 }
+        \\    { arr[j] = 2 }
         \\  } join
         \\}
     , .fork_data_race);
@@ -438,10 +438,10 @@ test "13. affine index and half-open slice disjointness (AffineIndex.lean)" {
     try expectSemaError(
         \\fn bad_reassigned(mut arr: [mut u32], mut i: u32, j: u32) {
         \\  if i != j {
-        \\    i = i +% 1u32
+        \\    i = i +% 1
         \\    fork {
-        \\      { arr[i] = 1u32 }
-        \\      { arr[j] = 2u32 }
+        \\      { arr[i] = 1 }
+        \\      { arr[j] = 2 }
         \\    } join
         \\  }
         \\}
@@ -468,7 +468,7 @@ test "14. transitive call-graph effects and returned caller-rooted Views" {
         \\  helper_hurt(s)
         \\}
         \\fn helper_hurt(s: Spaceship ~>.{shield_on}) {
-        \\  s.shield_on = 0u1
+        \\  s.shield_on = 0
         \\}
         \\law keep_shield(s: View(Spaceship, Exclusive)) {
         \\  preserves s.shield_on
@@ -534,15 +534,15 @@ test "15. Stage A .mir v1 emission includes two-phase perm_* and disjoint_* cert
         \\  }
         \\  if i != j {
         \\    fork {
-        \\      { arr[i] = 1u32 }
-        \\      { arr[j] = 2u32 }
+        \\      { arr[i] = 1 }
+        \\      { arr[j] = 2 }
         \\    } join
         \\  }
         \\  view exclusive l = arr[0..mid] {
         \\    view exclusive r = arr[mid..arr.len] {
         \\      fork {
-        \\        { l[0] = 3u32 }
-        \\        { r[0] = 4u32 }
+        \\        { l[0] = 3 }
+        \\        { r[0] = 4 }
         \\      } join
         \\    }
         \\  }
@@ -604,8 +604,8 @@ test "16. Stage B @layout(auto), hot-first ordering, and @parallel scalar/field 
         \\}
         \\fn mk() -> u32 {
         \\  let mut items: Collection(TinyRec) = [
-        \\    TinyRec { a: 1u32, b: 2u32 },
-        \\    TinyRec { a: 3u32, b: 4u32 },
+        \\    TinyRec { a: 1, b: 2 },
+        \\    TinyRec { a: 3, b: 4 },
         \\  ]
         \\  items[0].a
         \\}
@@ -622,12 +622,12 @@ test "16. Stage B @layout(auto), hot-first ordering, and @parallel scalar/field 
         \\fn ok_parallel(mut pair: Pair, scale: u32) {
         \\  @parallel fork {
         \\    {
-        \\      let mut acc: u32 = 1u32
+        \\      let mut acc: u32 = 1
         \\      acc = acc +% scale
         \\      pair.left = acc
         \\    }
         \\    {
-        \\      let mut acc: u32 = 2u32
+        \\      let mut acc: u32 = 2
         \\      acc = acc +% scale
         \\      pair.right = acc
         \\    }
@@ -640,7 +640,7 @@ test "16. Stage B @layout(auto), hot-first ordering, and @parallel scalar/field 
     try expectSemaError(
         \\fn bad_scalar_rw(mut total: u32) -> u32 {
         \\  @parallel fork {
-        \\    { total = total +% 1u32 }
+        \\    { total = total +% 1 }
         \\    { let _ = total }
         \\  } join
         \\  total
@@ -649,10 +649,10 @@ test "16. Stage B @layout(auto), hot-first ordering, and @parallel scalar/field 
 
     try expectSemaError(
         \\fn bad_scalar_ww() -> u32 {
-        \\  let mut total: u32 = 0u32
+        \\  let mut total: u32 = 0
         \\  @parallel fork {
-        \\    { total = 1u32 }
-        \\    { total = 2u32 }
+        \\    { total = 1 }
+        \\    { total = 2 }
         \\  } join
         \\  total
         \\}
@@ -706,7 +706,7 @@ test "17. Stage C LNL once closures, rank-1 generics, fused pipelines, combinato
         \\fn use_gen() -> i32 {
         \\  let b: bool = identity(true)
         \\  let _ = b
-        \\  apply_twice(10i32, fn(n: i32) -> i32 { n +% 1i32 })
+        \\  apply_twice(10, fn(n: i32) -> i32 { n +% 1 })
         \\}
     );
     defer ok_gen.deinit();
@@ -714,7 +714,7 @@ test "17. Stage C LNL once closures, rank-1 generics, fused pipelines, combinato
     try expectSemaError(
         \\fn same_pair(x: a, y: a) -> a { x }
         \\fn bad_unify() -> i32 {
-        \\  same_pair(1i32, true)
+        \\  same_pair(1, true)
         \\}
     , .type_mismatch);
 
@@ -729,8 +729,8 @@ test "17. Stage C LNL once closures, rank-1 generics, fused pipelines, combinato
         \\fn fuse_sum(fleet: View(Collection(Signal), Exclusive), dt: f32) -> f32 {
         \\  fleet
         \\    |> map_in_place(fn(s) { s.x += s.vx * dt })
-        \\    |> map_in_place(fn(s) { s.x += 1.0f32 })
-        \\    |> fold(0.0f32, fn(acc, s) { acc + s.x })
+        \\    |> map_in_place(fn(s) { s.x += 1.0 })
+        \\    |> fold(0.0, fn(acc, s) { acc + s.x })
         \\}
     );
     defer ok_pipe.deinit();
@@ -742,18 +742,18 @@ test "17. Stage C LNL once closures, rank-1 generics, fused pipelines, combinato
     // 4. Option/Result combinators + ? early-return propagation checks
     var ok_comb = try analyzeOk(
         \\fn comb_opt(x: Option(i32)) -> i32 {
-        \\  x |> map(fn(v) { v *% 2i32 }) |> and_then(fn(v) { Some(v +% 1i32) }) |> unwrap_or(0i32)
+        \\  x |> map(fn(v) { v *% 2 }) |> and_then(fn(v) { Some(v +% 1) }) |> unwrap_or(0)
         \\}
         \\fn comb_res(x: Option(i32)) -> i32 {
-        \\  x |> ok_or(404u32) |> map(fn(v) { v +% 10i32 }) |> unwrap_or(-1i32)
+        \\  x |> ok_or(404) |> map(fn(v) { v +% 10 }) |> unwrap_or(-1)
         \\}
         \\fn prop_opt(a: Option(i32)) -> Option(i32) {
         \\  let v = a?
-        \\  Some(v +% 1i32)
+        \\  Some(v +% 1)
         \\}
         \\fn prop_res(r: Result(i32, u32)) -> Result(i32, u32) {
         \\  let v = r?
-        \\  Ok(v +% 2i32)
+        \\  Ok(v +% 2)
         \\}
     );
     defer ok_comb.deinit();
@@ -769,7 +769,7 @@ test "reading an undeclared record field reports a source diagnostic" {
     try expectSemaError(
         \\type Reading { known: u8 }
         \\fn main() -> u8 {
-        \\  let reading = Reading { known: 1u8 }
+        \\  let reading = Reading { known: 1 }
         \\  reading.missing
         \\}
     , .unknown_ident);
@@ -780,7 +780,7 @@ test "returned scalar field views preserve the caller's sibling access" {
         \\type Pair { left: u8, right: u8 }
         \\fn fetch(pair: Pair ~>.{left}) -> View(u8, Shared) { pair.left }
         \\fn main() -> u8 {
-        \\  let mut pair = Pair { left: 7u8, right: 0u8 };
+        \\  let mut pair = Pair { left: 7, right: 0 };
         \\  let held = fetch(pair);
         \\  pair.right = held;
         \\  pair.right
@@ -798,10 +798,117 @@ test "returned scalar field views preserve the caller's sibling access" {
         \\  pair.right
         \\}
         \\fn main() -> u8 {
-        \\  let mut pair = Pair { left: 7u8, right: 0u8 };
+        \\  let mut pair = Pair { left: 7, right: 0 };
         \\  let held = select(pair, false);
-        \\  pair.right = 1u8;
-        \\  if held == 0u8 { 0u8 } else { 1u8 }
+        \\  pair.right = 1;
+        \\  if held == 0 { 0 } else { 1 }
         \\}
     , .borrow_conflict);
+}
+
+test "cross-byte bit-interval packing, byte-multiple preservation, address-taken view, and MIR emission" {
+    var checked = try analyzeOk(
+        \\type Cross { a: u12, b: u4, c: u1 }
+        \\type ThreeFives { a: u5, b: u5, c: u5 }
+        \\type ByteMultiples { a: u32, b: u8, c: u1 }
+        \\type ViewBorrowed { a: u12, b: u4, c: u1 }
+        \\type ForkConflict { a: u12, b: u4, c: u1 }
+        \\@layout(flat)
+        \\type FlatSample { x: u8, y: u32 }
+        \\fn use_view(mut vb: ViewBorrowed) -> u12 {
+        \\  view exclusive va = vb.a {
+        \\    va = 42;
+        \\  };
+        \\  vb.a
+        \\}
+        \\fn use_fork(mut fc: ForkConflict) -> u4 {
+        \\  @parallel fork {
+        \\    { fc.a = 7; }
+        \\    { let _ = fc.b; }
+        \\  } join;
+        \\  fc.b
+        \\}
+    );
+    defer checked.deinit();
+
+    // Cross: { u12, u4, u1 } -> 3B, align 1, b at byte 1 bit 4
+    try std.testing.expectEqual(@as(usize, 3), checked.records[0].record_layout.size);
+    try std.testing.expectEqual(@as(usize, 1), checked.records[0].record_layout.alignment);
+    try std.testing.expectEqual(@as(usize, 1), checked.records[0].record_layout.fields[1].byte_offset);
+    try std.testing.expectEqual(@as(?u8, 4), checked.records[0].record_layout.fields[1].bit_offset);
+    try std.testing.expectEqual(@as(usize, 1), checked.records[0].record_layout.fields[1].alignment);
+
+    // ThreeFives: { u5, u5, u5 } -> 2B, align 1 (beats old 3B FFD bins)
+    try std.testing.expectEqual(@as(usize, 2), checked.records[1].record_layout.size);
+    try std.testing.expectEqual(@as(usize, 1), checked.records[1].record_layout.alignment);
+
+    // ByteMultiples: { u32, u8, u1 } -> 8B, align 4 (u32 and u8 stay addressable)
+    try std.testing.expectEqual(@as(usize, 8), checked.records[2].record_layout.size);
+    try std.testing.expectEqual(@as(usize, 4), checked.records[2].record_layout.alignment);
+    try std.testing.expectEqual(@as(?u8, null), checked.records[2].record_layout.fields[0].bit_offset);
+    try std.testing.expectEqual(@as(?u8, null), checked.records[2].record_layout.fields[1].bit_offset);
+
+    // ViewBorrowed: view on u12 forces it addressable -> 4B, align 2
+    try std.testing.expectEqual(@as(usize, 4), checked.records[3].record_layout.size);
+    try std.testing.expectEqual(@as(usize, 2), checked.records[3].record_layout.alignment);
+    try std.testing.expectEqual(@as(?u8, null), checked.records[3].record_layout.fields[0].bit_offset);
+
+    // ForkConflict: concurrent fork on u12 and u4 separates them -> 4B, align 2
+    try std.testing.expectEqual(@as(usize, 4), checked.records[4].record_layout.size);
+    try std.testing.expectEqual(@as(usize, 2), checked.records[4].record_layout.alignment);
+    try std.testing.expectEqual(@as(?u8, null), checked.records[4].record_layout.fields[0].bit_offset);
+    try std.testing.expectEqual(@as(?u8, null), checked.records[4].record_layout.fields[1].bit_offset);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try mir.emitMir(&checked, &out.writer);
+    const mir_txt = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "record Cross 3\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "  addressable 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mir_txt, "  flat\n") != null);
+}
+
+test "lossless auto-widening, Integer(..) alias, field-path guard narrowing, and actionable overflow/suffix diagnostics" {
+    var ok = try analyzeOk(
+        \\type Pair { a: u12, b: u4 }
+        \\fn take_u32(x: u32) -> u32 { x }
+        \\fn take_f32(x: f32) -> f32 { x }
+        \\fn take_f64(x: f64) -> f64 { x }
+        \\fn pick_max(x: a, y: a) -> a { x }
+        \\fn main(y: u8, z: u12, small: Integer(0..=10), w16: u16, i32v: i32, f32v: f32) -> u64 {
+        \\  let sum_w: u32 = y + z
+        \\  let chained = (((2123 as u32) + (10 as Integer(0..=10))) as u64)
+        \\  let _ = take_u32(y + small)
+        \\  let _ = take_f32(w16)
+        \\  let _ = take_f64(i32v)
+        \\  let _ = take_f64(f32v)
+        \\  let _ = pick_max(y, w16)
+        \\  let mut p = Pair { a: 1000, b: 3 }
+        \\  if p.a < 2000 {
+        \\    p.a += 24
+        \\  }
+        \\  chained + sum_w + p.a
+        \\}
+    );
+    defer ok.deinit();
+
+    // Actionable overflow diagnostic mentions range, +|, and +%
+    var tree_ov = try parser.parse(std.testing.allocator, "fn bad(a: u8, b: u8) -> u8 { a + b }");
+    defer tree_ov.deinit();
+    var checked_ov = try sema.analyze(std.testing.allocator, &tree_ov);
+    defer checked_ov.deinit();
+    try std.testing.expect(checked_ov.hasErrors());
+    try std.testing.expectEqual(sema.SemaDiagnostic.Kind.potential_overflow, checked_ov.diagnostics[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, checked_ov.diagnostics[0].message, "0..=510 (u9)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checked_ov.diagnostics[0].message, "+|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checked_ov.diagnostics[0].message, "+%") != null);
+
+    // Glued suffix rejection mentions `as`
+    var tree_suf = try parser.parse(std.testing.allocator, "fn bad() -> u8 { 32u8 }");
+    defer tree_suf.deinit();
+    try std.testing.expect(tree_suf.hasErrors());
+    try std.testing.expect(std.mem.indexOf(u8, tree_suf.diagnostics[0].message, "(32 as u8)") != null);
+
+    // Lossy int -> f32 rejected without `as`
+    try expectSemaError("fn bad(x: u32) -> f32 { x }", .type_mismatch);
 }

@@ -1,0 +1,16 @@
+type Meter { count: u8, result: u8, side: u8, }
+fn catch(meter: Meter ~>.{count, result}) { meter.result = meter.count; }
+fn drain(meter: Meter ~>.{count, result}) {
+  while meter.count > 250 decreases meter.count {
+    meter.count = meter.count -| 3;
+    catch(meter);
+  };
+}
+fn main() -> u8 {
+  let mut meter = Meter { count: 255, result: 0, side: 12, };
+  view shared held = meter.side {
+    drain(meter);
+    let _ = held;
+  };
+  meter.result
+}

@@ -1,0 +1,6 @@
+type Counter { total: u8, }
+fn main() -> u8 {
+  let mut counter = Counter { total: 30, };
+  for _ in 3..7 { counter.total = counter.total -| 2; };
+  counter.total
+}

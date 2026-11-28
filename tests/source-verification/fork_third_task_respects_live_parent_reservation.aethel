@@ -1,0 +1,13 @@
+type Row { first: u8, second: u8, guarded: u8, }
+fn main() -> u8 {
+  let mut row = Row { first: 0, second: 0, guarded: 9, };
+  view shared reading = row.guarded {
+    fork {
+      { row.first = 11; }
+      { row.second = 23; }
+      { row.guarded = 37; }
+    } join;
+    let _ = reading;
+  };
+  row.guarded
+}

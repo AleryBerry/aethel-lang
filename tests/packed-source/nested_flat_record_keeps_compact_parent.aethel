@@ -1,0 +1,13 @@
+@layout(flat)
+type Flat { leading: u8, word: u32, trailing: u8, }
+type Row { flag: u1, fixed: Flat, cross: u33, }
+
+fn main() -> u32 {
+  let mut row = Row {
+    flag: 1,
+    fixed: Flat { leading: 2, word: 4294967295, trailing: 3, },
+    cross: 8589934591,
+  };
+  row.cross = 5;
+  row.fixed.word
+}

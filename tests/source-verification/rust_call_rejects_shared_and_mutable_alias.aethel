@@ -1,0 +1,9 @@
+@external(rust, "batch", "merge")
+pub fn merge(output: [mut u8], input: [u8]) -> ()
+
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut row = Pair { left: 37, right: 41, };
+  merge(row.left, row.left);
+  row.right
+}

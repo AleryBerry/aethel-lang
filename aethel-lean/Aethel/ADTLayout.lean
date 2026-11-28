@@ -1,11 +1,11 @@
 import Aethel.StatusCodec
 import Aethel.FunctionSummaries
 import Aethel.IntegerTypes
-import Aethel.AutomaticLayout
+import Aethel.LayoutAccess
 
 namespace Aethel.ADTLayout
 
-open Aethel
+open Aethel AutomaticLayout
 
 /-- Descriptor for one variant of a bit-compact algebraic data type. -/
 structure VariantSpec where
@@ -21,10 +21,158 @@ structure CompactADT where
   variants : List VariantSpec
   deriving Repr, DecidableEq
 
-def minTagBits : Nat → Nat
-  | 0 | 1 => 0
-  | 2 => 1
-  | n => if n ≤ 4 then 2 else if n ≤ 8 then 3 else if n ≤ 16 then 4 else 8
+/-- Minimum number of binary positions needed for the given number of codes. -/
+def minTagBits (count : Nat) : Nat :=
+  if count ≤ 1 then 0 else (count - 1).log2 + 1
+
+theorem minTagBits_le_iff {count bits : Nat} : minTagBits count ≤ bits ↔ count ≤ 2 ^ bits := by
+  unfold minTagBits
+  split
+  · rename_i small
+    have one := Nat.two_pow_pos bits
+    omega
+  · rename_i multiple
+    have positive : count - 1 ≠ 0 := by omega
+    rw [← Nat.lt_iff_add_one_le, Nat.log2_lt positive]
+    omega
+
+/-- A finite sum can use consecutive codes when each payload has a dense
+index. The second variant starts after all possible first-variant values. -/
+def denseIndex {left right : Nat} : Sum (Fin left) (Fin right) → Fin (left + right)
+  | .inl value => value.castAdd right
+  | .inr value => value.natAdd left
+
+def denseVariant {left right : Nat} (code : Fin (left + right)) : Sum (Fin left) (Fin right) :=
+  Fin.addCases (motive := fun _ => Sum (Fin left) (Fin right)) Sum.inl Sum.inr code
+
+@[simp] theorem denseVariant_index {left right : Nat} (value : Sum (Fin left) (Fin right)) :
+    denseVariant (denseIndex value) = value := by
+  cases value <;> simp [denseIndex, denseVariant]
+
+@[simp] theorem denseIndex_variant {left right : Nat} (code : Fin (left + right)) :
+    denseIndex (denseVariant code) = code := by
+  induction code using Fin.addCases with
+  | left value => simp [denseIndex, denseVariant]
+  | right value => simp [denseIndex, denseVariant]
+
+def packDenseIndex (index : Fin count) : BitVec (minTagBits count) :=
+  BitVec.ofNatLT index.val (Nat.lt_of_lt_of_le index.isLt (minTagBits_le_iff.mp (Nat.le_refl _)))
+
+def unpackDenseIndex (count : Nat) (bits : BitVec (minTagBits count)) : Option (Fin count) :=
+  if within : bits.toNat < count then some ⟨bits.toNat, within⟩ else none
+
+theorem unpackDenseIndex_correct {count : Nat} {bits : BitVec (minTagBits count)} {index : Fin count} :
+    unpackDenseIndex count bits = some index ↔ bits = packDenseIndex index := by
+  constructor
+  · intro decoded
+    unfold unpackDenseIndex at decoded
+    split at decoded
+    · exact BitVec.eq_of_toNat_eq (congrArg (Fin.val : Fin count → Nat) (Option.some.inj decoded))
+    · contradiction
+  · rintro rfl
+    have within : (packDenseIndex index).toNat < count := index.isLt
+    rw [unpackDenseIndex, dite_eq_left within]
+    rfl
+
+def packDenseSum {left right : Nat} (value : Sum (Fin left) (Fin right)) :
+    BitVec (minTagBits (left + right)) :=
+  packDenseIndex (denseIndex value)
+
+def unpackDenseSum (left right : Nat) (bits : BitVec (minTagBits (left + right))) :
+    Option (Sum (Fin left) (Fin right)) :=
+  (unpackDenseIndex (left + right) bits).map denseVariant
+
+theorem unpackDenseSum_correct {left right : Nat} {bits : BitVec (minTagBits (left + right))}
+    {value : Sum (Fin left) (Fin right)} :
+    unpackDenseSum left right bits = some value ↔ bits = packDenseSum value := by
+  rw [unpackDenseSum, Option.map_eq_some_iff]
+  constructor
+  · rintro ⟨index, valid, rfl⟩
+    simpa only [packDenseSum, denseIndex_variant] using unpackDenseIndex_correct.mp valid
+  · intro packed
+    exact ⟨denseIndex value, unpackDenseIndex_correct.mpr packed, denseVariant_index value⟩
+
+/-- Any injective fixed-width representation needs at least the width of
+the consecutive encoding. -/
+theorem packDenseIndex_minimum {count width : Nat}
+    (encode : Fin count → BitVec width) (distinct : Function.Injective encode) :
+    minTagBits count ≤ width := by
+  let code (index : Fin count) := (encode index).toFin
+  have codeDistinct : Function.Injective code := by
+    intro a b same
+    exact distinct (BitVec.eq_of_toNat_eq (congrArg Fin.val same))
+  have unique : ((List.finRange count).map code).Nodup :=
+    List.Pairwise.map code (fun _ _ different same => different (codeDistinct same))
+    (List.nodup_finRange count)
+  have capacity := unique.length_le_of_subset (l₂ := List.finRange (2 ^ width))
+    (fun {_} _ => List.mem_finRange _)
+  exact minTagBits_le_iff.mpr (by simpa using capacity)
+
+theorem packDenseSum_minimum {left right width : Nat}
+    (encode : Sum (Fin left) (Fin right) → BitVec width) (distinct : Function.Injective encode) :
+    minTagBits (left + right) ≤ width := by
+  apply packDenseIndex_minimum (encode ∘ denseVariant)
+  intro a b same
+  simpa using congrArg denseIndex (distinct same)
+
+theorem denseSum_no_wider_than_tagged (left right : Nat) :
+    minTagBits (left + right) ≤ (max (minTagBits left) (minTagBits right)) + 1 := by
+  rw [minTagBits_le_iff, Nat.pow_succ, Nat.mul_two]
+  exact Nat.add_le_add (minTagBits_le_iff.mp (Nat.le_max_left ..))
+    (minTagBits_le_iff.mp (Nat.le_max_right ..))
+
+/-- A finite field's complete code fits in the underlying byte image. -/
+structure DenseIndexField (size count : Nat) where
+  offset : Nat
+  fits : offset + minTagBits count ≤ size * 8
+
+def DenseIndexField.load (field : DenseIndexField size count) (image : Image size) : Option (Fin count) :=
+  unpackDenseIndex count (image.readBits field.offset (minTagBits count))
+
+def DenseIndexField.store (field : DenseIndexField size count) (image : Image size) (code : Fin count) :
+    Image size :=
+  image.writeBits field.offset (packDenseIndex code)
+
+theorem DenseIndexField.load_correct (field : DenseIndexField size count) (image : Image size) (code : Fin count) :
+    field.load image = some code ↔ image.readBits field.offset (minTagBits count) = packDenseIndex code :=
+  unpackDenseIndex_correct
+
+theorem DenseIndexField.load_store (field : DenseIndexField size count) (image : Image size) (code : Fin count) :
+    field.load (field.store image code) = some code :=
+  (field.load_correct ..).mpr (Image.read_write image field.offset (packDenseIndex code) field.fits)
+
+theorem DenseIndexField.store_frames_bits (field : DenseIndexField size count) (image : Image size)
+    (code : Fin count) (offset width : Nat) (fits : offset + width ≤ size * 8)
+    (separate : field.offset + minTagBits count ≤ offset ∨ offset + width ≤ field.offset) :
+    (field.store image code).readBits offset width = image.readBits offset width :=
+  Image.read_write_separate image field.offset offset width (packDenseIndex code) fits separate
+
+abbrev DenseSumField (size left right : Nat) := DenseIndexField size (left + right)
+
+def DenseSumField.load (field : DenseSumField size left right) (image : Image size) :
+    Option (Sum (Fin left) (Fin right)) :=
+  (DenseIndexField.load field image).map denseVariant
+
+def DenseSumField.store (field : DenseSumField size left right) (image : Image size)
+    (value : Sum (Fin left) (Fin right)) : Image size :=
+  DenseIndexField.store field image (denseIndex value)
+
+theorem DenseSumField.load_correct (field : DenseSumField size left right) (image : Image size)
+    (value : Sum (Fin left) (Fin right)) :
+    DenseSumField.load field image = some value ↔
+      image.readBits field.offset (minTagBits (left + right)) = packDenseSum value :=
+  unpackDenseSum_correct
+
+theorem DenseSumField.load_store (field : DenseSumField size left right) (image : Image size)
+    (value : Sum (Fin left) (Fin right)) :
+    DenseSumField.load field (DenseSumField.store field image value) = some value := by
+  simp [load, store, DenseIndexField.load_store]
+
+theorem DenseSumField.store_frames_bits (field : DenseSumField size left right) (image : Image size)
+    (value : Sum (Fin left) (Fin right)) (offset width : Nat) (fits : offset + width ≤ size * 8)
+    (separate : field.offset + minTagBits (left + right) ≤ offset ∨ offset + width ≤ field.offset) :
+    (DenseSumField.store field image value).readBits offset width = image.readBits offset width :=
+  DenseIndexField.store_frames_bits field image (denseIndex value) offset width fits separate
 
 def CompactADT.Valid (spec : CompactADT) : Prop :=
   spec.variants.length ≤ 2 ^ spec.tagBits ∧
@@ -81,31 +229,22 @@ theorem CompactADT.encode_fits {spec : CompactADT} (hSpec : spec.Valid)
   have hPayLe : 2 ^ v.payloadBits ≤ 2 ^ spec.maxPayloadBits :=
     Nat.pow_le_pow_right (by decide) hPayBound
   have hPayMax : val.payload < 2 ^ spec.maxPayloadBits := Nat.lt_of_lt_of_le hPayLt hPayLe
-  have hPaySucc : val.payload + 1 ≤ 2 ^ spec.maxPayloadBits := hPayMax
-  have hMulLe : 2 ^ spec.tagBits * (val.payload + 1) ≤ 2 ^ spec.tagBits * 2 ^ spec.maxPayloadBits :=
-    Nat.mul_le_mul_left (2 ^ spec.tagBits) hPaySucc
-  have hPowAdd : 2 ^ spec.tagBits * 2 ^ spec.maxPayloadBits = 2 ^ spec.totalBits := by
-    simp [CompactADT.totalBits, Nat.pow_add]
-  dsimp [CompactADT.encode]
-  calc
-    val.tag + 2 ^ spec.tagBits * val.payload
-      < 2 ^ spec.tagBits + 2 ^ spec.tagBits * val.payload := by omega
-    _ = 2 ^ spec.tagBits * (val.payload + 1) := by rw [Nat.mul_succ, Nat.add_comm]
-    _ ≤ 2 ^ spec.totalBits := hPowAdd ▸ hMulLe
+  simpa only [CompactADT.encode, CompactADT.totalBits, Nat.mul_comm (2 ^ spec.tagBits)] using
+    concatCode_fits hTagLt hPayMax
+
+theorem CompactADT.encode_parts {spec : CompactADT} (hSpec : spec.Valid) (val : CompactValue spec) :
+    spec.encode val % 2 ^ spec.tagBits = val.tag ∧
+      spec.encode val / 2 ^ spec.tagBits = val.payload := by
+  obtain ⟨variant, member, tag, _⟩ := val.valid
+  have tagFits : val.tag < 2 ^ spec.tagBits := tag ▸ (hSpec.2.1 variant member).1
+  simpa only [CompactADT.encode, Nat.mul_comm (2 ^ spec.tagBits)] using
+    concatCode_split (high := val.payload) tagFits
 
 theorem CompactADT.decode_encode {spec : CompactADT} (hSpec : spec.Valid)
     (val : CompactValue spec) :
     spec.decode (spec.encode val) = some (val.tag, val.payload) := by
   obtain ⟨v, hvMem, hTagEq, hPayLt⟩ := val.valid
-  obtain ⟨hTagBound, _⟩ := hSpec.2.1 v hvMem
-  have hPowPos : 0 < 2 ^ spec.tagBits := Nat.two_pow_pos spec.tagBits
-  have hTagLt : val.tag < 2 ^ spec.tagBits := hTagEq ▸ hTagBound
-  have hMod : (spec.encode val) % (2 ^ spec.tagBits) = val.tag := by
-    dsimp [CompactADT.encode]
-    rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hTagLt]
-  have hDiv : (spec.encode val) / (2 ^ spec.tagBits) = val.payload := by
-    dsimp [CompactADT.encode]
-    rw [Nat.add_mul_div_left _ _ hPowPos, Nat.div_eq_of_lt hTagLt, Nat.zero_add]
+  obtain ⟨hMod, hDiv⟩ := spec.encode_parts hSpec val
   dsimp [CompactADT.decode]
   rw [hMod, hDiv]
   cases hFind : spec.variants.find? (fun w => w.tag == val.tag) with

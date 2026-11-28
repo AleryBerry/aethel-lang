@@ -1,0 +1,8 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 74, };
+  view exclusive parent = pair.left {
+    view shared child = parent { child = pair.right; };
+  };
+  pair.left
+}

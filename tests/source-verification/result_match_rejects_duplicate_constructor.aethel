@@ -1,0 +1,7 @@
+fn main() -> u8 {
+  let result = Err(18): Result(u8, u8);
+  case result {
+    Err(first) -> first
+    Err(second) -> second
+  }
+}

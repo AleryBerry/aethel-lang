@@ -33,6 +33,25 @@ pub fn emitMir(checked: *const sema.CheckedModule, writer: *Io.Writer) Io.Writer
             const bits: u16 = @max(@as(u16, 1), f.bits);
             try writer.print("  field {c}{d}\n", .{ prefix, bits });
         }
+        if (rec.is_flat_c) {
+            try writer.writeAll("  flat\n");
+        } else {
+            for (rec.record_layout.fields, 0..) |fp, fi| {
+                const bits: u16 = @max(@as(u16, 1), rec.fields[fi].bits);
+                if (fp.policy == .addressable and (bits % 8 != 0)) {
+                    var has_conflict = false;
+                    for (rec.conflicts) |c| {
+                        if (c.a == fi or c.b == fi) {
+                            has_conflict = true;
+                            break;
+                        }
+                    }
+                    if (!has_conflict) {
+                        try writer.print("  addressable {d}\n", .{fi});
+                    }
+                }
+            }
+        }
         for (rec.conflicts) |c| {
             try writer.print("  conflict {d} {d}\n", .{ c.a, c.b });
         }

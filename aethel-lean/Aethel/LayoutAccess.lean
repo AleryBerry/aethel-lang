@@ -43,6 +43,46 @@ theorem Image.readBits_getLsbD (image : Image size) (offset width : Nat) {i : Na
     (image.readBits offset width).getLsbD i = image.bit (offset + i) := by
   simp only [Image.readBits, bitsOfFn_get _ hi]
 
+def bitIntervalBytes (offset width : Nat) : List Nat :=
+  if width = 0 then []
+  else (List.range ((offset % 8 + width + 7) / 8)).map (fun i => offset / 8 + i)
+
+def Image.bytesAt (image : Image size) (offsets : List Nat) : List (BitVec 8) :=
+  offsets.map fun byte => if within : byte < size then image ⟨byte, within⟩ else 0
+
+/-- Assemble increasing memory addresses as a little-endian integer, then
+select the payload interval. The payload need not fit a machine word. -/
+def decodeLittleEndianBytes (bytes : List (BitVec 8)) (skip width : Nat) : BitVec width :=
+  BitVec.extractLsb' skip width (BitVec.flattenList bytes.reverse)
+
+def Image.readBytes (image : Image size) (offset width : Nat) : BitVec width :=
+  decodeLittleEndianBytes (image.bytesAt (bitIntervalBytes offset width)) (offset % 8) width
+
+theorem Image.readBytes_refines (image : Image size) (offset width : Nat) :
+    image.readBytes offset width = image.readBits offset width := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro bit within
+  rw [Image.readBits_getLsbD _ _ _ within]
+  let count := (offset % 8 + width + 7) / 8
+  let index := (offset % 8 + bit) / 8
+  have listBound : index < count := by dsimp [index, count]; omega
+  have bitBound : offset % 8 + bit < 8 * ((offset % 8 + width + 7) / 8) := by
+    dsimp [index, count] at listBound
+    omega
+  have address : offset / 8 + index = (offset + bit) / 8 := by dsimp [index]; omega
+  have bitIndex : (offset % 8 + bit) % 8 = (offset + bit) % 8 := by omega
+  have nonempty : width ≠ 0 := by omega
+  simp only [Image.readBytes, decodeLittleEndianBytes, Image.bytesAt, bitIntervalBytes,
+    ite_eq_right nonempty, BitVec.getLsbD_extractLsb', BitVec.getLsbD_flattenList, List.length_reverse,
+    List.length_map, List.length_range, within, bitBound, decide_true, Bool.true_and]
+  change (((((List.range count).map (fun i => offset / 8 + i)).map
+    (fun byte => if h : byte < size then image ⟨byte, h⟩ else 0)).reverse[count - 1 - index]?).getD 0).getLsbD
+    ((offset % 8 + bit) % 8) = _
+  rw [List.getElem?_reverse (by simp only [List.length_map, List.length_range]; omega)]
+  simp only [List.length_map, List.length_range, show count - 1 - (count - 1 - index) = index by omega,
+    List.getElem?_map, List.getElem?_range listBound, Option.map_some, Option.getD_some, address, bitIndex]
+  by_cases inBounds : (offset + bit) / 8 < size <;> simp [Image.bit, inBounds]
+
 theorem Image.read_write (image : Image size) (offset : Nat) (bits : BitVec width)
     (fits : offset + width ≤ size * 8) :
     (image.writeBits offset bits).readBits offset width = bits := by
@@ -70,6 +110,70 @@ theorem Image.write_preserves_byte (image : Image size) (offset : Nat) (bits : B
   simp only [Image.writeBits, bitsOfFn_get _ hi]
   exact ite_eq_right (by omega)
 
+private def payloadByte (bits : BitVec width) (offset start : Nat) : BitVec 8 :=
+  if offset ≤ start then BitVec.extractLsb' (start - offset) 8 bits
+  else BitVec.extractLsb' 0 8 bits <<< (offset - start)
+
+private theorem payloadByte_bit (bits : BitVec width) (offset start : Nat) {i : Nat}
+    (hi : i < 8) (lower : offset ≤ start + i) :
+    (payloadByte bits offset start).getLsbD i = bits.getLsbD (start + i - offset) := by
+  unfold payloadByte
+  split
+  · rename_i aligned
+    simp only [BitVec.getLsbD_extractLsb', hi, decide_true, Bool.true_and]
+    congr 1
+    omega
+  · have enough : ¬ i < offset - start := by omega
+    have within : start + i - offset < 8 := by omega
+    have same : i - (offset - start) = start + i - offset := by omega
+    simp only [BitVec.getLsbD_shiftLeft, BitVec.getLsbD_extractLsb', hi, enough, within,
+      decide_true, decide_false, Bool.not_false, Bool.true_and, Nat.zero_add, same]
+
+private def intervalMask (offset ending start : Nat) : BitVec 8 :=
+  (BitVec.allOnes 8 <<< (offset - start)) &&& (BitVec.allOnes 8 >>> (8 - (ending - start)))
+
+private theorem intervalMask_bit (offset ending start : Nat) {i : Nat} (hi : i < 8) :
+    (intervalMask offset ending start).getLsbD i = decide (offset ≤ start + i ∧ start + i < ending) := by
+  apply Bool.eq_iff_iff.mpr
+  simp only [intervalMask, BitVec.getLsbD_and, BitVec.getLsbD_shiftLeft, BitVec.getLsbD_ushiftRight,
+    BitVec.getLsbD_allOnes, hi, decide_true, Bool.true_and, Bool.and_eq_true, Bool.not_eq_true',
+    decide_eq_true_eq, decide_eq_false_iff_not]
+  omega
+
+/-- Compute one byte of a store. Interior bytes need only the incoming value.
+Boundary bytes use read-modify-write to preserve bits outside the payload. -/
+def Image.writeBytes (image : Image size) (offset : Nat) (bits : BitVec width) : Image size :=
+  fun byte =>
+    let start := byte.val * 8
+    let ending := offset + width
+    if width = 0 ∨ start + 8 ≤ offset ∨ ending ≤ start then image byte
+    else
+      let payload := payloadByte bits offset start
+      if offset ≤ start ∧ start + 8 ≤ ending then payload
+      else
+        let mask := intervalMask offset ending start
+        (image byte &&& ~~~mask) ||| (payload &&& mask)
+
+theorem Image.writeBytes_refines (image : Image size) (offset : Nat) (bits : BitVec width) :
+    image.writeBytes offset bits = image.writeBits offset bits := by
+  funext byte
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  simp only [Image.writeBytes, Image.writeBits, bitsOfFn_get _ hi]
+  split
+  · exact (ite_eq_right (by omega)).symm
+  · split
+    · rw [payloadByte_bit _ _ _ hi (by omega), ite_eq_left (by omega)]
+    · simp only [BitVec.getLsbD_or, BitVec.getLsbD_and, BitVec.getLsbD_not, intervalMask_bit _ _ _ hi,
+        hi, decide_true, Bool.true_and]
+      split
+      · rename_i inside
+        rw [decide_eq_true inside, payloadByte_bit _ _ _ hi inside.1]
+        simp
+      · rename_i outside
+        rw [decide_eq_false outside]
+        simp
+
 /-- A resolved integer field with a proof that its payload fits the byte image.
 For addressable slots this excludes padding from the value. -/
 structure IntegerField (size : Nat) where
@@ -82,22 +186,21 @@ def IntegerField.get (field : IntegerField size) (image : Image size) : BitVec f
 
 def IntegerField.set (field : IntegerField size) (image : Image size)
     (value : BitVec field.kind.bits) : Image size :=
-  image.writeBits field.offset value
+  image.writeBytes field.offset value
 
 theorem IntegerField.get_set (field : IntegerField size) (image : Image size)
-    (value : BitVec field.kind.bits) : field.get (field.set image value) = value :=
-  Image.read_write image field.offset value field.fits
+    (value : BitVec field.kind.bits) : field.get (field.set image value) = value := by
+  simpa [IntegerField.get, IntegerField.set, Image.writeBytes_refines] using
+    Image.read_write image field.offset value field.fits
 
 theorem IntegerField.get_set_other (written observed : IntegerField size) (image : Image size)
     (value : BitVec written.kind.bits)
     (separate : written.offset + written.kind.bits ≤ observed.offset ∨
       observed.offset + observed.kind.bits ≤ written.offset) :
-    observed.get (written.set image value) = observed.get image :=
-  Image.read_write_separate image written.offset observed.offset observed.kind.bits value
-    observed.fits separate
-
-def Placement.bitStart (placement : Placement) : Nat :=
-  placement.byteOffset * 8 + placement.bitOffset.getD 0
+    observed.get (written.set image value) = observed.get image := by
+  simpa [IntegerField.get, IntegerField.set, Image.writeBytes_refines] using
+    Image.read_write_separate image written.offset observed.offset observed.kind.bits value
+      observed.fits separate
 
 theorem integer_span {abi : TargetIntegerABI} {kind : IntegerType} {slot : IntegerSlot}
     {placement : Placement} {total align : Nat} {policy : StoragePolicy}
@@ -114,12 +217,7 @@ theorem integer_span {abi : TargetIntegerABI} {kind : IntegerType} {slot : Integ
       simp [Placement.bitStart, Field.bytes, bit, Layout.size]
       omega
     | some offset =>
-      have inside := valid.2
-      change (match placement.bitOffset with
-        | none => _
-        | some bit => _ ∧ _ ∧ _ ∧ bit + kind.bits ≤ 8) at inside
-      rw [bit] at inside
-      simp [Placement.bitStart, Field.bytes, bit]
+      simp [Placement.bitStart, Field.bytes, bit, Layout.bits, Nat.ne_of_gt kind.bits_pos]
       omega
 
 theorem resolved_integer_fits {abi : TargetIntegerABI} {schema : Schema} {layout : Layout}
@@ -251,9 +349,8 @@ theorem integer_sibling_bits_separate {abi : TargetIntegerABI}
   · right
     simp only [Placement.bitStart] at rightSpan ⊢
     omega
-  · obtain ⟨sameByte, separatedBits⟩ := same
-    cases l : left.bitOffset <;> cases r : right.bitOffset <;>
-      simp_all [Placement.bitStart, Layout.bits]
-    omega
+  · cases l : left.bitOffset <;> cases r : right.bitOffset <;>
+      simp [l, r, Layout.bits] at same
+    exact same
 
 end Aethel.AutomaticLayout

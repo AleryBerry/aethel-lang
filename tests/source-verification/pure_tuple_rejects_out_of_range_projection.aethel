@@ -1,0 +1,4 @@
+fn main() -> u8 {
+  let pair = (4, 23);
+  pair.2
+}

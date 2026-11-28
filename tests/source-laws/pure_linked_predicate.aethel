@@ -1,0 +1,3 @@
+law handles_every_request(value: Result(u8, bool)) {
+  always handles(value)
+}

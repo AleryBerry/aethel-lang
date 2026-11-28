@@ -21,7 +21,7 @@ pub const FieldSchema = struct {
     signed: bool,
     addressable_size: usize,
     addressable_align: usize,
-    is_subbyte_packable: bool,
+    is_packable: bool,
 };
 
 pub const FieldPlacement = struct {
@@ -63,9 +63,9 @@ pub const LoopAccessProfile = struct {
 
 pub const l1_data_cache_bytes: usize = 32768;
 
-/// Mirror `CacheLayout.selectSubBytePolicy`: unpack hot loop-mutated sub-byte fields when the
-/// naive record working set fits inside L1d (`32 KiB`), while always packing cold or streaming fields.
-pub fn shouldUnpackHotSubByteInL1(is_hot: bool, observed_len: ?usize, naive_record_bytes: usize) bool {
+/// Mirror `AutomaticLayout.shouldUnpackHotInL1`: unpack hot loop-mutated packable fields when the
+/// record working set fits inside L1d (`32 KiB`), while always packing cold or streaming fields.
+pub fn shouldUnpackHotInL1(is_hot: bool, observed_len: ?usize, naive_record_bytes: usize) bool {
     if (!is_hot) return false;
     const len = observed_len orelse return false;
     const ws = std.math.mul(usize, len, @max(@as(usize, 1), naive_record_bytes)) catch return false;
@@ -224,9 +224,10 @@ pub fn planCompactADT(variant_count: usize, max_payload_bits: u16) CompactADTLay
     };
 }
 
-pub fn planFlatCLayout(
+fn placeDeclarationOrder(
     alloc: std.mem.Allocator,
     fields: []const FieldSchema,
+    policies: ?[]const StoragePolicy,
 ) std.mem.Allocator.Error!RecordLayout {
     if (fields.len == 0) {
         return .{ .size = 0, .alignment = 1, .fields = &.{} };
@@ -245,7 +246,7 @@ pub fn planFlatCLayout(
             .size = f.addressable_size,
             .alignment = a,
             .bits = f.bits,
-            .policy = .addressable,
+            .policy = if (policies) |p| p[idx] else .addressable,
         };
     }
     return .{
@@ -255,8 +256,15 @@ pub fn planFlatCLayout(
     };
 }
 
+pub fn planFlatCLayout(
+    alloc: std.mem.Allocator,
+    fields: []const FieldSchema,
+) std.mem.Allocator.Error!RecordLayout {
+    return placeDeclarationOrder(alloc, fields, null);
+}
+
 /// Synthesize co-borrow-safe field layout matching `Aethel.CoBorrowPacking.autoPlan`
-/// and `Aethel.AutomaticLayout.plan` (stable alignment ordering + FFD sub-byte bins).
+/// and `Aethel.AutomaticLayout.plan` (alignment-sorted addressable slots + contiguous bit intervals).
 pub fn planRecordLayout(
     alloc: std.mem.Allocator,
     fields: []const FieldSchema,
@@ -267,21 +275,23 @@ pub fn planRecordLayout(
     }
 
     const policies = try alloc.alloc(StoragePolicy, fields.len);
-    for (fields, 0..) |_, i| {
-        var conflict = false;
-        for (conflicts) |edge| {
-            if (edge.a < fields.len and edge.b < fields.len and edge.a != edge.b) {
-                if (edge.a == i or edge.b == i) {
-                    conflict = true;
-                    break;
+    for (fields, 0..) |f, i| {
+        var conflict = !f.is_packable;
+        if (!conflict) {
+            for (conflicts) |edge| {
+                if (edge.a < fields.len and edge.b < fields.len and edge.a != edge.b) {
+                    if (edge.a == i or edge.b == i) {
+                        conflict = true;
+                        break;
+                    }
                 }
             }
         }
         policies[i] = if (conflict) .addressable else .may_share_byte;
     }
 
-    const decl = try computeCandidate(alloc, fields, policies, false);
-    const compact = try computeCandidate(alloc, fields, policies, true);
+    const decl = try placeDeclarationOrder(alloc, fields, policies);
+    const compact = try computeCompactCandidate(alloc, fields, policies);
     if (compact.size < decl.size) {
         return compact;
     }
@@ -294,34 +304,30 @@ const Indexed = struct {
     policy: StoragePolicy,
 };
 
-fn computeCandidate(
+fn computeCompactCandidate(
     alloc: std.mem.Allocator,
     fields: []const FieldSchema,
     policies: []const StoragePolicy,
-    compact: bool,
 ) std.mem.Allocator.Error!RecordLayout {
     var max_align: usize = 1;
     var ordinary: std.ArrayList(Indexed) = .empty;
     var packed_list: std.ArrayList(Indexed) = .empty;
 
     for (fields, 0..) |f, idx| {
-        const a = @max(@as(usize, 1), f.addressable_align);
-        if (a > max_align) max_align = a;
         const entry = Indexed{ .idx = idx, .schema = f, .policy = policies[idx] };
-        const packable = compact and f.is_subbyte_packable and policies[idx] == .may_share_byte and f.bits > 0 and f.bits < 8;
-        if (packable) {
+        if (f.is_packable and policies[idx] == .may_share_byte) {
             try packed_list.append(alloc, entry);
         } else {
+            const a = @max(@as(usize, 1), f.addressable_align);
+            if (a > max_align) max_align = a;
             try ordinary.append(alloc, entry);
         }
     }
 
-    if (compact) {
-        // Stable descending sort by addressable alignment (`≥` preserves earlier index on ties).
-        stableSortByAlignDesc(ordinary.items);
-        // Stable descending sort by bit width.
-        stableSortByBitsDesc(packed_list.items);
-    }
+    // Stable descending sort by addressable alignment (`≥` preserves earlier index on ties).
+    stableSortByAlignDesc(ordinary.items);
+    // Stable descending sort by bit width.
+    stableSortByBitsDesc(packed_list.items);
 
     const out = try alloc.alloc(FieldPlacement, fields.len);
     var cursor: usize = 0;
@@ -340,41 +346,27 @@ fn computeCandidate(
         };
     }
 
-    // First-fit-decreasing sub-byte bin packing (matches `AutomaticLayout.allocPackedBit`).
-    var bins: std.ArrayList(u16) = .empty;
+    // Contiguous bit-interval packing across byte boundaries (matches `AutomaticLayout.compactCandidate`).
+    var bit_cursor: usize = cursor * 8;
     for (packed_list.items) |entry| {
-        var placed = false;
-        for (bins.items, 0..) |*used, bin_idx| {
-            if (used.* + entry.schema.bits <= 8) {
-                const bit_off: u8 = @intCast(used.*);
-                used.* += entry.schema.bits;
-                out[entry.idx] = .{
-                    .byte_offset = cursor + bin_idx,
-                    .bit_offset = bit_off,
-                    .size = 1,
-                    .alignment = 1,
-                    .bits = entry.schema.bits,
-                    .policy = entry.policy,
-                };
-                placed = true;
-                break;
-            }
-        }
-        if (!placed) {
-            const bin_idx = bins.items.len;
-            try bins.append(alloc, entry.schema.bits);
-            out[entry.idx] = .{
-                .byte_offset = cursor + bin_idx,
-                .bit_offset = 0,
-                .size = 1,
-                .alignment = 1,
-                .bits = entry.schema.bits,
-                .policy = entry.policy,
-            };
-        }
+        const byte_off = bit_cursor / 8;
+        const bit_off: u8 = @intCast(bit_cursor % 8);
+        const span_bytes: usize = if (entry.schema.bits == 0)
+            0
+        else
+            (@as(usize, bit_off) + @as(usize, entry.schema.bits) + 7) / 8;
+        out[entry.idx] = .{
+            .byte_offset = byte_off,
+            .bit_offset = bit_off,
+            .size = span_bytes,
+            .alignment = 1,
+            .bits = entry.schema.bits,
+            .policy = entry.policy,
+        };
+        bit_cursor += entry.schema.bits;
     }
 
-    const total_size = alignUp(cursor + bins.items.len, max_align);
+    const total_size = alignUp((bit_cursor + 7) / 8, max_align);
     return .{
         .size = total_size,
         .alignment = max_align,

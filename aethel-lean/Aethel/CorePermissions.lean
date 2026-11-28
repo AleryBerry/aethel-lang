@@ -26,6 +26,24 @@ def State.ViewsCompatible (s : State) : Prop :=
 theorem State.empty_views_compatible : ({} : State).ViewsCompatible := by
   simp [State.ViewsCompatible]
 
+theorem State.available_through_view {s : State} {view : View} {request : AccessMode}
+    (compatible : s.ViewsCompatible) (active : view ∈ s.views) (allowed : view.mode.Allows request) :
+    s.Available view.location request (some view.id) := by
+  let apart (a b : View) := a.id = b.id ∨ a.location ≠ b.location ∨ a.mode.Compatible b.mode
+  have forward : s.views.Pairwise apart :=
+    compatible.imp fun h => .inr ((accessFootprint_compatible ..).mp h.2)
+  have backward : s.views.Pairwise (flip apart) :=
+    forward.imp fun
+      | .inl same => .inl same.symm
+      | .inr (.inl separate) => .inr (.inl separate.symm)
+      | .inr (.inr shared) => .inr (.inr ⟨shared.2, shared.1⟩)
+  have all := forward.forall_of_forall_of_flip (fun _ _ => .inl rfl) backward
+  intro other present
+  rcases all active present with same | separate | shared
+  · exact .inl (congrArg some same)
+  · exact .inr (.inl separate)
+  · exact .inr (.inr ⟨allowed.resolve_right (by simp [shared.1]), shared.2⟩)
+
 theorem Step.views_compatible {s next : State} {instruction : Instruction}
     (h : Step s instruction next) (hs : s.ViewsCompatible) : next.ViewsCompatible := by
   cases h <;> try exact hs

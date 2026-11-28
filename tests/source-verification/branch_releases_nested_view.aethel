@@ -1,0 +1,11 @@
+type Pair { left: u8, right: u8, }
+fn main() -> u8 {
+  let mut pair = Pair { left: 17, right: 23, };
+  if pair.left != 17 {
+    view exclusive inner = pair.left { let _ = inner; };
+  } else {
+    view shared inner = pair.right { let _ = inner; };
+  };
+  pair.right = 93;
+  pair.right
+}

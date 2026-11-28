@@ -1,0 +1,4 @@
+fn main() -> u8 {
+  let state = (true, 39);
+  if state.0 { state.1 } else { 0 }
+}

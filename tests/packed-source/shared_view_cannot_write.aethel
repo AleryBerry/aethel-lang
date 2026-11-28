@@ -1,0 +1,8 @@
+type Sample { tail: u14, middle: i31, head: u35, }
+fn main() -> i31 {
+  let mut row = Sample { tail: 42, middle: 19, head: 34359738367, };
+  view shared middle = row.middle {
+    middle = -1073741824;
+  };
+  row.middle
+}

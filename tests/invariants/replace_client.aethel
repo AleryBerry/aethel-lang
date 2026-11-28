@@ -1,0 +1,6 @@
+import Character
+fn main() {
+  let mut c = Character { x: 5, y: 5 }
+  let next = c.x -| c.y
+  c = Character { x: next, y: next }
+}

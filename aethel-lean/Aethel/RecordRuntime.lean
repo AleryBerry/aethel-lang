@@ -14,11 +14,13 @@ structure RecordRef (abi : TargetIntegerABI) (schema : Schema) where
   conforms : Conforms abi schema layout
 
 def allocateRecord (abi : TargetIntegerABI) (schema : Schema) (state : State) (owner : OwnerId)
-    (values : List Nat → Option IntegerBits) : Option (RecordRef abi schema × State) := do
-  let layout ← planVerified abi schema
-  let image ← initializeRecord layout.property values
-  let next ← execute state (.alloc owner image.toBytes)
-  return (⟨owner, layout.val, layout.property⟩, next)
+    (values : List Nat → Option IntegerBits) : Option (RecordRef abi schema × State) :=
+  if schema.integerOnly then do
+    let layout ← planVerified abi schema
+    let image ← initializeRecord layout.property values
+    let next ← execute state (.alloc owner image.toBytes)
+    return (⟨owner, layout.val, layout.property⟩, next)
+  else none
 
 theorem allocateRecord_initialized {abi : TargetIntegerABI} {schema : Schema} {state next : State}
     {owner : OwnerId} {values : List Nat → Option IntegerBits} {record : RecordRef abi schema}
@@ -26,7 +28,9 @@ theorem allocateRecord_initialized {abi : TargetIntegerABI} {schema : Schema} {s
     record.owner = owner ∧ ∃ image, initializeRecord record.conforms values = some image ∧
       Step state (.alloc owner image.toBytes) next ∧
       next.allocation record.owner = some ⟨owner, image.toBytes⟩ := by
-  simp only [allocateRecord, bind, pure, Option.bind_eq_some_iff, Option.some.injEq,
+  unfold allocateRecord at allocated
+  split at allocated <;> try contradiction
+  simp only [bind, pure, Option.bind_eq_some_iff, Option.some.injEq,
     Prod.mk.injEq] at allocated
   obtain ⟨layout, planned, image, initialized, stateAfter, executed, rfl, rfl⟩ := allocated
   have step := execute_sound executed
@@ -38,13 +42,21 @@ def IntegerField.byteOffsets (field : IntegerField size) : List Nat :=
   (List.range ((field.offset % 8 + field.kind.bits + 7) / 8)).map
     (fun i => field.offset / 8 + i)
 
+theorem IntegerField.mem_byteOffsets (field : IntegerField size) (byte : Nat) :
+    byte ∈ field.byteOffsets ↔ field.offset / 8 ≤ byte ∧
+      byte < (field.offset + field.kind.bits + 7) / 8 := by
+  unfold byteOffsets
+  simp only [List.mem_map, List.mem_range]
+  constructor
+  · rintro ⟨index, within, rfl⟩
+    omega
+  · intro within
+    exact ⟨byte - field.offset / 8, by omega, by omega⟩
+
 theorem IntegerField.byteOffsets_cover (field : IntegerField size) (bit : Nat)
     (inside : field.offset ≤ bit ∧ bit < field.offset + field.kind.bits) :
     bit / 8 ∈ field.byteOffsets := by
-  apply List.mem_map.mpr
-  refine ⟨bit / 8 - field.offset / 8, List.mem_range.mpr ?_, ?_⟩
-  · omega
-  · omega
+  exact (field.mem_byteOffsets _).mpr (by omega)
 
 private def probe (mode : AccessMode) (target : AccessTarget) : Instruction :=
   match mode with
@@ -72,6 +84,15 @@ theorem checkAccessTargets_correct (state : State) (owner : OwnerId) (mode : Acc
       AccessAllowed state owner mode offsets targets := by
   simp only [checkAccessTargets, AccessAllowed, Bool.and_eq_true, beq_iff_eq,
     List.all_eq_true, checkInstruction_correct, Option.isSome_map, Option.isSome_iff_exists, execute_correct]
+
+theorem AccessAllowed.of_resources {state next : State} {owner : OwnerId} {mode : AccessMode}
+    {offsets : List Nat} {targets : List AccessTarget}
+    (allowed : AccessAllowed state owner mode offsets targets)
+    (same : next.resources = state.resources) : AccessAllowed next owner mode offsets targets := by
+  rw [← checkAccessTargets_correct] at allowed ⊢
+  have locationSame (target : AccessTarget) : target.location next = target.location state :=
+    (target.location_resources next).symm.trans (same ▸ target.location_resources state)
+  simpa only [checkAccessTargets, locationSame, same] using allowed
 
 theorem AccessAllowed.permits_bit {state : State} {owner : OwnerId} {mode : AccessMode}
     {field : IntegerField size} {targets : List AccessTarget} {bit : Nat}

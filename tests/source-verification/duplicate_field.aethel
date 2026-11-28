@@ -4,6 +4,6 @@ type Pair {
 }
 
 fn main() -> u8 {
-  let mut pair = Pair { left: 17u8, left: 23u8, };
+  let mut pair = Pair { left: 17, left: 23, };
   pair.left
 }
